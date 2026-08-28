@@ -146,6 +146,33 @@ class GroupDecisionTests(unittest.TestCase):
             self.assertFalse(second["groups"][0]["written"])
             self.assertEqual(read_json(path)["orders"], [{"keep": True}])
 
+    def test_fund_evidence_writer_requires_and_preserves_explicit_payee(self) -> None:
+        base_ocr = {
+            "amount": "10416",
+            "currency": "THB",
+            "status_text": "Transaction successful",
+            "status_class": "completed",
+            "status_class_confidence": "high",
+            "amount_completeness": "complete",
+            "confidence": "high",
+        }
+        for payee in ("王少秋（**秋）", "206-4-xxx781"):
+            with self.subTest(payee=payee):
+                decision = group_decisions.fund_evidence_decision(
+                    event_type="payout_screenshot",
+                    payee=payee,
+                    ocr=base_ocr,
+                    flow_side="payout",
+                )
+                self.assertEqual(decision["ocr"]["payee"], payee)
+
+        with self.assertRaisesRegex(ValueError, "payee is required"):
+            group_decisions.fund_evidence_decision(
+                event_type="payout_screenshot",
+                payee=" ",
+                ocr=base_ocr,
+            )
+
     def test_missing_media_remains_covered_without_a_model_decision(self) -> None:
         missing_media_id = f"{GROUP_KEY}:2#media:0"
         missing_message = message(2)
@@ -226,21 +253,17 @@ class GroupDecisionTests(unittest.TestCase):
             decision_path = next(decisions_dir.glob("*.json"))
             document = read_json(decision_path)
             by_media = {item["media_id"]: item for item in document["media_decisions"]}
-            by_media[payment_media]["decision"].update(
-                {
-                    "disposition": "order_evidence",
-                    "event_type": "payment_screenshot",
-                    "flow_side": "payment",
-                    "ocr": ocr("6048", "CNY", "Goddess Space"),
-                }
+            by_media[payment_media]["decision"] = group_decisions.fund_evidence_decision(
+                event_type="payment_screenshot",
+                payee="Goddess Space",
+                ocr=ocr("6048", "CNY", "Goddess Space"),
+                flow_side="payment",
             )
-            by_media[payout_media]["decision"].update(
-                {
-                    "disposition": "order_evidence",
-                    "event_type": "payout_screenshot",
-                    "flow_side": "payout",
-                    "ocr": ocr("30000", "THB", "MANITHAY KHAMPHOUMY"),
-                }
+            by_media[payout_media]["decision"] = group_decisions.fund_evidence_decision(
+                event_type="payout_screenshot",
+                payee="206-4-xxx781",
+                ocr=ocr("30000", "THB", "206-4-xxx781"),
+                flow_side="payout",
             )
             document["orders"] = [
                 {
@@ -294,6 +317,10 @@ class GroupDecisionTests(unittest.TestCase):
             self.assertEqual(order["actual_rate"], "4.96")
             self.assertEqual(order["expected_payout"], "30000")
             self.assertEqual(order["review_result"], "")
+            self.assertEqual(
+                [flow["payee"] for flow in order["flows"]],
+                ["Goddess Space", "206-4-xxx781"],
+            )
 
     def test_order_source_citation_must_exist_in_the_same_group(self) -> None:
         payment_media = f"{GROUP_KEY}:2#media:0"

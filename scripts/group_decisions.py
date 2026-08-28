@@ -190,6 +190,54 @@ def _decision_template() -> dict[str, Any]:
     }
 
 
+def fund_evidence_decision(
+    *,
+    event_type: str,
+    payee: object,
+    ocr: Mapping[str, Any],
+    disposition: str = "order_evidence",
+    flow_side: str | None = None,
+    note: object = None,
+) -> dict[str, Any]:
+    """Build a fund decision while keeping the observed payee explicit and unchanged."""
+    core.require(
+        disposition in {"order_evidence", "uncertain"},
+        "fund evidence disposition must be order_evidence or uncertain",
+    )
+    core.require(
+        event_type in core.FUND_EVENT_TYPES,
+        f"unsupported fund event_type {event_type!r}",
+    )
+    core.require(isinstance(ocr, Mapping), "fund evidence ocr must be an object")
+
+    payee_text = core.clean_text(payee)
+    core.require(
+        bool(payee_text),
+        "payee is required and must be explicitly transcribed from the evidence",
+    )
+    normalized_ocr = copy.deepcopy(dict(ocr))
+    existing_payee = core.clean_text(normalized_ocr.get("payee"))
+    core.require(
+        not existing_payee or existing_payee == payee_text,
+        "ocr.payee conflicts with the explicit payee",
+    )
+    normalized_ocr["payee"] = payee_text
+
+    normalized_side = core.clean_text(flow_side) or None
+    if disposition == "uncertain":
+        core.require(normalized_side is None, "uncertain fund evidence cannot contain flow_side")
+    elif normalized_side is not None:
+        core.require(normalized_side in FLOW_SIDES, f"unsupported flow_side {flow_side!r}")
+
+    return {
+        "disposition": disposition,
+        "event_type": event_type,
+        "flow_side": normalized_side,
+        "ocr": normalized_ocr,
+        "note": copy.deepcopy(note),
+    }
+
+
 def _evidence_media(group: Mapping[str, Any]) -> list[tuple[Mapping[str, Any], Mapping[str, Any]]]:
     result: list[tuple[Mapping[str, Any], Mapping[str, Any]]] = []
     for message in group.get("messages", []):

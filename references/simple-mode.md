@@ -114,11 +114,38 @@ read_group(group_key, cursor, limit)
 ### 图片字段
 
 - `ocr.amount/currency/payee/status_*` 只来自图片可见内容，不用聊天公式回填 OCR。
-- `payee` 必填并保留原图掩码；未显示写 `未显示`，看不清写 `无法辨认`，现金固定写 `现金`。
+- `payee` 是凭证中最具体的可见收款标识。它必填，不得用发送者角色、事件类型或资金方向生成。只有
+  泰国银行卡转账凭证以收款银行卡号作为 `payee`，例如 `206-4-xxx781`，原图有掩码时原样保留；其他
+  付款方式仍记录各自可见的具体收款名称、商户或地址。底层继续把 `payee` 作为一个通用字符串原样传递。
+  未显示写 `未显示`，看不清写 `无法辨认`，现金固定写 `现金`。
 - 现金的 `amount` 使用无千分位的标准十进制数；`amount_text` 可保留票面的正负号、逗号或手写单位。
 - 图片明确失败时使用 `status_class=failed`；没有状态时使用 `blank`。`pending|blank|unknown` 不自动排除
   清楚且完整的金额，只有失败或证据不完整的流水不进入合计。
 - 明确显示 TRX 就记录 TRX，不换写成 USDT。
+
+程序化填写群判定时使用统一写入接口，显式传入看图得到的收款方：
+
+```python
+from group_decisions import fund_evidence_decision
+
+item["decision"] = fund_evidence_decision(
+    event_type="payout_screenshot",
+    payee="206-4-xxx781",
+    ocr={
+        "amount": "10416",
+        "currency": "THB",
+        "status_text": "Transaction successful",
+        "status_class": "completed",
+        "status_class_confidence": "high",
+        "amount_completeness": "complete",
+        "confidence": "high",
+    },
+    flow_side="payout",
+)
+```
+
+接口只负责建立合法的资金凭证判定并保存明确传入的 `payee`，不根据平台、客户、内部人员或资金方向替换
+该值。直接手工填写 JSON 时遵守同一字段含义。
 
 ### 订单字段
 

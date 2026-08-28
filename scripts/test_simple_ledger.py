@@ -500,6 +500,28 @@ class SimpleLedgerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "payee is required"):
             build_workbook.validate_orders(orders)
 
+    def test_detailed_payee_text_round_trips_to_workbook_unchanged(self) -> None:
+        for payee in ("王少秋（**秋）", "206-4-xxx781"):
+            with self.subTest(payee=payee):
+                normalized, events, plan = fixture()
+                events[0]["ocr"]["payee"] = payee
+
+                orders, _ = simple_ledger.compile_simple_ledger(
+                    normalized,
+                    events,
+                    "sha256:events-test",
+                    plan,
+                )
+
+                payment = orders["groups"][0]["orders"][0]["flows"][0]
+                self.assertEqual(payment["payee"], payee)
+                payment_row = next(
+                    row
+                    for row in build_workbook.order_rows(orders["groups"][0]["orders"][0])
+                    if row[0] == "客户付款"
+                )
+                self.assertEqual(payment_row[core.HEADERS.index("收款方")], payee)
+
     def test_cash_fund_flow_records_cash_as_payee(self) -> None:
         normalized, events, plan = fixture()
         events[0]["type"] = "cash_payment"
