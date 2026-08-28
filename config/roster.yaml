@@ -1,0 +1,15 @@
+roster_version: 1
+
+# Sender names are normalized with Unicode NFKC; whitespace and bidi controls
+# are removed; wave dashes are normalized to ~; then Unicode casefold is used.
+staff:
+  patterns:
+    - kind: prefix
+      value: "qq"
+      note: "QQ/Q Q 前缀均为内部人员，包括财务、售后和技术"
+    - kind: contains
+      value: "小涵总"
+      note: "管理层内部人员"
+    - kind: contains
+      value: "财务"
+      note: "名称中带QQ和财务的人员均为内部人员"
