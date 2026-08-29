@@ -35,6 +35,7 @@ ORDER_FIELDS = frozenset(
         "rate",
         "rate_operator",
         "expected_payout",
+        "note",
         "same_transactions",
         "legs",
         "fees",
@@ -210,10 +211,10 @@ def fund_evidence_decision(
     )
     core.require(isinstance(ocr, Mapping), "fund evidence ocr must be an object")
 
-    payee_text = core.clean_text(payee)
-    core.require(
-        bool(payee_text),
-        "payee is required and must be explicitly transcribed from the evidence",
+    payee_text = core.validate_payee(
+        payee,
+        field="payee",
+        cash=event_type in {"cash_payment", "cash_payout"},
     )
     normalized_ocr = copy.deepcopy(dict(ocr))
     existing_payee = core.clean_text(normalized_ocr.get("payee"))
@@ -487,6 +488,11 @@ def _compile_orders(
         core.require(isinstance(raw_order, Mapping), f"{field} must be an object")
         unknown_fields = sorted(set(raw_order) - ORDER_FIELDS)
         core.require(not unknown_fields, f"{field}: unsupported fields: {', '.join(unknown_fields)}")
+        if raw_order.get("legs") not in (None, "", []):
+            core.require(
+                bool(core.clean_text(raw_order.get("note"))),
+                f"{field}.note is required for a multi-leg order because legs are shown in the order remark",
+            )
         event_ids_value = raw_order.get("event_ids")
         core.require(isinstance(event_ids_value, list) and event_ids_value, f"{field}.event_ids is required")
         event_ids = [str(item) for item in event_ids_value]
@@ -582,6 +588,12 @@ def compile_decision_documents(
             }
             if disposition in {"order_evidence", "uncertain"}:
                 event["ocr"] = copy.deepcopy(decision["ocr"])
+                media_path = core.clean_text(media.get("path"))
+                existing_hash = core.clean_text(media.get("blob_sha256"))
+                if existing_hash:
+                    event["evidence_sha256"] = existing_hash
+                elif availability == "available" and media_path and Path(media_path).is_file():
+                    event["evidence_sha256"] = core.sha256_file(Path(media_path))
             if _present(decision.get("note")):
                 event["note"] = decision["note"]
             if disposition == "order_evidence":

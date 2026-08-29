@@ -437,17 +437,23 @@ def normalize_group(
         content_type = int(row["ZCONTENTTYPE"] or 0)
         text = clean_text(row["ZTEXT"])
         sender_pk = row["ZSENDER"]
+        send_status = int(row["ZSENDSTATUS"] or 0)
         is_system = content_type == SYSTEM_CONTENT_TYPE or (
-            sender_pk is None and bool(CONTEXT_ONLY_NOTIFICATION_RE.search(text))
+            sender_pk is None
+            and (send_status != 1 or bool(CONTEXT_ONLY_NOTIFICATION_RE.search(text)))
         )
         if is_system:
             sender_id = None
             sender_name = None
             role = "未知"
-        elif sender_pk is None:
+        elif sender_pk is None and send_status == 1:
             sender_id = "line:self"
             sender_name = self_name
             role = "内部人员"
+        elif sender_pk is None:
+            sender_id = None
+            sender_name = None
+            role = "未知"
         else:
             sender_id, sender_name = users.get(int(sender_pk), (f"line:user-pk-{sender_pk}", ""))
             role = core.classify_role(sender_name or sender_id, roster=roster)
@@ -486,7 +492,7 @@ def normalize_group(
                         ),
                         "path": str(final_path),
                         "original_reference": str(selected_row["relativePath"]),
-                        "blob_sha256": core.sha256_file(selected_path),
+                        "blob_sha256": None,
                         "byte_size": selected_path.stat().st_size,
                         "variant": (
                             "primary"
@@ -496,7 +502,6 @@ def normalize_group(
                         "missing_kind": None,
                     }
                 )
-                fingerprint_paths.append(selected_path)
         elif should_have_image:
             media.append(
                 {
@@ -515,7 +520,11 @@ def normalize_group(
             )
             warnings.append(f"{message_id}: image attachment is missing from the backup")
 
-        excluded = is_system or content_type == ALBUM_CONTAINER_CONTENT_TYPE or role == "未知"
+        excluded = (
+            is_system
+            or content_type == ALBUM_CONTAINER_CONTENT_TYPE
+            or bool(core.BOT_NAME_RE.search(sender_name or ""))
+        )
         messages.append(
             {
                 "message_id": message_id,

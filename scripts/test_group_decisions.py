@@ -277,6 +277,8 @@ class GroupDecisionTests(unittest.TestCase):
                         messages[20]["message_id"],
                         messages[32]["message_id"],
                     ],
+                    "customer_id": "customer-1",
+                    "customer_nickname": "客户",
                     "direction": "CNY->THB",
                     "rate": "4.96",
                     "expected_payout": "30000",

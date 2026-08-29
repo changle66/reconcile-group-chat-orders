@@ -149,13 +149,18 @@ def flow_row_label(flow: Mapping[str, Any]) -> str | None:
 def flow_row_note(flow: Mapping[str, Any]) -> str | None:
     if flow.get("side") == "unassigned":
         return "金额和币种按截图展示；尚未归入订单，未计入任何订单合计。"
-    if flow.get("duplicate_of"):
-        return "与另一张截图为同一笔交易，金额未重复计入。"
-    if flow.get("status") == "failed":
-        return "截图明确显示失败，金额未计入。"
+    if flow.get("duplicate_of") or flow.get("status") == "failed":
+        return None
     if not flow.get("included"):
         return "截图金额或币种尚未清楚确认，金额未计入。"
     return None
+
+
+def order_row_note(order: Mapping[str, Any]) -> str | None:
+    explicit_note = core.clean_text(order.get("note"))
+    if explicit_note:
+        return explicit_note
+    return core.clean_text(order.get("anomaly_note")) or None
 
 
 def pricing_detail_rows(order: Mapping[str, Any]) -> list[list[Any]]:
@@ -164,14 +169,6 @@ def pricing_detail_rows(order: Mapping[str, Any]) -> list[list[Any]]:
         "service_fee": "手续费",
         "network_fee": "网络费用",
     }
-    treatment_labels = {
-        "added_to_payment": "已包含在客户付款中，计价时从付款本金扣除",
-        "added_to_payout": "加到应回金额",
-        "deducted_from_payout": "从应回金额扣除",
-        "included_in_quote": "已含在报价",
-        "separate": "另行结算",
-    }
-    rounding_labels = {"half_up": "四舍五入", "down": "向下取整", "up": "向上取整"}
     legs = order.get("legs", [])
     sources: list[tuple[str | None, list[Mapping[str, Any]], Mapping[str, Any] | None]] = []
     if legs:
@@ -202,24 +199,7 @@ def pricing_detail_rows(order: Mapping[str, Any]) -> list[list[Any]]:
     for direction, fees, rounding in sources:
         for fee in fees:
             kind = core.clean_text(fee.get("kind")).casefold()
-            treatment = core.clean_text(fee.get("treatment")).casefold()
             label = fee_labels.get(kind, kind or "费用")
-            treatment_label = treatment_labels.get(treatment, treatment or "处理方式未填写")
-            amount_text = core.clean_text(fee.get("amount"))
-            currency = core.clean_text(fee.get("currency"))
-            amount_with_currency = " ".join(part for part in (amount_text, currency) if part)
-            fee_note = f"{label}："
-            if amount_with_currency:
-                fee_note += f"{amount_with_currency}，"
-            fee_note += treatment_label
-            if kind == "delivery_fee" and treatment == "deducted_from_payout" and not order.get("legs"):
-                expected_payout = core.clean_text(order.get("expected_payout"))
-                payout_currency = core.clean_text(order.get("payout_currency"))
-                if expected_payout and payout_currency:
-                    fee_note += (
-                        f"；表中应回金额 {expected_payout} {payout_currency} 已为扣费后的净额"
-                    )
-            fee_note += "。"
             rows.append(
                 [
                     label,
@@ -234,16 +214,12 @@ def pricing_detail_rows(order: Mapping[str, Any]) -> list[list[Any]]:
                     None,
                     None,
                     None,
-                    fee_note,
+                    None,
                     None,
                     None,
                 ]
             )
         if rounding:
-            mode = core.clean_text(rounding.get("mode")).casefold()
-            mode_label = rounding_labels.get(mode, mode or "处理方式未填写")
-            unit = core.clean_text(rounding.get("unit"))
-            currency = core.clean_text(rounding.get("currency"))
             rows.append(
                 [
                     "舍入",
@@ -258,7 +234,7 @@ def pricing_detail_rows(order: Mapping[str, Any]) -> list[list[Any]]:
                     None,
                     None,
                     None,
-                    f"舍入：按 {unit} {currency} {mode_label}。",
+                    None,
                     None,
                     None,
                 ]
@@ -281,31 +257,11 @@ def order_rows(order: Mapping[str, Any]) -> list[list[Any]]:
             excel_number(order.get("expected_payout")),
             excel_number(order.get("actual_payout_total")),
             order.get("review_result") or None,
-            order.get("anomaly_note") or None,
+            order_row_note(order),
             None,
             None,
         ]
     ]
-    for leg in order.get("legs", []):
-        rows.append(
-            [
-                "换汇明细",
-                order.get("order_id"),
-                None,
-                None,
-                leg.get("direction"),
-                excel_number(leg.get("payment_total")),
-                rate_cell(leg),
-                None,
-                None,
-                excel_number(leg.get("expected_payout")),
-                excel_number(leg.get("actual_payout_total")),
-                leg.get("review_result") or None,
-                leg.get("anomaly_note") or None,
-                None,
-                None,
-            ]
-        )
     rows.extend(pricing_detail_rows(order))
     for flow in order.get("flows", []):
         if not flow.get("included") and not flow.get("display_in_workbook"):

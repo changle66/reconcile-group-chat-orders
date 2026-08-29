@@ -20,7 +20,7 @@ except ImportError:  # The roster subset also has a small stdlib fallback parser
 
 NORMALIZED_CONTRACT = "small-group-normalized/1.0"
 ORDERS_CONTRACT = "small-group-simple-orders/1.1"
-RULE_VERSION = "simple-ledger/1.1"
+RULE_VERSION = "simple-ledger/1.2"
 getcontext().prec = 60
 
 HEADERS = [
@@ -61,11 +61,11 @@ MEDIA_EVENT_TYPES = EVENT_TYPES
 NON_EVIDENCE_MEDIA_KINDS = {"audio", "video", "sticker", "animation"}
 
 CURRENCY_TOLERANCES = {
-    "CNY": Decimal("1.00"),
-    "THB": Decimal("1.00"),
-    "USDT": Decimal("0.01"),
-    "TRX": Decimal("0.000001"),
-    "USD": Decimal("0.01"),
+    "CNY": Decimal("0"),
+    "THB": Decimal("0"),
+    "USDT": Decimal("0"),
+    "TRX": Decimal("0"),
+    "USD": Decimal("0"),
 }
 CURRENCIES = frozenset(CURRENCY_TOLERANCES)
 DIRECTIONS = {
@@ -102,6 +102,11 @@ COMPLETED_STATUS_RE = re.compile(
 STATUS_CLASSES = frozenset({"failed", "pending", "completed", "blank", "unknown"})
 CONFIDENCE_LEVELS = frozenset({"high", "medium", "low"})
 AMOUNT_COMPLETENESS = frozenset({"complete", "partial", "unreadable"})
+UNKNOWN_PAYEES = frozenset({"未显示", "无法辨认"})
+GENERIC_PAYEE_RE = re.compile(
+    r"^(?:截图所示|聊天指定|固定金额二维码|支付宝截图所示).*(?:收款方|收款账户|收款地址|账户)?$",
+    re.IGNORECASE,
+)
 BOT_NAME_RE = re.compile(r"(?:自动统计机器人|统计机器人|机器人A\d+)", re.IGNORECASE)
 CASH_AMOUNT_NOTATION_RE = re.compile(
     r"(?P<sign>[+-])?\s*(?:(?P<number>(?:\d+(?:\.\d*)?|\.\d+))\s*)?(?P<suffix>[wk])",
@@ -233,6 +238,22 @@ def clean_text(value: object) -> str:
     return text.replace("\r\n", "\n").replace("\r", "\n").strip("\u3000 \t\n")
 
 
+def validate_payee(value: object, *, field: str, cash: bool = False) -> str:
+    """Return an evidence payee while rejecting descriptive placeholders."""
+    payee = "现金" if cash else clean_text(value)
+    require(
+        bool(payee),
+        f"{field} is required; use 未显示 or 无法辨认 only when that is true of the evidence",
+    )
+    if not cash:
+        require(
+            GENERIC_PAYEE_RE.fullmatch(payee) is None,
+            f"{field} must be the exact visible name, masked account, or address; "
+            f"generic placeholder is forbidden: {payee!r}",
+        )
+    return payee
+
+
 def normalize_currency(
     value: object,
     *,
@@ -359,20 +380,15 @@ def classify_status(event_type: str, status_text: object, status_class: object =
 def classify_fund_status(event: Mapping[str, Any]) -> str:
     ocr = event.get("ocr") if isinstance(event.get("ocr"), dict) else {}
     event_type = str(event.get("type") or "")
-    text_status = classify_status(event_type, ocr.get("status_text"))
     declared = clean_text(ocr.get("status_class")).casefold()
     declared_confidence = clean_text(ocr.get("status_class_confidence")).casefold()
     if declared and declared not in STATUS_CLASSES:
         return "unknown"
     if declared and declared_confidence not in {"", "high"}:
         return "unknown"
-    if text_status != "unknown" and declared in {"failed", "pending", "completed"} and declared != text_status:
-        return "unknown"
-    if text_status != "unknown":
-        return text_status
     if declared in STATUS_CLASSES:
         return declared
-    return "unknown"
+    return classify_status(event_type, ocr.get("status_text"))
 
 
 def load_normalized(path: Path) -> dict[str, Any]:
@@ -428,10 +444,11 @@ def load_normalized(path: Path) -> dict[str, Any]:
                 if availability == "available":
                     require(isinstance(media.get("path"), str) and media["path"], f"{media_id}: available media needs path")
                     blob_hash = media.get("blob_sha256")
-                    require(
-                        isinstance(blob_hash, str) and re.fullmatch(r"[0-9a-f]{64}", blob_hash) is not None,
-                        f"{media_id}: available media needs lowercase SHA-256",
-                    )
+                    if blob_hash not in (None, ""):
+                        require(
+                            isinstance(blob_hash, str) and re.fullmatch(r"[0-9a-f]{64}", blob_hash) is not None,
+                            f"{media_id}: blob_sha256 must be lowercase SHA-256 when present",
+                        )
                     require(
                         isinstance(media.get("byte_size"), int) and media["byte_size"] >= 0,
                         f"{media_id}: invalid byte_size",
@@ -500,15 +517,10 @@ def load_events(events_dir: Path, normalized: Mapping[str, Any]) -> tuple[list[d
                     field=f"{path}:{line_number}: ocr.currency",
                     allow_none=True,
                 )
-                payee = (
-                    "现金"
-                    if event_type in {"cash_payment", "cash_payout"}
-                    else clean_text(ocr.get("payee"))
-                )
-                require(
-                    bool(payee),
-                    f"{path}:{line_number}: ocr.payee is required; "
-                    "use 未显示 or 无法辨认 only when that is true of the evidence",
+                payee = validate_payee(
+                    ocr.get("payee"),
+                    field=f"{path}:{line_number}: ocr.payee",
+                    cash=event_type in {"cash_payment", "cash_payout"},
                 )
                 normalized_ocr["payee"] = payee
                 status_class = clean_text(ocr.get("status_class")).casefold()

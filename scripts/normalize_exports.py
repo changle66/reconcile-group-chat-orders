@@ -28,6 +28,7 @@ WHATSAPP_ATTACHMENT_RE = re.compile(
 )
 MENTION_RE = re.compile(r"@([^@\n\r，。；、]{1,64})")
 WHATSAPP_SENDER_RE = re.compile(r"^(?P<sender>[^:\n]{1,120}):(?:\s(?P<text>[\s\S]*))?$")
+GENERATED_PATH_MARKERS = ("订单核对", "上游重跑", "ocr_runtime", ".reconcile")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -57,10 +58,15 @@ def discover_sources(inputs: Iterable[Path]) -> tuple[list[Path], list[Path]]:
             continue
         if not path.is_dir():
             raise ValueError(f"input does not exist: {path}")
-        direct_json = path / "result.json"
-        if direct_json.is_file():
-            telegram.add(direct_json.resolve())
-        for candidate in path.glob("*.txt"):
+        for candidate in path.rglob("result.json"):
+            relative_parts = candidate.relative_to(path).parts[:-1]
+            if any(marker.casefold() in part.casefold() for part in relative_parts for marker in GENERATED_PATH_MARKERS):
+                continue
+            telegram.add(candidate.resolve())
+        for candidate in path.rglob("*.txt"):
+            relative_parts = candidate.relative_to(path).parts[:-1]
+            if any(marker.casefold() in part.casefold() for part in relative_parts for marker in GENERATED_PATH_MARKERS):
+                continue
             if "whatsapp" in candidate.name.casefold():
                 whatsapp.add(candidate.resolve())
     if not telegram and not whatsapp:
@@ -127,14 +133,12 @@ def telegram_media(message: dict[str, Any], source: Path) -> tuple[list[dict[str
                 "source_field": field,
                 "path": str(candidate) if available else None,
                 "original_reference": reference,
-                "blob_sha256": core.sha256_file(candidate) if available else None,
+                "blob_sha256": None,
                 "byte_size": candidate.stat().st_size if available else None,
                 "missing_kind": "not_exported" if not available and reference.startswith("(File not included") else ("missing" if not available else None),
             }
         )
-        if available:
-            fingerprint_paths.append(candidate)
-        else:
+        if not available:
             warnings.append(f"Telegram media missing: {source} :: {reference}")
     return media, warnings, fingerprint_paths
 
@@ -182,7 +186,7 @@ def normalize_telegram(
         raw_reply = raw_message.get("reply_to_message_id")
         reply_to = f"{group_key}:{raw_reply}" if raw_reply not in (None, "") else None
         message_type = str(raw_message.get("type") or "message")
-        excluded = message_type != "message" or role == "未知"
+        excluded = message_type != "message" or bool(core.BOT_NAME_RE.search(sender_name or ""))
         mentions = [core.clean_text(match.group(1)) for match in MENTION_RE.finditer(text)]
         messages.append(
             {
@@ -280,14 +284,12 @@ def whatsapp_media(text: str, source: Path) -> tuple[list[dict[str, Any]], list[
                 "source_field": "whatsapp_attachment",
                 "path": str(candidate) if available else None,
                 "original_reference": reference,
-                "blob_sha256": core.sha256_file(candidate) if available else None,
+                "blob_sha256": None,
                 "byte_size": candidate.stat().st_size if available else None,
                 "missing_kind": None if available else "missing",
             }
         )
-        if available:
-            fingerprint_paths.append(candidate)
-        else:
+        if not available:
             warnings.append(f"WhatsApp media missing: {source} :: {reference}")
     return media, warnings, fingerprint_paths
 
@@ -342,7 +344,7 @@ def normalize_whatsapp(
                 "media": media,
                 "source_file": str(source),
                 "source_sequence": raw_sequence,
-                "excluded_from_accounting": sender_name is None or role == "未知",
+                "excluded_from_accounting": sender_name is None or bool(core.BOT_NAME_RE.search(sender_name or "")),
             }
         )
     for index, message in enumerate(staged, start=1):

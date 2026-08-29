@@ -15,19 +15,15 @@ import core
 
 
 LEGACY_SIMPLE_PLAN_CONTRACT = "small-group-simple-plan/1.0"
-SIMPLE_PLAN_CONTRACT = "small-group-simple-plan/1.1"
+INTERMEDIATE_SIMPLE_PLAN_CONTRACT = "small-group-simple-plan/1.1"
+SIMPLE_PLAN_CONTRACT = "small-group-simple-plan/1.2"
 SUPPORTED_SIMPLE_PLAN_CONTRACTS = {
     LEGACY_SIMPLE_PLAN_CONTRACT,
+    INTERMEDIATE_SIMPLE_PLAN_CONTRACT,
     SIMPLE_PLAN_CONTRACT,
 }
-SIMPLE_MODE_VERSION = "1.2"
-EVENT_SIDE = {
-    "payment_screenshot": "payment",
-    "cash_payment": "payment",
-    "payout_screenshot": "payout",
-    "cash_payout": "payout",
-    "payout_recovery": "recovery",
-}
+SIMPLE_MODE_VERSION = "1.3"
+SUPPORTED_FUND_EVENT_TYPES = frozenset(core.FUND_EVENT_TYPES)
 FLOW_LABEL = {
     "payment": "客户付款",
     "payment_refund": "付款退款",
@@ -35,6 +31,7 @@ FLOW_LABEL = {
     "recovery": "回款追回",
 }
 FLOW_SIDES = frozenset(FLOW_LABEL)
+MODEL_FLOW_SIDES = FLOW_SIDES | {"unknown"}
 RATE_OPERATORS = frozenset({"multiply", "divide"})
 FEE_KINDS = frozenset({"delivery_fee", "service_fee", "network_fee"})
 NETWORK_FEE_TREATMENTS = frozenset({"added_to_payment", "deducted_from_payout"})
@@ -54,17 +51,12 @@ ROUNDING_MODES = {
 }
 
 
-def _simple_side(
-    event_type: str,
-    message: Mapping[str, Any],
-    side_override: str | None = None,
-) -> str:
-    if side_override:
-        core.require(side_override in FLOW_SIDES, f"unsupported simple flow side: {side_override}")
-        return side_override
-    if event_type in {"payment_screenshot", "payout_screenshot"}:
-        return "payout" if message.get("role") == "内部人员" else "payment"
-    return EVENT_SIDE.get(event_type, "unknown")
+def _simple_side(side_override: str | None) -> str:
+    side = core.clean_text(side_override).casefold()
+    if not side:
+        return "unknown"
+    core.require(side in MODEL_FLOW_SIDES, f"unsupported simple flow side: {side}")
+    return side
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -75,17 +67,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("-o", "--output", required=True, type=Path)
     parser.add_argument("--force", action="store_true")
     return parser.parse_args(argv)
-
-
-def _event_media(
-    event: Mapping[str, Any],
-    message: Mapping[str, Any],
-) -> Mapping[str, Any] | None:
-    media_id = str(event.get("media_id") or "")
-    for media in message.get("media", []):
-        if isinstance(media, Mapping) and str(media.get("media_id") or "") == media_id:
-            return media
-    return None
 
 
 def _cash_amount(event: Mapping[str, Any]) -> Decimal | None:
@@ -132,25 +113,11 @@ def _visible_currency(event: Mapping[str, Any]) -> str | None:
 
 
 def _visible_payee(event: Mapping[str, Any]) -> str:
-    if event.get("type") in {"cash_payment", "cash_payout"}:
-        return "现金"
     ocr = event.get("ocr") if isinstance(event.get("ocr"), Mapping) else {}
-    payee = core.clean_text(ocr.get("payee"))
-    core.require(
-        bool(payee),
-        f"{event.get('event_id') or 'fund_event'}.payee is required; "
-        "use 未显示 or 无法辨认 only when that is true of the evidence",
-    )
-    return payee
-
-
-def _explicitly_failed(event: Mapping[str, Any]) -> bool:
-    ocr = event.get("ocr") if isinstance(event.get("ocr"), Mapping) else {}
-    page_status = core.classify_status(str(event.get("type") or ""), ocr.get("status_text"))
-    declared = core.clean_text(ocr.get("status_class")).casefold()
-    declared_confidence = core.clean_text(ocr.get("status_class_confidence")).casefold()
-    return page_status == "failed" or (
-        declared == "failed" and declared_confidence in {"", "high"}
+    return core.validate_payee(
+        ocr.get("payee"),
+        field=f"{event.get('event_id') or 'fund_event'}.payee",
+        cash=event.get("type") in {"cash_payment", "cash_payout"},
     )
 
 
@@ -164,7 +131,7 @@ def _flow_from_event(
 ) -> tuple[dict[str, Any], str | None]:
     event_id = str(event.get("event_id") or "")
     event_type = str(event.get("type") or "")
-    side = _simple_side(event_type, message, side_override)
+    side = _simple_side(side_override)
     ocr = event.get("ocr") if isinstance(event.get("ocr"), Mapping) else {}
     amount = _visible_amount(event)
     currency = _visible_currency(event)
@@ -179,14 +146,15 @@ def _flow_from_event(
 
     issue: str | None = None
     included = False
-    if duplicate_of:
-        duplicate_label = "declared same transaction as" if duplicate_basis == "declared_same_transaction" else "exact duplicate of"
-        issue = f"{event_id}: {duplicate_label} {duplicate_of}; counted once"
+    display_in_workbook = not duplicate_of and status != "failed"
+    # Payee is preserved as evidence data, including 未显示/无法辨认, but does
+    # not control whether the order is complete.
+    if not display_in_workbook:
+        pass
     elif side == "unknown":
-        issue = f"{event_id}: unsupported fund image type {event_type!r}"
-    elif _explicitly_failed(event):
-        status = "failed"
-        issue = f"{event_id}: image explicitly shows failure; not counted"
+        issue = f"{event_id}: model left the fund-flow side unknown"
+    elif status != "completed":
+        issue = f"{event_id}: model marked fund result as {status}; not counted"
     elif amount is None or currency is None or completeness != "complete" or confidence != "high":
         issue = f"{event_id}: amount or currency is not clearly readable"
     else:
@@ -206,7 +174,7 @@ def _flow_from_event(
             "included": included,
             "duplicate_of": duplicate_of,
             "duplicate_basis": duplicate_basis if duplicate_of else None,
-            "display_in_workbook": True,
+            "display_in_workbook": display_in_workbook,
             "leg_id": None,
             "leg_direction": None,
         },
@@ -227,7 +195,7 @@ def _side_total(flows: list[dict[str, Any]], side: str) -> tuple[Decimal | None,
         if flow["side"] == side
         and not flow["included"]
         and flow.get("status") != "failed"
-        and not flow.get("duplicate_of")
+        and flow.get("duplicate_basis") is None
     ]
     if not included or unresolved:
         return None, False
@@ -247,7 +215,7 @@ def _optional_side_total(
         for flow in relevant
         if not flow["included"]
         and flow.get("status") != "failed"
-        and not flow.get("duplicate_of")
+        and flow.get("duplicate_basis") is None
     ]
     if unresolved:
         return None, False
@@ -294,8 +262,10 @@ def _append_note(existing: str, note: str) -> str:
     return "\n".join(parts)
 
 
-def _rate_operator(value: object, *, field: str) -> str:
-    operator = core.clean_text(value).casefold() or "multiply"
+def _rate_operator(value: object, *, field: str, required: bool = False) -> str:
+    raw = core.clean_text(value).casefold()
+    core.require(not required or bool(raw), f"{field} is required when rate is used to calculate expected payout")
+    operator = raw or "multiply"
     core.require(operator in RATE_OPERATORS, f"{field} must be multiply or divide")
     return operator
 
@@ -404,17 +374,23 @@ def _pricing_result(
     str,
     list[dict[str, str]],
     dict[str, str] | None,
+    str | None,
 ]:
     rate = _parse_optional_decimal(rate_value, field=f"{field}.rate")
     if rate is not None:
         core.require(rate > 0, f"{field}.rate must be positive")
-    operator = _rate_operator(operator_value, field=f"{field}.rate_operator")
     explicit_expected = _parse_optional_decimal(
         explicit_expected_value,
         field=f"{field}.expected_payout",
     )
     if explicit_expected is not None:
         core.require(explicit_expected >= 0, f"{field}.expected_payout cannot be negative")
+    operator_supplied = bool(core.clean_text(operator_value))
+    operator = _rate_operator(
+        operator_value,
+        field=f"{field}.rate_operator",
+        required=False,
+    )
     fees, payment_deduction, payout_adjustment = _compile_fees(
         fees_value,
         payment_currency=payment_currency,
@@ -429,22 +405,31 @@ def _pricing_result(
     payment_basis = payment_total - payment_deduction
     core.require(payment_basis >= 0, f"{field} fees exceed customer payment")
     expected: Decimal | None = None
+    pricing_issue: str | None = None
     if explicit_expected is not None:
         expected = explicit_expected
-    elif rate is not None:
+    if rate is not None and (explicit_expected is None or operator_supplied):
         if operator == "multiply":
             base_expected = payment_basis * rate
         else:
             base_expected = payment_basis / rate
         adjusted = base_expected + payout_adjustment
         core.require(adjusted >= 0, f"{field} fees exceed expected payout")
-        expected = _round_to_unit(adjusted, rounding)
+        calculated_expected = _round_to_unit(adjusted, rounding)
+        if explicit_expected is None:
+            expected = calculated_expected
+        elif calculated_expected != explicit_expected:
+            pricing_issue = (
+                f"明确应回 {core.decimal_text(explicit_expected)} 与汇率计算 "
+                f"{core.decimal_text(calculated_expected)} 不一致"
+            )
     return (
         expected,
         rate,
         operator,
         fees,
         rounding if explicit_rounding else None,
+        pricing_issue,
     )
 
 
@@ -466,6 +451,8 @@ def _rate_display(
 def _event_side_overrides(
     raw_order: Mapping[str, Any],
     event_ids: list[str],
+    *,
+    require_complete: bool,
 ) -> dict[str, str]:
     value = raw_order.get("event_sides", {})
     core.require(isinstance(value, Mapping), "simple_order.event_sides must be an object")
@@ -473,7 +460,13 @@ def _event_side_overrides(
     unknown = sorted(set(overrides) - set(event_ids))
     core.require(not unknown, f"simple_order.event_sides cites events outside the order: {unknown}")
     for event_id, side in overrides.items():
-        core.require(side in FLOW_SIDES, f"simple_order.event_sides[{event_id}] is unsupported")
+        core.require(side in MODEL_FLOW_SIDES, f"simple_order.event_sides[{event_id}] is unsupported")
+    if require_complete:
+        missing = sorted(set(event_ids) - set(overrides))
+        core.require(
+            not missing,
+            f"simple_order requires an explicit side for every event; missing: {missing}",
+        )
     return overrides
 
 
@@ -549,7 +542,7 @@ def _compile_order(
     messages: Mapping[str, Mapping[str, Any]],
     event_index: Mapping[str, Mapping[str, Any]],
     assigned_events: set[str],
-    seen_blobs: dict[str, str],
+    require_model_judgments: bool,
 ) -> tuple[dict[str, Any], list[str]]:
     event_ids_value = raw_order.get("event_ids")
     core.require(
@@ -561,7 +554,14 @@ def _compile_order(
         len(event_ids) == len(set(event_ids)),
         f"{group_key}: simple order {position} repeats an event_id",
     )
-    side_overrides = _event_side_overrides(raw_order, event_ids)
+    if require_model_judgments:
+        for field in ("customer_id", "customer_nickname", "direction"):
+            core.require(field in raw_order, f"simple_order.{field} must be explicitly supplied by the model")
+    side_overrides = _event_side_overrides(
+        raw_order,
+        event_ids,
+        require_complete=require_model_judgments,
+    )
     semantic_duplicates = _same_transaction_map(raw_order, event_ids, event_index)
     flows: list[dict[str, Any]] = []
     issues: list[str] = []
@@ -570,19 +570,15 @@ def _compile_order(
         event = event_index.get(event_id)
         core.require(event is not None, f"unknown simple order event_id: {event_id}")
         core.require(event.get("group_key") == group_key, f"simple order event belongs to another group: {event_id}")
-        core.require(event.get("type") in EVENT_SIDE, f"simple order event is not supported fund evidence: {event_id}")
+        core.require(
+            event.get("type") in SUPPORTED_FUND_EVENT_TYPES,
+            f"simple order event is not supported fund evidence: {event_id}",
+        )
         message_id = str(event.get("message_id") or "")
         message = messages.get(message_id)
         core.require(message is not None, f"simple order event has no source message: {event_id}")
-        media = _event_media(event, message)
-        blob = core.clean_text(media.get("blob_sha256")) if isinstance(media, Mapping) else ""
         duplicate_of = semantic_duplicates.get(event_id)
         duplicate_basis = "declared_same_transaction" if duplicate_of else None
-        if duplicate_of is None:
-            duplicate_of = seen_blobs.get(blob) if blob else None
-            duplicate_basis = "identical_blob" if duplicate_of else None
-        if blob and duplicate_of is None:
-            seen_blobs[blob] = event_id
         flow, issue = _flow_from_event(
             event,
             message,
@@ -613,21 +609,8 @@ def _compile_order(
             f"same transaction sides differ: {event_id} vs {same_as}",
         )
 
-    customer_messages = [
-        messages[str(flow["source_message_id"])]
-        for flow in flows
-        if flow["side"] in {"payment", "recovery"}
-        and str(flow.get("source_message_id") or "") in messages
-        and messages[str(flow["source_message_id"])].get("role") != "内部人员"
-    ]
-    derived_customer_id = _unique_value(
-        [core.clean_text(message.get("sender_id")) for message in customer_messages]
-    )
-    derived_customer_name = _unique_value(
-        [core.clean_text(message.get("sender_name")) for message in customer_messages]
-    )
-    customer_id = core.clean_text(raw_order.get("customer_id")) or derived_customer_id or ""
-    customer_nickname = core.clean_text(raw_order.get("customer_nickname")) or derived_customer_name or ""
+    customer_id = core.clean_text(raw_order.get("customer_id"))
+    customer_nickname = core.clean_text(raw_order.get("customer_nickname"))
     identity_pending = not customer_id or not customer_nickname
     if identity_pending:
         issues.append(f"{group_key}: simple order {position} customer identity is not unique")
@@ -661,6 +644,7 @@ def _compile_order(
 
     raw_legs = raw_order.get("legs")
     multi_leg = raw_legs not in (None, "")
+    order_note = core.clean_text(raw_order.get("note"))
     compiled_legs: list[dict[str, Any]] = []
     fee_adjustments: list[dict[str, str]] = []
     expected: Decimal | None = None
@@ -672,6 +656,8 @@ def _compile_order(
     result = ""
     direction = ""
     pair_complete = False
+    pricing_pending = False
+    pricing_notes: list[str] = []
 
     if multi_leg:
         core.require(isinstance(raw_legs, list) and len(raw_legs) >= 2, "simple_order.legs requires at least two legs")
@@ -786,6 +772,7 @@ def _compile_order(
             leg_expected: Decimal | None = None
             leg_fees: list[dict[str, str]] = []
             leg_rounding: dict[str, str] | None = None
+            leg_pricing_issue: str | None = None
             if leg_complete:
                 (
                     leg_expected,
@@ -793,6 +780,7 @@ def _compile_order(
                     leg_operator,
                     leg_fees,
                     leg_rounding,
+                    leg_pricing_issue,
                 ) = _pricing_result(
                     payment_total=spec["allocation_amount"],
                     payment_currency=spec["payment_currency"],
@@ -831,6 +819,12 @@ def _compile_order(
                 else "待确认"
             )
             leg_issue_notes: list[str] = []
+            if leg_pricing_issue:
+                pricing_pending = True
+                leg_result = "待确认"
+                leg_issue_notes.append(leg_pricing_issue)
+                pricing_notes.append(f"{spec['direction']}：{leg_pricing_issue}。")
+                issues.append(f"{spec['field']}: {leg_pricing_issue}")
             if not leg_complete:
                 leg_issue_notes.append("该换汇明细的付款分配或内部回款尚未完整确认。")
             leg_anomaly = "\n".join(leg_issue_notes)
@@ -882,11 +876,6 @@ def _compile_order(
         result = "\n".join(leg_result_lines)
         pair_complete = all_legs_complete
     else:
-        direction = (
-            f"{payment_currency}->{payout_currency}"
-            if payment_currency and payout_currency and payment_currency != payout_currency
-            else ""
-        )
         requested_direction = core.clean_text(raw_order.get("direction"))
         if requested_direction:
             requested_payment, requested_payout = core.direction_currencies(
@@ -935,6 +924,7 @@ def _compile_order(
                 rate_operator,
                 fee_adjustments,
                 rounding,
+                pricing_issue,
             ) = _pricing_result(
                 payment_total=payment_total,
                 payment_currency=payment_currency,
@@ -947,6 +937,11 @@ def _compile_order(
                 field="simple_order",
             )
             result = _review_result(payout_total, expected, payout_currency)
+            if pricing_issue:
+                pricing_pending = True
+                result = "待确认"
+                pricing_notes.append(pricing_issue + "。")
+                issues.append(f"{group_key}: simple order {position}: {pricing_issue}")
         elif payment_currency is not None and payout_currency is not None:
             (
                 fee_adjustments,
@@ -981,14 +976,17 @@ def _compile_order(
         notes.append("付款拆分金额尚未闭合。")
     if multi_leg:
         notes.extend(leg_note_lines)
+    notes.extend(pricing_notes)
     if identity_pending:
         notes.append("该订单客户无法唯一确认。")
         result = "待确认"
     if not pair_complete:
         result = "待确认"
     anomaly_note = "\n".join(dict.fromkeys(note for note in notes if note))
-    if pair_complete and not identity_pending:
+    if pair_complete and not identity_pending and not pricing_pending:
         order_status = "completed"
+    elif pricing_pending:
+        order_status = "pending_pricing"
     elif identity_pending and pair_complete:
         order_status = "pending_identity"
     else:
@@ -1015,6 +1013,7 @@ def _compile_order(
             "actual_payout_total": core.decimal_text(payout_total),
             "review_result": result,
             "anomaly_note": anomaly_note,
+            "note": order_note,
             "order_status": order_status,
             "fee_adjustments": fee_adjustments,
             "rounding": rounding,
@@ -1022,79 +1021,6 @@ def _compile_order(
             "flows": flows,
         },
         issues,
-    )
-
-
-def _compile_unassigned_order(
-    event: Mapping[str, Any],
-    *,
-    group_key: str,
-    position: int,
-    messages: Mapping[str, Mapping[str, Any]],
-    seen_blobs: dict[str, str],
-) -> tuple[dict[str, Any] | None, list[str]]:
-    event_id = str(event.get("event_id") or "")
-    message_id = str(event.get("message_id") or "")
-    message = messages.get(message_id)
-    core.require(message is not None, f"unassigned fund event has no source message: {event_id}")
-    media = _event_media(event, message)
-    blob = core.clean_text(media.get("blob_sha256")) if isinstance(media, Mapping) else ""
-    duplicate_of = seen_blobs.get(blob) if blob else None
-    if blob and duplicate_of is None:
-        seen_blobs[blob] = event_id
-    flow, issue = _flow_from_event(
-        event,
-        message,
-        duplicate_of=duplicate_of,
-        duplicate_basis="identical_blob" if duplicate_of else None,
-    )
-    warnings = [item for item in [issue] if item]
-    flow["display_in_workbook"] = True
-    provisional_side = str(flow.get("side") or "")
-    amount_is_clear = bool(flow.get("included"))
-    flow["provisional_side"] = provisional_side
-    flow["side"] = "unassigned"
-    flow["flow_type"] = "未归单资金图片"
-    flow["included"] = False
-    is_external = message.get("role") != "内部人员"
-    customer_id = core.clean_text(message.get("sender_id")) if is_external else ""
-    customer_nickname = core.clean_text(message.get("sender_name")) if is_external else ""
-    notes = ["该资金图片尚未归入订单。"]
-    if flow.get("duplicate_of"):
-        notes.append("该图与另一张图属于同一笔交易，未重复计入金额。")
-    if flow.get("status") == "failed":
-        notes.append("该图明确显示失败，未计入金额。")
-    if not amount_is_clear:
-        notes.append("该资金图片的金额或币种尚未完整确认。")
-    if not customer_id or not customer_nickname:
-        notes.append("该资金记录的客户无法唯一确认。")
-    return (
-        {
-            "case_id": f"{group_key}:simple:unassigned:{position:03d}",
-            "order_id": None,
-            "start_time": message.get("timestamp"),
-            "start_message_id": message_id,
-            "customer_nickname": customer_nickname,
-            "customer_id": customer_id,
-            "direction": "",
-            "payment_currency": None,
-            "payment_total": None,
-            "actual_rate": None,
-            "actual_rate_display": None,
-            "rate_operator": "multiply",
-            "payout_currency": None,
-            "expected_payout": None,
-            "balance_adjustment": "0",
-            "actual_payout_total": None,
-            "review_result": "待确认",
-            "anomaly_note": "\n".join(notes),
-            "order_status": "pending_assignment",
-            "fee_adjustments": [],
-            "rounding": None,
-            "legs": [],
-            "flows": [flow],
-        },
-        warnings,
     )
 
 
@@ -1118,6 +1044,27 @@ def _apply_balance_links(
     core.require(len(order_index) == len(orders), f"{group_key}: order case_id values must be unique")
     compiled: list[dict[str, Any]] = []
     warnings: list[str] = []
+    seen_links: set[tuple[str, str, str, str, str, bool]] = set()
+    consumed_source_balances: defaultdict[tuple[str, str, str], Decimal] = defaultdict(Decimal)
+    declared_source_balances: defaultdict[tuple[str, str, str], Decimal] = defaultdict(Decimal)
+    for pre_index, pre_item in enumerate(value):
+        if not isinstance(pre_item, Mapping):
+            continue
+        pre_source = core.clean_text(pre_item.get("source_case_id"))
+        pre_kind = core.clean_text(pre_item.get("kind")).casefold()
+        try:
+            pre_currency = core.normalize_currency(
+                pre_item.get("currency"),
+                field=f"{group_key}: balance_links[{pre_index}].currency",
+            )
+            pre_amount = _parse_positive_decimal(
+                pre_item.get("amount"),
+                field=f"{group_key}: balance_links[{pre_index}].amount",
+            )
+        except ValueError:
+            continue
+        assert pre_currency is not None
+        declared_source_balances[(pre_source, pre_currency, pre_kind)] += pre_amount
     for index, item in enumerate(value):
         field = f"{group_key}: balance_links[{index}]"
         core.require(isinstance(item, Mapping), f"{field} must be an object")
@@ -1136,6 +1083,18 @@ def _apply_balance_links(
         source = order_index[source_case_id]
         target = order_index[target_case_id]
         reasons: list[str] = []
+        link_signature = (
+            source_case_id,
+            target_case_id,
+            kind,
+            core.decimal_text(amount) or "",
+            currency,
+            already_value,
+        )
+        if link_signature in seen_links:
+            reasons.append("重复的跨单补款或抵扣关系")
+        else:
+            seen_links.add(link_signature)
         if source.get("legs") or target.get("legs"):
             reasons.append("多方向订单暂不应用跨单余额")
         if not source.get("customer_id") or source.get("customer_id") != target.get("customer_id"):
@@ -1152,10 +1111,18 @@ def _apply_balance_links(
             reasons.append("前单差额或后单应回金额尚未确认")
         else:
             source_difference = source_actual - source_expected
-            required_difference = -amount if kind == "shortfall_carryover" else amount
-            tolerance = core.currency_tolerance(currency)
-            if abs(source_difference - required_difference) > tolerance:
-                reasons.append("声明金额与前单实际差额不一致")
+            direction_matches = (
+                source_difference < 0
+                if kind == "shortfall_carryover"
+                else source_difference > 0
+            )
+            if not direction_matches:
+                reasons.append("声明方向与前单实际差额不一致")
+            source_key = (source_case_id, currency, kind)
+            if declared_source_balances[source_key] != abs(source_difference):
+                reasons.append("同一前单的全部补抵金额未与实际差额守恒")
+            if consumed_source_balances[source_key] + amount > abs(source_difference):
+                reasons.append("同一前单差额被重复或超额使用")
         status = "applied"
         signed_adjustment = amount if kind == "shortfall_carryover" else -amount
         if reasons:
@@ -1182,6 +1149,7 @@ def _apply_balance_links(
                     if target.get("review_result") != "待确认" and target_actual is not None:
                         target["review_result"] = _review_result(target_actual, adjusted_expected, currency)
             if status == "applied":
+                consumed_source_balances[(source_case_id, currency, kind)] += amount
                 source_order_id = str(source.get("order_id") or source_case_id)
                 target_order_id = str(target.get("order_id") or target_case_id)
                 if kind == "shortfall_carryover":
@@ -1238,11 +1206,9 @@ def compile_simple_ledger(
     core.require(set(plan_groups) == set(normalized_groups), "simple plan must contain every selected group exactly once")
 
     assigned_events: set[str] = set()
-    seen_blobs: dict[str, str] = {}
+    require_model_judgments = plan.get("contract_version") == SIMPLE_PLAN_CONTRACT
     result_groups: list[dict[str, Any]] = []
     warnings: list[str] = []
-    visible_pending_fund_images = 0
-    originally_unassigned_fund_images = 0
     for group_key, normalized_group in normalized_groups.items():
         plan_group = plan_groups[group_key]
         raw_orders = plan_group.get("orders")
@@ -1257,7 +1223,7 @@ def compile_simple_ledger(
                 messages=messages,
                 event_index=event_index,
                 assigned_events=assigned_events,
-                seen_blobs=seen_blobs,
+                require_model_judgments=require_model_judgments,
             )
             compiled_orders.append(compiled)
             warnings.extend(issues)
@@ -1265,7 +1231,7 @@ def compile_simple_ledger(
         group_fund_events = [
             event
             for event in events
-            if event.get("type") in EVENT_SIDE
+            if event.get("type") in SUPPORTED_FUND_EVENT_TYPES
             and (
                 str(event.get("group_key") or "") == group_key
                 or messages.get(str(event.get("message_id") or ""), {}).get("_group_key") == group_key
@@ -1274,22 +1240,11 @@ def compile_simple_ledger(
         group_unassigned = [
             event for event in group_fund_events if str(event.get("event_id") or "") not in assigned_events
         ]
-        originally_unassigned_fund_images += len(group_unassigned)
-        for auto_position, event in enumerate(group_unassigned, start=len(raw_orders) + 1):
-            event_id = str(event.get("event_id") or "")
-            pending_order, issues = _compile_unassigned_order(
-                event,
-                group_key=group_key,
-                position=auto_position,
-                messages=messages,
-                seen_blobs=seen_blobs,
-            )
-            assigned_events.add(event_id)
-            warnings.extend(issues)
-            if pending_order is not None:
-                compiled_orders.append(pending_order)
-                visible_pending_fund_images += 1
-                warnings.append(f"unassigned fund image recorded as pending in workbook: {event_id}")
+        group_unassigned_ids = sorted(str(event.get("event_id") or "") for event in group_unassigned)
+        core.require(
+            not group_unassigned_ids,
+            f"{group_key}: every fund event must be explicitly assigned by the model; unassigned: {group_unassigned_ids}",
+        )
 
         _assign_order_ids(compiled_orders)
         compiled_balance_links, balance_warnings = _apply_balance_links(
@@ -1311,10 +1266,10 @@ def compile_simple_ledger(
     fund_events = {
         str(event.get("event_id") or "")
         for event in events
-        if event.get("type") in EVENT_SIDE
+        if event.get("type") in SUPPORTED_FUND_EVENT_TYPES
     }
     unassigned = sorted(fund_events - assigned_events)
-    warnings.extend(f"unassigned fund image could not be placed in a workbook group: {event_id}" for event_id in unassigned)
+    core.require(not unassigned, f"fund events remain unassigned: {unassigned}")
     document = {
         "contract_version": core.ORDERS_CONTRACT,
         "rule_version": core.RULE_VERSION,
@@ -1333,8 +1288,8 @@ def compile_simple_ledger(
         "fund_images": len(fund_events),
         "assigned_fund_images": len(assigned_events & fund_events),
         "unassigned_fund_images": len(unassigned),
-        "originally_unassigned_fund_images": originally_unassigned_fund_images + len(unassigned),
-        "visible_pending_fund_images": visible_pending_fund_images,
+        "originally_unassigned_fund_images": 0,
+        "visible_pending_fund_images": 0,
         "pending_orders": sum(
             order["order_status"] != "completed"
             for group in result_groups

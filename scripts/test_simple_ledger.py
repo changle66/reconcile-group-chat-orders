@@ -85,7 +85,7 @@ def fund_event(
     }
 
 
-def fixture(*, payment_confidence: str = "high", payment_status: str = "blank") -> tuple[dict, list[dict], dict]:
+def fixture(*, payment_confidence: str = "high", payment_status: str = "completed") -> tuple[dict, list[dict], dict]:
     normalized = {
         "timezone": "Asia/Bangkok",
         "source_fingerprint": "sha256:normalized-test",
@@ -155,6 +155,13 @@ def fixture(*, payment_confidence: str = "high", payment_status: str = "blank") 
                 "orders": [
                     {
                         "event_ids": [event["event_id"] for event in events],
+                        "event_sides": {
+                            events[0]["event_id"]: "payment",
+                            events[1]["event_id"]: "payout",
+                        },
+                        "customer_id": "user5570170493",
+                        "customer_nickname": "梅鮪花黔",
+                        "direction": "USDT->THB",
                         "rate": "32.5",
                         "expected_payout": "30000",
                     }
@@ -250,7 +257,7 @@ class SimpleLedgerTests(unittest.TestCase):
 
         self.assertEqual(orders["groups"][0]["orders"][0]["order_status"], "completed")
 
-    def test_blank_customer_payment_is_confirmed_by_paired_internal_payout(self) -> None:
+    def test_explicit_model_judgments_compile_without_business_inference(self) -> None:
         normalized, events, plan = fixture()
 
         orders, statistics = simple_ledger.compile_simple_ledger(
@@ -307,12 +314,47 @@ class SimpleLedgerTests(unittest.TestCase):
         payment = order["flows"][0]
         self.assertFalse(payment["included"])
         self.assertEqual(payment["status"], "failed")
-        self.assertEqual(build_workbook.flow_row_label(payment), "客户付款")
-        self.assertIn("失败", build_workbook.flow_row_note(payment) or "")
+        self.assertFalse(payment["display_in_workbook"])
+        self.assertIsNone(build_workbook.flow_row_note(payment))
+        self.assertNotIn("客户付款", [row[0] for row in build_workbook.order_rows(order)])
+        self.assertIsNone(order["payment_total"])
+        self.assertEqual(order["review_result"], "待确认")
+        self.assertNotIn("失败", order["anomaly_note"])
+
+    def test_model_declared_status_is_authoritative_over_status_text(self) -> None:
+        normalized, events, plan = fixture()
+        events[0]["ocr"]["status_text"] = "失败"
+        events[0]["ocr"]["status_class"] = "completed"
+        events[0]["ocr"]["status_class_confidence"] = "high"
+
+        orders, _ = simple_ledger.compile_simple_ledger(
+            normalized,
+            events,
+            "sha256:events-test",
+            plan,
+        )
+
+        order = orders["groups"][0]["orders"][0]
+        self.assertEqual(order["flows"][0]["status"], "completed")
+        self.assertTrue(order["flows"][0]["included"])
+        self.assertEqual(order["payment_total"], "923")
+
+    def test_model_unknown_status_is_not_counted_even_when_amount_is_clear(self) -> None:
+        normalized, events, plan = fixture(payment_status="unknown")
+
+        orders, _ = simple_ledger.compile_simple_ledger(
+            normalized,
+            events,
+            "sha256:events-test",
+            plan,
+        )
+
+        order = orders["groups"][0]["orders"][0]
+        self.assertFalse(order["flows"][0]["included"])
         self.assertIsNone(order["payment_total"])
         self.assertEqual(order["review_result"], "待确认")
 
-    def test_sender_role_controls_screenshot_side(self) -> None:
+    def test_explicit_side_controls_flow_when_screenshot_types_disagree(self) -> None:
         normalized, events, plan = fixture()
         events[0]["type"] = "payout_screenshot"
         events[1]["type"] = "payment_screenshot"
@@ -330,7 +372,7 @@ class SimpleLedgerTests(unittest.TestCase):
         self.assertEqual(order["payment_total"], "923")
         self.assertEqual(order["actual_payout_total"], "30000")
 
-    def test_exact_duplicate_image_is_counted_once(self) -> None:
+    def test_identical_image_hash_is_not_a_business_duplicate_without_model_declaration(self) -> None:
         normalized, events, plan = fixture()
         original_message = normalized["groups"][0]["messages"][1]
         original_message["media"][0]["blob_sha256"] = "sha256:identical-image"
@@ -354,10 +396,12 @@ class SimpleLedgerTests(unittest.TestCase):
             amount="923",
             currency="USDT",
             status_text=None,
-            status_class="blank",
+            status_class="completed",
         )
         events.append(duplicate_event)
-        plan["groups"][0]["orders"][0]["event_ids"].insert(1, duplicate_event["event_id"])
+        raw_order = plan["groups"][0]["orders"][0]
+        raw_order["event_ids"].insert(1, duplicate_event["event_id"])
+        raw_order["event_sides"][duplicate_event["event_id"]] = "payment"
 
         orders, statistics = simple_ledger.compile_simple_ledger(
             normalized,
@@ -367,39 +411,37 @@ class SimpleLedgerTests(unittest.TestCase):
         )
 
         order = orders["groups"][0]["orders"][0]
-        self.assertEqual(order["payment_total"], "923")
-        self.assertFalse(order["flows"][1]["included"])
-        self.assertEqual(
-            order["flows"][1]["duplicate_of"],
-            f"{GROUP_KEY}:65735#payment_screenshot#1",
-        )
-        self.assertTrue(any("exact duplicate" in warning for warning in statistics["warnings"]))
+        self.assertEqual(order["payment_total"], "1846")
+        self.assertTrue(order["flows"][1]["included"])
+        self.assertIsNone(order["flows"][1]["duplicate_of"])
+        self.assertFalse(any("duplicate" in warning for warning in statistics["warnings"]))
 
-    def test_unassigned_fund_image_becomes_visible_pending_order(self) -> None:
+    def test_unassigned_fund_event_is_rejected_instead_of_becoming_an_auto_order(self) -> None:
         normalized, events, plan = fixture()
         plan["groups"][0]["orders"][0]["event_ids"] = [events[0]["event_id"]]
+        plan["groups"][0]["orders"][0]["event_sides"] = {
+            events[0]["event_id"]: "payment"
+        }
 
-        orders, statistics = simple_ledger.compile_simple_ledger(
-            normalized,
-            events,
-            "sha256:events-test",
-            plan,
-        )
+        with self.assertRaisesRegex(ValueError, "must be explicitly assigned by the model"):
+            simple_ledger.compile_simple_ledger(
+                normalized,
+                events,
+                "sha256:events-test",
+                plan,
+            )
 
-        pending = orders["groups"][0]["orders"][1]
-        self.assertEqual(pending["order_status"], "pending_assignment")
-        self.assertEqual(pending["review_result"], "待确认")
-        self.assertIn("尚未归入订单", pending["anomaly_note"])
-        self.assertIsNone(pending["actual_payout_total"])
-        self.assertEqual(pending["flows"][0]["amount"], "30000")
-        self.assertEqual(pending["flows"][0]["side"], "unassigned")
-        self.assertEqual(
-            build_workbook.flow_row_label(pending["flows"][0]),
-            "未归单资金图片",
-        )
-        self.assertTrue(pending["flows"][0]["display_in_workbook"])
-        self.assertEqual(statistics["unassigned_fund_images"], 0)
-        self.assertEqual(statistics["visible_pending_fund_images"], 1)
+    def test_current_contract_rejects_missing_explicit_event_side(self) -> None:
+        normalized, events, plan = fixture()
+        plan["groups"][0]["orders"][0].pop("event_sides")
+
+        with self.assertRaisesRegex(ValueError, "requires an explicit side for every event"):
+            simple_ledger.compile_simple_ledger(
+                normalized,
+                events,
+                "sha256:events-test",
+                plan,
+            )
 
     def test_internal_sender_can_relay_customer_payment_with_explicit_side(self) -> None:
         normalized, events, plan = fixture()
@@ -408,7 +450,10 @@ class SimpleLedgerTests(unittest.TestCase):
         payment_message["sender_name"] = "QQ～财务4"
         payment_message["role"] = "内部人员"
         raw_order = plan["groups"][0]["orders"][0]
-        raw_order["event_sides"] = {events[0]["event_id"]: "payment"}
+        raw_order["event_sides"] = {
+            events[0]["event_id"]: "payment",
+            events[1]["event_id"]: "payout",
+        }
         raw_order["customer_id"] = "user5570170493"
         raw_order["customer_nickname"] = "梅鮪花黔"
 
@@ -442,6 +487,7 @@ class SimpleLedgerTests(unittest.TestCase):
         )
         raw_order = plan["groups"][0]["orders"][0]
         raw_order["event_ids"].insert(1, duplicate["event_id"])
+        raw_order["event_sides"][duplicate["event_id"]] = "payment"
         raw_order["same_transactions"] = [
             {"event_id": duplicate["event_id"], "same_as": events[0]["event_id"]}
         ]
@@ -458,8 +504,79 @@ class SimpleLedgerTests(unittest.TestCase):
         self.assertEqual(order["payment_total"], "923")
         self.assertFalse(duplicate_flow["included"])
         self.assertEqual(duplicate_flow["duplicate_basis"], "declared_same_transaction")
-        self.assertEqual(build_workbook.flow_row_label(duplicate_flow), "客户付款")
-        self.assertIn("同一笔交易", build_workbook.flow_row_note(duplicate_flow) or "")
+        self.assertFalse(duplicate_flow["display_in_workbook"])
+        self.assertIsNone(build_workbook.flow_row_note(duplicate_flow))
+        self.assertEqual(
+            [row[0] for row in build_workbook.order_rows(order)].count("客户付款"),
+            1,
+        )
+        self.assertNotIn("同一笔交易", order["anomaly_note"])
+
+    def test_declared_same_transaction_summary_without_payee_does_not_downgrade_order(self) -> None:
+        normalized, events, plan = fixture()
+        summary = events[0]
+        summary["ocr"]["payee"] = "未显示"
+        detail = append_fund(
+            normalized,
+            events,
+            sequence=65736,
+            sender_id="user5570170493",
+            sender_name="梅鮪花黔",
+            role="客户候选",
+            timestamp="2026-08-08T19:15:00+07:00",
+            event_type="payment_screenshot",
+            amount="923",
+            currency="USDT",
+            blob_sha256="sha256:detail-page",
+        )
+        detail["ocr"]["payee"] = "TZ7nsfaXoJCsNytYFcT5yEZLXMAH87QKUg"
+        raw_order = plan["groups"][0]["orders"][0]
+        raw_order["event_ids"].insert(1, detail["event_id"])
+        raw_order["event_sides"][detail["event_id"]] = "payment"
+        raw_order["same_transactions"] = [
+            {"event_id": summary["event_id"], "same_as": detail["event_id"]}
+        ]
+
+        orders, statistics = simple_ledger.compile_simple_ledger(
+            normalized,
+            events,
+            "sha256:events-test",
+            plan,
+        )
+
+        order = orders["groups"][0]["orders"][0]
+        summary_flow = order["flows"][0]
+        self.assertFalse(summary_flow["included"])
+        self.assertEqual(summary_flow["duplicate_basis"], "declared_same_transaction")
+        self.assertEqual(summary_flow["payee"], "未显示")
+        self.assertNotIn("evidence_pending", summary_flow)
+        self.assertEqual(order["payment_total"], "923")
+        self.assertEqual(order["order_status"], "completed")
+        self.assertEqual(order["review_result"], "")
+        self.assertNotIn("收款方未显示", order["anomaly_note"] or "")
+        self.assertEqual(statistics["pending_orders"], 0)
+
+    def test_missing_payee_is_recorded_without_downgrading_order(self) -> None:
+        for payee in ("未显示", "无法辨认"):
+            with self.subTest(payee=payee):
+                normalized, events, plan = fixture()
+                events[0]["ocr"]["payee"] = payee
+
+                orders, statistics = simple_ledger.compile_simple_ledger(
+                    normalized,
+                    events,
+                    "sha256:events-test",
+                    plan,
+                )
+
+                order = orders["groups"][0]["orders"][0]
+                payment = order["flows"][0]
+                self.assertEqual(payment["payee"], payee)
+                self.assertNotIn("evidence_pending", payment)
+                self.assertEqual(order["order_status"], "completed")
+                self.assertEqual(order["review_result"], "")
+                self.assertNotIn("收款方", order["anomaly_note"] or "")
+                self.assertEqual(statistics["pending_orders"], 0)
 
     def test_simple_mode_requires_and_records_payee(self) -> None:
         normalized, events, plan = fixture()
@@ -637,15 +754,12 @@ class SimpleLedgerTests(unittest.TestCase):
         )
         self.assertEqual(
             [row[core.HEADERS.index("备注")] for row in pricing_rows[:3]],
-            [
-                "配送费：2 USDT，已包含在客户付款中，计价时从付款本金扣除。",
-                "手续费：4 THB，从应回金额扣除。",
-                "网络费用：1 THB，从应回金额扣除。",
-            ],
+            [None, None, None],
         )
+        self.assertIsNone(pricing_rows[3][core.HEADERS.index("备注")])
         self.assertEqual(order["review_result"], "")
 
-    def test_deducted_delivery_fee_note_includes_amount_and_net_payout(self) -> None:
+    def test_deducted_delivery_fee_row_has_no_normal_process_note(self) -> None:
         normalized, events, plan = fixture()
         events[0]["ocr"]["amount"] = "3102"
         events[1]["ocr"]["amount"] = "100000"
@@ -676,10 +790,7 @@ class SimpleLedgerTests(unittest.TestCase):
         self.assertEqual(fee_row[0], "配送费")
         self.assertEqual(fee_row[core.HEADERS.index("流水金额")], 500)
         self.assertEqual(fee_row[core.HEADERS.index("流水币种")], "THB")
-        self.assertEqual(
-            fee_row[core.HEADERS.index("备注")],
-            "配送费：500 THB，从应回金额扣除；表中应回金额 100000 THB 已为扣费后的净额。",
-        )
+        self.assertIsNone(fee_row[core.HEADERS.index("备注")])
 
     def test_platform_displayed_network_fee_is_not_recorded_or_applied(self) -> None:
         normalized, events, plan = fixture()
@@ -731,7 +842,7 @@ class SimpleLedgerTests(unittest.TestCase):
                 plan,
             )
 
-    def test_nonunique_customer_identity_is_visible_pending_not_silently_chosen(self) -> None:
+    def test_explicit_unknown_customer_is_not_replaced_from_sender_metadata(self) -> None:
         normalized, events, plan = fixture()
         second_payment = append_fund(
             normalized,
@@ -748,6 +859,9 @@ class SimpleLedgerTests(unittest.TestCase):
         events[1]["ocr"]["amount"] = "32500"
         raw_order = plan["groups"][0]["orders"][0]
         raw_order["event_ids"].insert(1, second_payment["event_id"])
+        raw_order["event_sides"][second_payment["event_id"]] = "payment"
+        raw_order["customer_id"] = ""
+        raw_order["customer_nickname"] = ""
         raw_order["expected_payout"] = "32500"
 
         orders, _ = simple_ledger.compile_simple_ledger(
@@ -763,6 +877,22 @@ class SimpleLedgerTests(unittest.TestCase):
         self.assertEqual(order["review_result"], "待确认")
         self.assertEqual(order["order_status"], "pending_identity")
         self.assertIn("客户无法唯一确认", order["anomaly_note"])
+
+    def test_explicit_unknown_direction_is_not_derived_from_flow_currencies(self) -> None:
+        normalized, events, plan = fixture()
+        plan["groups"][0]["orders"][0]["direction"] = ""
+
+        orders, _ = simple_ledger.compile_simple_ledger(
+            normalized,
+            events,
+            "sha256:events-test",
+            plan,
+        )
+
+        order = orders["groups"][0]["orders"][0]
+        self.assertEqual(order["direction"], "")
+        self.assertEqual(order["review_result"], "待确认")
+        self.assertNotEqual(order["order_status"], "completed")
 
     def test_one_payment_can_close_two_exchange_legs_without_anomaly(self) -> None:
         normalized, events, plan = fixture()
@@ -782,6 +912,7 @@ class SimpleLedgerTests(unittest.TestCase):
         )
         raw_order = plan["groups"][0]["orders"][0]
         raw_order["event_ids"].append(second_payout["event_id"])
+        raw_order["event_sides"][second_payout["event_id"]] = "payout"
         raw_order.pop("rate")
         raw_order.pop("expected_payout")
         raw_order["legs"] = [
@@ -813,20 +944,28 @@ class SimpleLedgerTests(unittest.TestCase):
         self.assertEqual(order["actual_rate_display"], "USDT->THB：32.5\nUSDT->CNY：5")
         self.assertEqual(order["review_result"], "")
         self.assertEqual(order["anomaly_note"], "")
+        self.assertEqual(order["note"], "")
         self.assertEqual(order["order_status"], "completed")
         rows = build_workbook.order_rows(order)
         leg_rows = [row for row in rows if row[0] == "换汇明细"]
+        self.assertEqual(leg_rows, [])
+        summary_row = next(row for row in rows if row[0] == "订单汇总")
+        self.assertIsNone(summary_row[core.HEADERS.index("备注")])
         self.assertEqual(
-            [row[core.HEADERS.index("换汇方向")] for row in leg_rows],
-            ["USDT->THB", "USDT->CNY"],
+            [row[0] for row in rows if row[0] in {"客户付款", "内部回款"}],
+            ["客户付款", "内部回款", "内部回款"],
+        )
+
+    def test_order_row_note_uses_one_problem_note(self) -> None:
+        self.assertEqual(
+            build_workbook.order_row_note(
+                {"note": "具体问题", "anomaly_note": "自动生成的重复说明"}
+            ),
+            "具体问题",
         )
         self.assertEqual(
-            [row[core.HEADERS.index("付款合计")] for row in leg_rows],
-            [600, 400],
-        )
-        self.assertEqual(
-            [row[core.HEADERS.index("汇率")] for row in leg_rows],
-            [32.5, 5],
+            build_workbook.order_row_note({"note": "", "anomaly_note": "实际异常"}),
+            "实际异常",
         )
 
     def test_payment_refund_and_payout_recovery_use_net_amounts(self) -> None:
@@ -860,6 +999,8 @@ class SimpleLedgerTests(unittest.TestCase):
         raw_order = plan["groups"][0]["orders"][0]
         raw_order["event_ids"] = [event["event_id"] for event in events]
         raw_order["event_sides"] = {
+            events[0]["event_id"]: "payment",
+            events[1]["event_id"]: "payout",
             refund["event_id"]: "payment_refund",
             recovery["event_id"]: "recovery",
         }
@@ -915,11 +1056,25 @@ class SimpleLedgerTests(unittest.TestCase):
                     {
                         "case_id": "first",
                         "event_ids": [first_payment["event_id"], first_payout["event_id"]],
+                        "event_sides": {
+                            first_payment["event_id"]: "payment",
+                            first_payout["event_id"]: "payout",
+                        },
+                        "customer_id": "customer-1",
+                        "customer_nickname": "客户甲",
+                        "direction": "USDT->THB",
                         "rate": "32.5",
                     },
                     {
                         "case_id": "second",
                         "event_ids": [second_payment["event_id"], second_payout["event_id"]],
+                        "event_sides": {
+                            second_payment["event_id"]: "payment",
+                            second_payout["event_id"]: "payout",
+                        },
+                        "customer_id": "customer-1",
+                        "customer_nickname": "客户甲",
+                        "direction": "USDT->THB",
                         "rate": "32.5",
                     },
                 ]
@@ -1093,7 +1248,7 @@ class SimpleLedgerTests(unittest.TestCase):
                 fee_row = next(row for row in worksheet.iter_rows(values_only=True) if row[0] == "手续费")
                 self.assertEqual(
                     fee_row[core.HEADERS.index("备注")],
-                    "手续费：10 THB，已含在报价。",
+                    None,
                 )
                 self.assertIsNone(fee_row[core.HEADERS.index("收款方")])
                 fund_row_types = {"客户付款", "付款退款", "内部回款", "回款追回", "未归单资金图片"}
