@@ -617,6 +617,10 @@ class SimpleLedgerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "payee is required"):
             build_workbook.validate_orders(orders)
 
+        orders["groups"][0]["orders"][0]["flows"][0]["payee"] = "群内收款方"
+        with self.assertRaisesRegex(ValueError, "generic placeholder"):
+            build_workbook.validate_orders(orders)
+
     def test_detailed_payee_text_round_trips_to_workbook_unchanged(self) -> None:
         for payee in ("王少秋（**秋）", "206-4-xxx781"):
             with self.subTest(payee=payee):
@@ -956,7 +960,7 @@ class SimpleLedgerTests(unittest.TestCase):
             ["客户付款", "内部回款", "内部回款"],
         )
 
-    def test_order_row_note_uses_one_problem_note(self) -> None:
+    def test_order_row_note_uses_only_model_note(self) -> None:
         self.assertEqual(
             build_workbook.order_row_note(
                 {"note": "具体问题", "anomaly_note": "自动生成的重复说明"}
@@ -965,7 +969,7 @@ class SimpleLedgerTests(unittest.TestCase):
         )
         self.assertEqual(
             build_workbook.order_row_note({"note": "", "anomaly_note": "实际异常"}),
-            "实际异常",
+            None,
         )
 
     def test_payment_refund_and_payout_recovery_use_net_amounts(self) -> None:
@@ -1162,6 +1166,17 @@ class SimpleLedgerTests(unittest.TestCase):
                     for cell in row:
                         self.assertEqual(cell.alignment.horizontal, "center")
                         self.assertEqual(cell.alignment.vertical, "center")
+
+                payee_column = core.HEADERS.index("收款方") + 1
+                payee_cells = [
+                    worksheet.cell(row, payee_column)
+                    for row in range(2, worksheet.max_row + 1)
+                    if worksheet.cell(row, payee_column).value is not None
+                ]
+                self.assertTrue(payee_cells)
+                for cell in payee_cells:
+                    self.assertEqual(cell.data_type, "s")
+                    self.assertEqual(cell.number_format, "@")
 
                 review_column = core.HEADERS.index("核对结果") + 1
                 review_cells = {

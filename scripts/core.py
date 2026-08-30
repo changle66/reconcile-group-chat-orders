@@ -19,8 +19,8 @@ except ImportError:  # The roster subset also has a small stdlib fallback parser
 
 
 NORMALIZED_CONTRACT = "small-group-normalized/1.0"
-ORDERS_CONTRACT = "small-group-simple-orders/1.1"
-RULE_VERSION = "simple-ledger/1.2"
+ORDERS_CONTRACT = "small-group-simple-orders/1.2"
+RULE_VERSION = "simple-ledger/1.3"
 getcontext().prec = 60
 
 HEADERS = [
@@ -103,6 +103,16 @@ STATUS_CLASSES = frozenset({"failed", "pending", "completed", "blank", "unknown"
 CONFIDENCE_LEVELS = frozenset({"high", "medium", "low"})
 AMOUNT_COMPLETENESS = frozenset({"complete", "partial", "unreadable"})
 UNKNOWN_PAYEES = frozenset({"未显示", "无法辨认"})
+PAYEE_STATES = frozenset({"visible", "not_shown", "unreadable", "cash"})
+GENERIC_PAYEES = frozenset(
+    {
+        "群内收款方",
+        "泰铢收款账户",
+        "usdt收款钱包",
+        "银行卡收款方",
+        "客户退款钱包",
+    }
+)
 GENERIC_PAYEE_RE = re.compile(
     r"^(?:截图所示|聊天指定|固定金额二维码|支付宝截图所示).*(?:收款方|收款账户|收款地址|账户)?$",
     re.IGNORECASE,
@@ -238,19 +248,50 @@ def clean_text(value: object) -> str:
     return text.replace("\r\n", "\n").replace("\r", "\n").strip("\u3000 \t\n")
 
 
-def validate_payee(value: object, *, field: str, cash: bool = False) -> str:
-    """Return an evidence payee while rejecting descriptive placeholders."""
-    payee = "现金" if cash else clean_text(value)
+def validate_payee(
+    value: object,
+    *,
+    field: str,
+    cash: bool = False,
+    payee_state: object = None,
+    require_state: bool = False,
+) -> str:
+    """Return a payee that is consistent with the reviewed evidence state."""
+    state = clean_text(payee_state).casefold()
+    if require_state:
+        require(bool(state), f"{field.rsplit('.', 1)[0]}.payee_state is required")
+    if state:
+        require(state in PAYEE_STATES, f"{field.rsplit('.', 1)[0]}.payee_state is unsupported")
+
+    if cash:
+        if state:
+            require(state == "cash", f"{field.rsplit('.', 1)[0]}.payee_state must be cash")
+        return "现金"
+
+    require(state != "cash", f"{field.rsplit('.', 1)[0]}.payee_state cash requires kind cash")
+    require(
+        isinstance(value, str),
+        f"{field} must be text so account numbers and wallet addresses are preserved exactly",
+    )
+    payee = clean_text(value)
     require(
         bool(payee),
         f"{field} is required; use 未显示 or 无法辨认 only when that is true of the evidence",
     )
-    if not cash:
+    require(
+        payee.casefold() not in GENERIC_PAYEES and GENERIC_PAYEE_RE.fullmatch(payee) is None,
+        f"{field} must be the exact visible name, masked account, or address; "
+        f"generic placeholder is forbidden: {payee!r}",
+    )
+    if state == "visible":
         require(
-            GENERIC_PAYEE_RE.fullmatch(payee) is None,
-            f"{field} must be the exact visible name, masked account, or address; "
-            f"generic placeholder is forbidden: {payee!r}",
+            payee not in UNKNOWN_PAYEES,
+            f"{field} cannot be {payee} when payee_state is visible",
         )
+    elif state == "not_shown":
+        require(payee == "未显示", f"{field} must be 未显示 when payee_state is not_shown")
+    elif state == "unreadable":
+        require(payee == "无法辨认", f"{field} must be 无法辨认 when payee_state is unreadable")
     return payee
 
 
@@ -521,6 +562,7 @@ def load_events(events_dir: Path, normalized: Mapping[str, Any]) -> tuple[list[d
                     ocr.get("payee"),
                     field=f"{path}:{line_number}: ocr.payee",
                     cash=event_type in {"cash_payment", "cash_payout"},
+                    payee_state=ocr.get("payee_state"),
                 )
                 normalized_ocr["payee"] = payee
                 status_class = clean_text(ocr.get("status_class")).casefold()

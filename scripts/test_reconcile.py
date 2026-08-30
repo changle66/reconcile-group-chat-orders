@@ -6,6 +6,8 @@ import unittest
 from argparse import Namespace
 from pathlib import Path
 
+import build_workbook
+import check_workbook
 import core
 import reconcile
 
@@ -85,6 +87,7 @@ class ReconcileWorkflowTests(unittest.TestCase):
                         "amount": "100",
                         "currency": "CNY",
                         "payee": payee,
+                        "payee_state": "visible",
                         "side": "payment",
                         "result": "completed",
                         "amount_state": "clear",
@@ -99,6 +102,7 @@ class ReconcileWorkflowTests(unittest.TestCase):
                         "amount": "500",
                         "currency": "THB",
                         "payee": "206-4-xxx781",
+                        "payee_state": "visible",
                         "side": "payout",
                         "result": "completed",
                         "amount_state": "clear",
@@ -130,7 +134,7 @@ class ReconcileWorkflowTests(unittest.TestCase):
             decision_path = self._write_complete_decision(work)
             self.assertEqual(
                 reconcile._load_json(decision_path)["contract_version"],
-                "group-chat-decision/2.2",
+                "group-chat-decision/2.3",
             )
             sealed = reconcile.review_command(
                 Namespace(work=work, review_action="seal", group="测试小额群")
@@ -151,13 +155,122 @@ class ReconcileWorkflowTests(unittest.TestCase):
             self.assertFalse((work / "simple_plan.json").exists())
 
     def test_generic_payee_is_rejected_at_group_seal(self) -> None:
+        for payee in (
+            "截图所示人民币收款方",
+            "群内收款方",
+            "泰铢收款账户",
+            "USDT收款钱包",
+            "银行卡收款方",
+            "客户退款钱包",
+        ):
+            with self.subTest(payee=payee), tempfile.TemporaryDirectory() as temporary:
+                work, _, _ = self._start_fixture(Path(temporary))
+                self._write_complete_decision(work, payee=payee)
+                with self.assertRaisesRegex(ValueError, "generic placeholder"):
+                    reconcile.review_command(
+                        Namespace(work=work, review_action="seal", group="测试小额群")
+                    )
+
+    def test_current_contract_requires_consistent_payee_evidence_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             work, _, _ = self._start_fixture(Path(temporary))
-            self._write_complete_decision(work, payee="截图所示人民币收款方")
-            with self.assertRaisesRegex(ValueError, "generic placeholder"):
+            decision_path = self._write_complete_decision(work)
+            decision = reconcile._load_json(decision_path)
+            entry = decision["media_decisions"]["M0001"]["entries"][0]
+            entry.pop("payee_state")
+            core.atomic_json(decision_path, decision)
+            with self.assertRaisesRegex(ValueError, "payee_state is required"):
                 reconcile.review_command(
                     Namespace(work=work, review_action="seal", group="测试小额群")
                 )
+
+            decision = reconcile._load_json(decision_path)
+            entry = decision["media_decisions"]["M0001"]["entries"][0]
+            entry["payee_state"] = "not_shown"
+            entry["payee"] = "张三"
+            core.atomic_json(decision_path, decision)
+            with self.assertRaisesRegex(ValueError, "must be 未显示"):
+                reconcile.review_command(
+                    Namespace(work=work, review_action="seal", group="测试小额群")
+                )
+
+    def test_transfer_payee_must_be_json_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            work, _, _ = self._start_fixture(Path(temporary))
+            decision_path = self._write_complete_decision(work)
+            decision = reconcile._load_json(decision_path)
+            decision["media_decisions"]["M0001"]["entries"][0]["payee"] = 6222021234567890
+            core.atomic_json(decision_path, decision)
+            with self.assertRaisesRegex(ValueError, "must be text"):
+                reconcile.review_command(
+                    Namespace(work=work, review_action="seal", group="测试小额群")
+                )
+
+    def test_legacy_2_2_decision_remains_compatible(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            work, _, _ = self._start_fixture(Path(temporary))
+            decision_path = self._write_complete_decision(work)
+            decision = reconcile._load_json(decision_path)
+            decision["contract_version"] = reconcile.LEGACY_DECISION_CONTRACT
+            decision.pop("settlement_allocations")
+            decision.pop("unknown_payee_reviewed_entry_ids")
+            for media in decision["media_decisions"].values():
+                for entry in media.get("entries", []):
+                    entry.pop("payee_state")
+            core.atomic_json(decision_path, decision)
+
+            sealed = reconcile.review_command(
+                Namespace(work=work, review_action="seal", group="测试小额群")
+            )
+            self.assertTrue(sealed["sealed"])
+
+    def test_mass_unknown_payees_require_explicit_original_image_review(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            work, _, _ = self._start_fixture(Path(temporary))
+            decision_path = self._write_complete_decision(work)
+            decision = reconcile._load_json(decision_path)
+            entries = decision["media_decisions"]["M0001"]["entries"]
+            entries[0]["payee"] = "未显示"
+            entries[0]["payee_state"] = "not_shown"
+            for _ in range(9):
+                entries.append(
+                    {
+                        "amount": "1",
+                        "currency": "CNY",
+                        "payee": "无法辨认",
+                        "payee_state": "unreadable",
+                        "side": "payment",
+                        "result": "completed",
+                        "amount_state": "clear",
+                    }
+                )
+            decision["orders"][0]["entry_ids"] = [
+                *(f"M0001.{index}" for index in range(1, 11)),
+                "M0002.1",
+            ]
+            core.atomic_json(decision_path, decision)
+
+            checked = reconcile.review_command(
+                Namespace(work=work, review_action="check", group="测试小额群")
+            )
+            self.assertEqual(checked["transfer_payees"], 11)
+            self.assertEqual(checked["unknown_payees"], 10)
+            self.assertEqual(checked["unknown_payee_review_required"], 1)
+            self.assertEqual(checked["unreviewed_unknown_payees"], 10)
+            with self.assertRaisesRegex(ValueError, "unknown payee audit"):
+                reconcile.review_command(
+                    Namespace(work=work, review_action="seal", group="测试小额群")
+                )
+
+            decision = reconcile._load_json(decision_path)
+            decision["unknown_payee_reviewed_entry_ids"] = [
+                f"M0001.{index}" for index in range(1, 11)
+            ]
+            core.atomic_json(decision_path, decision)
+            sealed = reconcile.review_command(
+                Namespace(work=work, review_action="seal", group="测试小额群")
+            )
+            self.assertTrue(sealed["sealed"])
 
     def test_one_image_can_compile_multiple_fund_entries(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -169,6 +282,7 @@ class ReconcileWorkflowTests(unittest.TestCase):
                     "amount": "25",
                     "currency": "USD",
                     "payee": "张三",
+                    "payee_state": "visible",
                     "side": "payment",
                     "result": "completed",
                     "amount_state": "clear",
@@ -217,6 +331,7 @@ class ReconcileWorkflowTests(unittest.TestCase):
                     "amount": "25",
                     "currency": "USD",
                     "payee": "张三",
+                    "payee_state": "visible",
                     "side": "payment",
                     "result": "completed",
                     "amount_state": "clear",
@@ -429,6 +544,158 @@ class ReconcileWorkflowTests(unittest.TestCase):
                 plan["groups"][0]["orders"][0]["note"],
                 "特殊安排写入订单汇总备注。",
             )
+
+    def test_one_physical_payout_can_be_allocated_across_currency_orders(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            work, _, normalized = self._start_fixture(root)
+            decision_path = self._write_complete_decision(work)
+            decision = reconcile._load_json(decision_path)
+            decision["media_decisions"]["M0001"]["entries"][0]["amount"] = "2000"
+            decision["media_decisions"]["M0001"]["entries"].append(
+                {
+                    "amount": "630",
+                    "currency": "USDT",
+                    "payee": "TPayeeWalletAddress123456789",
+                    "payee_state": "visible",
+                    "side": "payment",
+                    "result": "completed",
+                    "amount_state": "clear",
+                }
+            )
+            decision["media_decisions"]["M0002"]["entries"][0]["amount"] = "30000"
+            decision["orders"] = [
+                {
+                    "id": "O001",
+                    "entry_ids": ["M0001.1"],
+                    "source_messages": ["S00001", "S00002"],
+                    "customer_id": "user:alice",
+                    "customer_nickname": "Alice",
+                    "direction": "CNY->THB",
+                    "rate_state": "adopted",
+                    "rate": "4.89",
+                    "expected_payout_state": "explicit",
+                    "expected_payout": "9780",
+                },
+                {
+                    "id": "O002",
+                    "entry_ids": ["M0001.2"],
+                    "source_messages": ["S00001", "S00002"],
+                    "customer_id": "user:alice",
+                    "customer_nickname": "Alice",
+                    "direction": "USDT->THB",
+                    "rate_state": "adopted",
+                    "rate": "32.1",
+                    "expected_payout_state": "explicit",
+                    "expected_payout": "20220",
+                },
+            ]
+            decision["settlement_allocations"] = [
+                {
+                    "entry_id": "M0002.1",
+                    "allocations": [
+                        {"order_id": "O001", "amount": "9780"},
+                        {"order_id": "O002", "amount": "20220"},
+                    ],
+                    "source_messages": ["S00002"],
+                }
+            ]
+            core.atomic_json(decision_path, decision)
+
+            reconcile.review_command(
+                Namespace(work=work, review_action="seal", group="测试小额群")
+            )
+            sealed = reconcile._load_json(decision_path)
+            events, plan = reconcile._compile_decisions_v2(
+                normalized,
+                {str(normalized["groups"][0]["group_key"]): sealed},
+            )
+            orders, statistics = reconcile.simple_ledger.compile_simple_ledger(
+                normalized,
+                events,
+                plan["events_fingerprint"],
+                plan,
+            )
+
+            first, second = orders["groups"][0]["orders"]
+            self.assertEqual(first["actual_payout_total"], "9780")
+            self.assertEqual(second["actual_payout_total"], "20220")
+            self.assertEqual(first["actual_rate"], "4.89")
+            self.assertEqual(second["actual_rate"], "32.1")
+            self.assertEqual(first["review_result"], "")
+            self.assertEqual(second["review_result"], "")
+            self.assertEqual(statistics["unassigned_fund_images"], 0)
+            for order, allocation in ((first, "9780"), (second, "20220")):
+                flow = next(
+                    item for item in order["flows"] if item.get("settlement_allocation")
+                )
+                self.assertEqual(flow["amount"], allocation)
+                self.assertEqual(flow["source_amount"], "30000")
+                self.assertEqual(build_workbook.flow_row_label(flow), "内部回款分摊")
+                self.assertIn(f"本单计入 {allocation} THB", build_workbook.flow_row_note(flow))
+
+            orders_path = root / "allocated-orders.json"
+            workbook_path = root / "allocated-ledger.xlsx"
+            core.atomic_json(orders_path, orders)
+            workbook = build_workbook.build_workbook(
+                build_workbook.validate_orders(orders),
+                Path(__file__).resolve().parent.parent / "assets" / "模版.xlsx",
+            )
+            try:
+                workbook.save(workbook_path)
+            finally:
+                workbook.close()
+            self.assertEqual(check_workbook.check(workbook_path, orders_path), [])
+
+    def test_settlement_allocation_must_close_to_physical_payout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            work, _, _ = self._start_fixture(Path(temporary))
+            decision_path = self._write_complete_decision(work)
+            decision = reconcile._load_json(decision_path)
+            decision["orders"][0]["entry_ids"] = ["M0001.1"]
+            decision["orders"].append(
+                {
+                    "id": "O002",
+                    "entry_ids": ["M0001.1"],
+                    "source_messages": ["S00001", "S00002"],
+                    "customer_id": "user:alice",
+                    "customer_nickname": "Alice",
+                    "direction": "CNY->THB",
+                    "rate_state": "adopted",
+                    "rate": "1.99",
+                    "expected_payout_state": "explicit",
+                    "expected_payout": "199",
+                }
+            )
+            # Give the second order its own payment entry so only the allocation
+            # closure, rather than duplicate assignment, is under test.
+            decision["media_decisions"]["M0001"]["entries"].append(
+                {
+                    "amount": "100",
+                    "currency": "CNY",
+                    "payee": "张三",
+                    "payee_state": "visible",
+                    "side": "payment",
+                    "result": "completed",
+                    "amount_state": "clear",
+                }
+            )
+            decision["orders"][1]["entry_ids"] = ["M0001.2"]
+            decision["settlement_allocations"] = [
+                {
+                    "entry_id": "M0002.1",
+                    "allocations": [
+                        {"order_id": "O001", "amount": "300"},
+                        {"order_id": "O002", "amount": "199"},
+                    ],
+                }
+            ]
+            core.atomic_json(decision_path, decision)
+
+            with self.assertRaisesRegex(ValueError, "must equal source amount 500"):
+                reconcile.review_command(
+                    Namespace(work=work, review_action="seal", group="测试小额群")
+                )
 
     def test_changed_snapshot_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

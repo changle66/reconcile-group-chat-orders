@@ -90,7 +90,9 @@ def check(workbook_path: Path, orders_path: Path) -> list[str]:
         "客户付款",
         "付款退款",
         "内部回款",
+        "内部回款分摊",
         "回款追回",
+        "回款追回分摊",
         "未归单资金图片",
     }
     last_column = len(core.HEADERS)
@@ -167,11 +169,20 @@ def check(workbook_path: Path, orders_path: Path) -> list[str]:
                             f"{sheet_name}!{worksheet.cell(row_index, column_index).coordinate}: "
                             f"expected {right!r}, got {left!r}"
                         )
-                if expected[0] in fund_row_types and not core.clean_text(
-                    worksheet.cell(row_index, payee_column).value
-                ):
-                    coordinate = worksheet.cell(row_index, payee_column).coordinate
-                    errors.append(f"{sheet_name}!{coordinate}: fund-flow row requires payee")
+                if expected[0] in fund_row_types:
+                    payee_cell = worksheet.cell(row_index, payee_column)
+                    if not core.clean_text(payee_cell.value):
+                        errors.append(
+                            f"{sheet_name}!{payee_cell.coordinate}: fund-flow row requires payee"
+                        )
+                    elif payee_cell.data_type != "s":
+                        errors.append(
+                            f"{sheet_name}!{payee_cell.coordinate}: payee must be stored as text"
+                        )
+                    if canonical_number_format(payee_cell.number_format) != "@":
+                        errors.append(
+                            f"{sheet_name}!{payee_cell.coordinate}: payee must use Excel text format"
+                        )
                 if expected[0] == "订单汇总":
                     wrong_fill = [cell.coordinate for cell in row_cells if not has_summary_fill(cell)]
                     if wrong_fill:

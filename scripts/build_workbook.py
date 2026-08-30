@@ -79,10 +79,13 @@ def validate_orders(data: object) -> list[dict[str, Any]]:
                     f"groups[{group_index}].orders[{order_index}].flows[{flow_index}] "
                     "must be an object",
                 )
-                core.require(
-                    bool(core.clean_text(flow.get("payee"))),
-                    f"groups[{group_index}].orders[{order_index}].flows[{flow_index}].payee "
-                    "is required",
+                core.validate_payee(
+                    flow.get("payee"),
+                    field=(
+                        f"groups[{group_index}].orders[{order_index}].flows[{flow_index}].payee"
+                    ),
+                    cash=flow.get("cash") is True,
+                    payee_state=flow.get("payee_state"),
                 )
     return groups
 
@@ -143,10 +146,18 @@ def rate_cell(value: Mapping[str, Any]) -> int | float | str | None:
 
 
 def flow_row_label(flow: Mapping[str, Any]) -> str | None:
+    if flow.get("settlement_allocation"):
+        return "回款追回分摊" if flow.get("side") == "recovery" else "内部回款分摊"
     return core.clean_text(flow.get("flow_type")) or None
 
 
 def flow_row_note(flow: Mapping[str, Any]) -> str | None:
+    if flow.get("settlement_allocation"):
+        source_amount = core.clean_text(flow.get("source_amount"))
+        amount = core.clean_text(flow.get("amount"))
+        currency = core.clean_text(flow.get("currency"))
+        source_label = "原始合并追回" if flow.get("side") == "recovery" else "原始合并回款"
+        return f"{source_label} {source_amount} {currency}；本单计入 {amount} {currency}。"
     if flow.get("side") == "unassigned":
         return "金额和币种按截图展示；尚未归入订单，未计入任何订单合计。"
     if flow.get("duplicate_of") or flow.get("status") == "failed":
@@ -157,10 +168,7 @@ def flow_row_note(flow: Mapping[str, Any]) -> str | None:
 
 
 def order_row_note(order: Mapping[str, Any]) -> str | None:
-    explicit_note = core.clean_text(order.get("note"))
-    if explicit_note:
-        return explicit_note
-    return core.clean_text(order.get("anomaly_note")) or None
+    return core.clean_text(order.get("note")) or None
 
 
 def pricing_detail_rows(order: Mapping[str, Any]) -> list[list[Any]]:
@@ -344,6 +352,7 @@ def build_workbook(
         wrapped_columns = {
             core.HEADERS.index(header) + 1 for header in wrapped_headers
         }
+        payee_column = core.HEADERS.index("收款方") + 1
         review_column = core.HEADERS.index("核对结果") + 1
         review_column_letter = get_column_letter(review_column)
         for column, (value, style) in enumerate(zip(core.HEADERS, header_styles), start=1):
@@ -374,6 +383,8 @@ def build_workbook(
                 for column, (value, style) in enumerate(zip(values, body_styles), start=1):
                     cell = worksheet.cell(row=output_row, column=column, value=value)
                     apply_cell_style(cell, style)
+                    if column == payee_column:
+                        cell.number_format = "@"
                     cell.alignment = Alignment(
                         horizontal="center",
                         vertical="center",

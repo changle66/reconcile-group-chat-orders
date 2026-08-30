@@ -37,14 +37,15 @@ python scripts/reconcile.py review <work> next --group <群> --limit 200
 媒体条目中的 `path` 是原图路径。缩略图只能用来判断是否可能是资金凭证；一旦判为 `fund`，必须打开该
 路径的原图，看完后立即录入。
 
-## v2.2 群判定
+## v2.3 群判定
 
-每群只维护一份 `group-chat-decision/2.2` 判定。生成字段保持原样，只编辑
-`media_decisions`、`orders` 和确有需要时的 `balance_links`。示例：
+每群只维护一份 `group-chat-decision/2.3` 判定。生成字段保持原样，只编辑
+`media_decisions`、`orders` 和确有需要时的 `settlement_allocations`、`balance_links`、
+`unknown_payee_reviewed_entry_ids`。示例：
 
 ```json
 {
-  "contract_version": "group-chat-decision/2.2",
+  "contract_version": "group-chat-decision/2.3",
   "reviewed_through": 420,
   "read_complete": true,
   "sealed": false,
@@ -63,6 +64,7 @@ python scripts/reconcile.py review <work> next --group <群> --limit 200
           "amount_text": "28,890.00 THB",
           "currency": "THB",
           "payee": "206-4-xxx781",
+          "payee_state": "visible",
           "kind": "transfer",
           "side": "payout",
           "result": "completed",
@@ -85,7 +87,9 @@ python scripts/reconcile.py review <work> next --group <群> --limit 200
       "expected_payout": "28890"
     }
   ],
-  "balance_links": []
+  "settlement_allocations": [],
+  "balance_links": [],
+  "unknown_payee_reviewed_entry_ids": []
 }
 ```
 
@@ -108,7 +112,10 @@ python scripts/reconcile.py review <work> next --group <群> --limit 200
   金额制造少转差额。
 - `amount_text`：可选，原样保留逗号、正负号或单位。
 - `currency`：原图币种；TRX 不改写成 USDT。
-- `payee`：模型打开原图，识别并原样记录实际收款方最具体的可见姓名、掩码账户或地址。
+- `payee`：模型打开原图，识别并原样记录实际收款方最具体的可见姓名、掩码账户或地址；必须是 JSON 字符串，
+  账号和钱包地址不得写成数字。
+- `payee_state`：必填。明确可见写 `visible`；原图没有收款方字段写 `not_shown` 且 `payee=未显示`；字段存在
+  但确实看不清写 `unreadable` 且 `payee=无法辨认`；现金写 `cash`。
 - `kind`：`transfer` 或 `cash`；现金的收款方由脚本规范为 `现金`。
 - `side`：必填，`payment|payment_refund|payout|recovery|unknown`。普通凭证按发送者身份填写：客户发出记
   `payment`，内部人员发出记 `payout`；聊天明确是退款或追回时分别记 `payment_refund` 或 `recovery`。
@@ -127,16 +134,21 @@ python scripts/reconcile.py review <work> next --group <群> --limit 200
 换汇方向和明确的退款、追回、拆分、补抵或同笔交易关系；界面中与本单无关的余额、优惠、矿工费或广告金额
 不另建资金条目。
 
-`payee` 不得使用“截图所示人民币收款方”“截图所示泰国收款账户”“聊天指定USDT收款地址”等描述性
-占位内容。原图确实没有显示时写 `未显示`，确实看不清时写 `无法辨认`。脚本只校验并原样传递该字段，
-不识别、不推断、不补值；`未显示` 或 `无法辨认` 不触发订单待确认。
+`payee` 不得使用“截图所示人民币收款方”“截图所示泰国收款账户”“聊天指定USDT收款地址”“群内收款方”
+“泰铢收款账户”“USDT收款钱包”等描述性占位内容。脚本校验 `payee_state` 与值一致，并把 Excel 收款方列
+强制保存为文本；`未显示` 或 `无法辨认` 不触发订单待确认。
+
+当本群转账条目不少于 10 条且 `not_shown/unreadable` 超过一半时，`review check` 返回
+`unknown_payee_review_required=1` 和尚未复核数量。必须逐一重开相应原图，把复核后仍确认为未知的条目标识
+完整写入根级 `unknown_payee_reviewed_entry_ids`；`review seal` 不接受批量未知值未经这一步直接发布。
 
 ## 订单
 
 每个订单至少填写：
 
 - `id`：本群唯一短编号，例如 `O001`。
-- `entry_ids`：属于该订单的资金条目；同一条目不能进入两个订单。
+- `entry_ids`：属于该订单的资金条目；同一条目不能进入两个订单。被群级 `settlement_allocations` 占用的原始
+  合并回款条目不得再出现在任何订单的 `entry_ids` 中。
 - `source_messages`：支持订单边界、客户、方向、采用报价或明确关系的消息短标签，可跨页且不限固定半径。
 - `customer_id`、`customer_nickname`、`direction`：三个键都必须存在，由模型填写；聊天无法确认时显式写
   `null` 或空字符串。多方向订单的订单级 `direction` 可为空，各 `leg.direction` 必须明确。
@@ -219,6 +231,27 @@ python scripts/reconcile.py review <work> next --group <群> --limit 200
 才记录 `network_fee`，且必须有 `customer_requested=true`；截图自身显示的矿工费、Gas 或能量消耗不录为
 额外费用。
 
+一张实际回款或追回凭证明确同时属于至少两个普通订单时，使用群级 `settlement_allocations`：
+
+```json
+"settlement_allocations": [
+  {
+    "entry_id": "M0224.1",
+    "allocations": [
+      {"order_id": "O055", "amount": "9780"},
+      {"order_id": "O056", "amount": "20220"}
+    ],
+    "source_messages": ["S00621"]
+  }
+]
+```
+
+源条目必须是金额、币种明确且已完成的 `payout` 或 `recovery`，只能由这一关系占用；至少分给两个不同订单，
+各分配额必须为正且合计严格等于原始凭证金额。目标订单必须是同一客户、同一回款币种的普通订单，并各自有
+付款证据。脚本为每个目标订单生成一条“内部回款分摊”明细，显示本单计入额，同时在备注保留原始合并回款
+总额；原始物理凭证只计数一次。它与 `legs` 不同：`legs` 是一笔付款拆成多个方向，
+`settlement_allocations` 是一笔实际回款结清多个订单。
+
 明确把前单差额补到或抵扣后单时，才使用群级 `balance_links`：
 
 ```json
@@ -244,6 +277,7 @@ python scripts/reconcile.py review <work> next --group <群> --limit 200
 
 - 群未读完、可用媒体漏分类、资金图未打开原图；
 - 描述性收款方、字段格式错误、缺少显式 `side`/客户/方向、短标签不存在、资金条目未归单或重复归单；
+- 收款方状态和值冲突、批量未知收款方未逐图复核，或合并回款分摊不守恒、跨客户、币种不一致；
 - 缺少汇率状态或应回状态，状态值不受支持，或状态与汇率、运算符、明确应回互相冲突；
 - 固定快照、已采用资金原图或封存后的语义判定发生变化；
 - 输出文件已存在或生成的工作簿回读不一致。
@@ -274,4 +308,4 @@ python scripts/reconcile.py finish <work> -o <新的群聊订单核对.xlsx>
 通过后才原子发布。失败和已声明重复的资金明细不写入工作簿，普通无问题订单不写备注。最终交付只有指定的
 `.xlsx`；内部 events、plan 和 orders 不留在工作目录。
 
-旧的 `group-chat-decision/2.1` 不再兼容；新任务必须从 `start` 生成 2.2 判定后审阅和封存。
+旧的 `group-chat-decision/2.2` 仅作已有任务兼容；新任务必须从 `start` 生成 2.3 判定后审阅和封存。

@@ -25,11 +25,16 @@ import simple_ledger
 
 
 RUN_CONTRACT = "group-chat-reconcile-run/1.0"
-DECISION_CONTRACT = "group-chat-decision/2.2"
+LEGACY_DECISION_CONTRACT = "group-chat-decision/2.2"
+DECISION_CONTRACT = "group-chat-decision/2.3"
+SUPPORTED_DECISION_CONTRACTS = frozenset(
+    {LEGACY_DECISION_CONTRACT, DECISION_CONTRACT}
+)
 REVIEW_PAGE_CONTRACT = "group-chat-review-page/1.0"
 NORMALIZER_VERSION = "reconcile-start/1.0"
 DEFAULT_PAGE_SIZE = 200
 MAX_PAGE_SIZE = 500
+UNKNOWN_PAYEE_AUDIT_MIN_TRANSFERS = 10
 FLOW_SIDES = frozenset({"payment", "payment_refund", "payout", "recovery", "unknown"})
 ENTRY_KINDS = frozenset({"transfer", "cash"})
 ENTRY_RESULTS = frozenset({"completed", "failed", "pending", "not_shown", "unknown"})
@@ -345,6 +350,8 @@ def _decision_template(normalized: Mapping[str, Any], group: Mapping[str, Any]) 
         "media_decisions": {},
         "orders": [],
         "balance_links": [],
+        "settlement_allocations": [],
+        "unknown_payee_reviewed_entry_ids": [],
     }
 
 
@@ -484,21 +491,31 @@ def _decision_path(work: Path, run_group: Mapping[str, Any]) -> Path:
 
 
 def _semantic_fingerprint(decision: Mapping[str, Any]) -> str:
-    return core.fingerprint_json(
-        {
-            "media_decisions": decision.get("media_decisions"),
-            "orders": decision.get("orders"),
-            "balance_links": decision.get("balance_links"),
-        }
-    )
+    semantic = {
+        "media_decisions": decision.get("media_decisions"),
+        "orders": decision.get("orders"),
+        "balance_links": decision.get("balance_links"),
+    }
+    # Preserve fingerprints for sealed 2.2 decisions while covering every new
+    # 2.3 judgment when those fields exist.
+    for field in ("settlement_allocations", "unknown_payee_reviewed_entry_ids"):
+        if field in decision:
+            semantic[field] = decision.get(field)
+    return core.fingerprint_json(semantic)
 
 
-def _validate_entry(entry: dict[str, Any], *, field: str) -> None:
+def _validate_entry(
+    entry: dict[str, Any],
+    *,
+    field: str,
+    require_payee_state: bool,
+) -> None:
     allowed = {
         "amount",
         "amount_text",
         "currency",
         "payee",
+        "payee_state",
         "kind",
         "side",
         "result",
@@ -534,7 +551,11 @@ def _validate_entry(entry: dict[str, Any], *, field: str) -> None:
         entry.get("payee"),
         field=f"{field}.payee",
         cash=kind == "cash",
+        payee_state=entry.get("payee_state"),
+        require_state=require_payee_state,
     )
+    if entry.get("payee_state") not in (None, ""):
+        entry["payee_state"] = core.clean_text(entry.get("payee_state")).casefold()
 
 
 def _validate_network_fees(value: object, *, field: str) -> None:
@@ -641,7 +662,12 @@ def _validate_decision(
     capture_hashes: bool,
 ) -> dict[str, int]:
     expected = _decision_template(normalized, group)
-    core.require(decision.get("contract_version") == DECISION_CONTRACT, "unsupported decision contract")
+    decision_contract = core.clean_text(decision.get("contract_version"))
+    core.require(
+        decision_contract in SUPPORTED_DECISION_CONTRACTS,
+        "unsupported decision contract",
+    )
+    current_contract = decision_contract == DECISION_CONTRACT
     for field in (
         "normalized_source_fingerprint",
         "group_fingerprint",
@@ -671,6 +697,9 @@ def _validate_decision(
         core.require(not unclassified, f"unclassified available media: {unclassified[:20]}")
 
     entry_ids: set[str] = set()
+    entry_records: dict[str, dict[str, Any]] = {}
+    transfer_payees = 0
+    unknown_payee_entry_ids: set[str] = set()
     reference_count = 0
     fund_media_count = 0
     for label, raw in media_decisions.items():
@@ -701,17 +730,55 @@ def _validate_decision(
             raise ValueError(f"{field}: evidence hash has not been captured; run review seal")
         for position, entry in enumerate(entries, start=1):
             core.require(isinstance(entry, dict), f"{field}.entries[{position - 1}] must be an object")
-            _validate_entry(entry, field=f"{field}.entries[{position - 1}]")
+            _validate_entry(
+                entry,
+                field=f"{field}.entries[{position - 1}]",
+                require_payee_state=current_contract,
+            )
             entry_id = f"{label}.{position}"
             core.require(entry_id not in entry_ids, f"duplicate entry id: {entry_id}")
             entry_ids.add(entry_id)
+            entry_records[entry_id] = entry
+            if entry["kind"] == "transfer":
+                transfer_payees += 1
+                if entry["payee"] in core.UNKNOWN_PAYEES:
+                    unknown_payee_entry_ids.add(entry_id)
         fund_media_count += 1
+
+    reviewed_unknown_value = decision.get("unknown_payee_reviewed_entry_ids", [])
+    core.require(
+        isinstance(reviewed_unknown_value, list),
+        "unknown_payee_reviewed_entry_ids must be a list",
+    )
+    reviewed_unknown = [str(item) for item in reviewed_unknown_value]
+    core.require(
+        len(reviewed_unknown) == len(set(reviewed_unknown)),
+        "unknown_payee_reviewed_entry_ids repeats an entry",
+    )
+    core.require(
+        set(reviewed_unknown) <= unknown_payee_entry_ids,
+        "unknown_payee_reviewed_entry_ids may only cite transfer entries marked 未显示 or 无法辨认",
+    )
+    unknown_payee_review_required = (
+        current_contract
+        and transfer_payees >= UNKNOWN_PAYEE_AUDIT_MIN_TRANSFERS
+        and len(unknown_payee_entry_ids) * 2 > transfer_payees
+    )
+    unreviewed_unknown_payees = unknown_payee_entry_ids - set(reviewed_unknown)
+    if require_complete and unknown_payee_review_required:
+        core.require(
+            not unreviewed_unknown_payees,
+            "unknown payee audit is required: reopen every cited original image and list all "
+            "confirmed unknown entry IDs in unknown_payee_reviewed_entry_ids; remaining: "
+            f"{sorted(unreviewed_unknown_payees)[:40]}",
+        )
 
     label_by_message_id, message_by_label = _message_labels(group)
     del label_by_message_id
     orders = decision.get("orders")
     core.require(isinstance(orders, list), "orders must be a list")
     order_ids: set[str] = set()
+    order_by_id: dict[str, dict[str, Any]] = {}
     assigned_entries: set[str] = set()
     pricing_scopes = 0
     missing_pricing_states: list[str] = []
@@ -750,6 +817,7 @@ def _validate_decision(
         core.require(bool(order_id), f"{field}.id is required")
         core.require(order_id not in order_ids, f"{field}.id is duplicated")
         order_ids.add(order_id)
+        order_by_id[order_id] = order
         raw_entries = order.get("entry_ids")
         core.require(isinstance(raw_entries, list) and raw_entries, f"{field}.entry_ids is required")
         refs = [str(item) for item in raw_entries]
@@ -860,6 +928,147 @@ def _validate_decision(
                 _validate_pricing_scope(order, field=field)
             )
 
+    settlement_allocations = decision.get("settlement_allocations", [])
+    core.require(
+        isinstance(settlement_allocations, list),
+        "settlement_allocations must be a list",
+    )
+    allocated_source_entries: set[str] = set()
+    for position, relation in enumerate(settlement_allocations):
+        field = f"{group.get('group_key')}.settlement_allocations[{position}]"
+        core.require(isinstance(relation, dict), f"{field} must be an object")
+        unknown_relation_fields = sorted(
+            set(relation) - {"entry_id", "allocations", "source_messages"}
+        )
+        core.require(
+            not unknown_relation_fields,
+            f"{field}: unsupported fields: {', '.join(unknown_relation_fields)}",
+        )
+        source_entry_id = core.clean_text(relation.get("entry_id"))
+        core.require(source_entry_id in entry_records, f"{field}.entry_id is unknown")
+        core.require(
+            source_entry_id not in assigned_entries,
+            f"{field}.entry_id must not also appear in an order.entry_ids",
+        )
+        core.require(
+            source_entry_id not in allocated_source_entries,
+            f"{field}.entry_id is already used by another settlement allocation",
+        )
+        source_entry = entry_records[source_entry_id]
+        core.require(
+            source_entry.get("side") in {"payout", "recovery"},
+            f"{field}.entry_id must identify a payout or recovery entry",
+        )
+        core.require(
+            source_entry.get("result") == "completed"
+            and source_entry.get("amount_state") == "clear",
+            f"{field}.entry_id must be a completed entry with a clear amount",
+        )
+        source_amount = core.parse_decimal(
+            source_entry.get("amount"),
+            field=f"{field}.source_amount",
+        )
+        core.require(
+            source_amount is not None and source_amount > 0,
+            f"{field}.source_amount must be positive",
+        )
+        source_currency = core.normalize_currency(
+            source_entry.get("currency"),
+            field=f"{field}.source_currency",
+        )
+        allocations = relation.get("allocations")
+        core.require(
+            isinstance(allocations, list) and len(allocations) >= 2,
+            f"{field}.allocations must contain at least two target orders",
+        )
+        target_order_ids: set[str] = set()
+        target_customer_ids: set[str] = set()
+        allocated_amounts = []
+        for allocation_position, allocation in enumerate(allocations):
+            allocation_field = f"{field}.allocations[{allocation_position}]"
+            core.require(
+                isinstance(allocation, dict),
+                f"{allocation_field} must be an object",
+            )
+            unknown_allocation_fields = sorted(set(allocation) - {"order_id", "amount"})
+            core.require(
+                not unknown_allocation_fields,
+                f"{allocation_field}: unsupported fields: {', '.join(unknown_allocation_fields)}",
+            )
+            target_order_id = core.clean_text(allocation.get("order_id"))
+            core.require(
+                target_order_id in order_by_id,
+                f"{allocation_field}.order_id is unknown",
+            )
+            core.require(
+                target_order_id not in target_order_ids,
+                f"{field}.allocations repeats target order {target_order_id}",
+            )
+            target_order_ids.add(target_order_id)
+            target_order = order_by_id[target_order_id]
+            core.require(
+                target_order.get("legs") in (None, "", []),
+                f"{allocation_field}: settlement allocation does not support multi-leg target orders",
+            )
+            target_customer_id = core.clean_text(target_order.get("customer_id"))
+            core.require(
+                bool(target_customer_id),
+                f"{allocation_field}: target customer_id must be known",
+            )
+            target_customer_ids.add(target_customer_id)
+            _, target_payout_currency = core.direction_currencies(
+                target_order.get("direction"),
+                field=f"{allocation_field}.target_direction",
+            )
+            core.require(
+                target_payout_currency == source_currency,
+                f"{allocation_field}: target payout currency must be {source_currency}",
+            )
+            target_entries = [
+                entry_records[str(item)]
+                for item in target_order.get("entry_ids", [])
+                if str(item) in entry_records
+            ]
+            core.require(
+                any(item.get("side") in {"payment", "payment_refund"} for item in target_entries),
+                f"{allocation_field}: target order must contain its own payment evidence",
+            )
+            amount = core.parse_decimal(
+                allocation.get("amount"),
+                field=f"{allocation_field}.amount",
+            )
+            core.require(
+                amount is not None and amount > 0,
+                f"{allocation_field}.amount must be positive",
+            )
+            allocation["order_id"] = target_order_id
+            allocation["amount"] = core.decimal_text(amount)
+            allocated_amounts.append(amount)
+        core.require(
+            len(target_customer_ids) == 1,
+            f"{field}.allocations must target orders for the same customer",
+        )
+        allocated_total = sum(allocated_amounts, start=source_amount * 0)
+        core.require(
+            allocated_total == source_amount,
+            f"{field}.allocations total {core.decimal_text(allocated_total)} "
+            f"must equal source amount {core.decimal_text(source_amount)}",
+        )
+        source_messages = relation.get("source_messages", [])
+        core.require(isinstance(source_messages, list), f"{field}.source_messages must be a list")
+        source_labels = [str(item) for item in source_messages]
+        core.require(
+            len(source_labels) == len(set(source_labels)),
+            f"{field}.source_messages repeats a label",
+        )
+        core.require(
+            set(source_labels) <= set(message_by_label),
+            f"{field}.source_messages contains an unknown label",
+        )
+        relation["entry_id"] = source_entry_id
+        allocated_source_entries.add(source_entry_id)
+        assigned_entries.add(source_entry_id)
+
     if require_complete:
         core.require(
             not missing_pricing_states,
@@ -923,6 +1132,11 @@ def _validate_decision(
         "pricing_scopes": pricing_scopes,
         "missing_pricing_states": len(missing_pricing_states),
         "unassigned_entries": len(entry_ids - assigned_entries),
+        "settlement_allocations": len(settlement_allocations),
+        "transfer_payees": transfer_payees,
+        "unknown_payees": len(unknown_payee_entry_ids),
+        "unknown_payee_review_required": int(unknown_payee_review_required),
+        "unreviewed_unknown_payees": len(unreviewed_unknown_payees),
     }
 
 
@@ -1069,10 +1283,13 @@ def review_command(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _entry_event_type(entry: Mapping[str, Any]) -> str:
-    if core.clean_text(entry.get("side")).casefold() == "recovery":
-        return "payout_recovery"
+    side = core.clean_text(entry.get("side")).casefold()
     if core.clean_text(entry.get("kind")).casefold() == "cash":
-        return "cash_payment"
+        return "cash_payment" if side in {"payment", "payment_refund"} else "cash_payout"
+    if side == "recovery":
+        return "payout_recovery"
+    if side == "payout":
+        return "payout_screenshot"
     return "payment_screenshot"
 
 
@@ -1171,6 +1388,7 @@ def _compile_decisions_v2(
                         "amount_text": entry.get("amount_text"),
                         "currency": entry.get("currency"),
                         "payee": entry["payee"],
+                        "payee_state": entry.get("payee_state"),
                         "status_text": entry.get("status_text"),
                         "status_class": STATUS_CLASS[str(entry["result"])],
                         "status_class_confidence": "high",
@@ -1224,6 +1442,24 @@ def _compile_decisions_v2(
             order["event_sides"] = event_sides
             order.update(_translated_advanced_order(raw, event_by_entry=event_by_entry))
             plan_orders.append(order)
+        settlement_allocations = []
+        for raw_relation in decision.get("settlement_allocations", []):
+            relation = {
+                "source_event_id": event_by_entry[str(raw_relation["entry_id"])],
+                "allocations": [
+                    {
+                        "target_case_id": case_by_order_id[str(item["order_id"])],
+                        "amount": copy.deepcopy(item["amount"]),
+                    }
+                    for item in raw_relation["allocations"]
+                ],
+            }
+            if raw_relation.get("source_messages"):
+                relation["source_message_ids"] = [
+                    str(message_by_label[str(item)]["message_id"])
+                    for item in raw_relation["source_messages"]
+                ]
+            settlement_allocations.append(relation)
         balance_links = []
         for raw_link in decision.get("balance_links", []):
             link = {
@@ -1244,6 +1480,7 @@ def _compile_decisions_v2(
                 "group_key": group_key,
                 "orders": plan_orders,
                 "balance_links": balance_links,
+                "settlement_allocations": settlement_allocations,
             }
         )
     events_fingerprint = core.fingerprint_json(events)

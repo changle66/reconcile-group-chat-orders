@@ -16,13 +16,19 @@ import core
 
 LEGACY_SIMPLE_PLAN_CONTRACT = "small-group-simple-plan/1.0"
 INTERMEDIATE_SIMPLE_PLAN_CONTRACT = "small-group-simple-plan/1.1"
-SIMPLE_PLAN_CONTRACT = "small-group-simple-plan/1.2"
+PREVIOUS_SIMPLE_PLAN_CONTRACT = "small-group-simple-plan/1.2"
+SIMPLE_PLAN_CONTRACT = "small-group-simple-plan/1.3"
 SUPPORTED_SIMPLE_PLAN_CONTRACTS = {
     LEGACY_SIMPLE_PLAN_CONTRACT,
     INTERMEDIATE_SIMPLE_PLAN_CONTRACT,
+    PREVIOUS_SIMPLE_PLAN_CONTRACT,
     SIMPLE_PLAN_CONTRACT,
 }
-SIMPLE_MODE_VERSION = "1.3"
+MODEL_JUDGMENT_PLAN_CONTRACTS = {
+    PREVIOUS_SIMPLE_PLAN_CONTRACT,
+    SIMPLE_PLAN_CONTRACT,
+}
+SIMPLE_MODE_VERSION = "1.4"
 SUPPORTED_FUND_EVENT_TYPES = frozenset(core.FUND_EVENT_TYPES)
 FLOW_LABEL = {
     "payment": "客户付款",
@@ -118,6 +124,7 @@ def _visible_payee(event: Mapping[str, Any]) -> str:
         ocr.get("payee"),
         field=f"{event.get('event_id') or 'fund_event'}.payee",
         cash=event.get("type") in {"cash_payment", "cash_payout"},
+        payee_state=ocr.get("payee_state"),
     )
 
 
@@ -168,6 +175,8 @@ def _flow_from_event(
             "amount": core.decimal_text(amount),
             "currency": currency,
             "payee": payee,
+            "payee_state": core.clean_text(ocr.get("payee_state")).casefold() or None,
+            "cash": event_type in {"cash_payment", "cash_payout"},
             "message_time": message.get("timestamp"),
             "source_message_id": str(event.get("message_id") or ""),
             "status": status,
@@ -525,6 +534,211 @@ def _parse_optional_decimal(value: object, *, field: str) -> Decimal | None:
     return core.parse_decimal(value, field=field, allow_none=True)
 
 
+def _compile_settlement_allocations(
+    value: object,
+    *,
+    group_key: str,
+    raw_orders: list[Mapping[str, Any]],
+    messages: Mapping[str, Mapping[str, Any]],
+    event_index: Mapping[str, Mapping[str, Any]],
+    assigned_events: set[str],
+) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
+    if value in (None, ""):
+        return {}, []
+    core.require(isinstance(value, list), f"{group_key}: settlement_allocations must be a list")
+    order_index: dict[str, Mapping[str, Any]] = {}
+    direct_event_ids: set[str] = set()
+    for position, raw_order in enumerate(raw_orders, start=1):
+        core.require(isinstance(raw_order, Mapping), f"{group_key}: simple order must be an object")
+        case_id = core.clean_text(raw_order.get("case_id")) or f"{group_key}:simple:{position:03d}"
+        core.require(case_id not in order_index, f"{group_key}: simple order case_id values must be unique")
+        order_index[case_id] = raw_order
+        raw_event_ids = raw_order.get("event_ids")
+        core.require(isinstance(raw_event_ids, list), f"{case_id}: event_ids must be a list")
+        direct_event_ids.update(str(item) for item in raw_event_ids)
+
+    allocated_flows: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
+    compiled_relations: list[dict[str, Any]] = []
+    used_source_events: set[str] = set()
+    for relation_position, relation in enumerate(value):
+        field = f"{group_key}: settlement_allocations[{relation_position}]"
+        core.require(isinstance(relation, Mapping), f"{field} must be an object")
+        unknown_fields = sorted(
+            set(relation) - {"source_event_id", "allocations", "source_message_ids"}
+        )
+        core.require(
+            not unknown_fields,
+            f"{field}: unsupported fields: {', '.join(unknown_fields)}",
+        )
+        source_event_id = core.clean_text(relation.get("source_event_id"))
+        core.require(source_event_id in event_index, f"{field}.source_event_id is unknown")
+        core.require(
+            source_event_id not in direct_event_ids,
+            f"{field}.source_event_id must not also appear in a simple order.event_ids",
+        )
+        core.require(
+            source_event_id not in used_source_events and source_event_id not in assigned_events,
+            f"{field}.source_event_id is assigned more than once",
+        )
+        source_event = event_index[source_event_id]
+        core.require(
+            source_event.get("group_key") == group_key,
+            f"{field}.source_event_id belongs to another group",
+        )
+        core.require(
+            source_event.get("type") in SUPPORTED_FUND_EVENT_TYPES,
+            f"{field}.source_event_id is not supported fund evidence",
+        )
+        source_side = _simple_side(source_event.get("flow_side"))
+        core.require(
+            source_side in {"payout", "recovery"},
+            f"{field}.source_event_id must have explicit payout or recovery side",
+        )
+        source_message_id = str(source_event.get("message_id") or "")
+        source_message = messages.get(source_message_id)
+        core.require(source_message is not None, f"{field}.source_event_id has no source message")
+        base_flow, issue = _flow_from_event(
+            source_event,
+            source_message,
+            duplicate_of=None,
+            side_override=source_side,
+        )
+        core.require(
+            issue is None and base_flow.get("included") is True,
+            f"{field}.source_event_id must be completed with a clear amount and currency",
+        )
+        source_amount = _parse_positive_decimal(
+            base_flow.get("amount"),
+            field=f"{field}.source_amount",
+        )
+        source_currency = core.normalize_currency(
+            base_flow.get("currency"),
+            field=f"{field}.source_currency",
+        )
+        assert source_currency is not None
+
+        allocations = relation.get("allocations")
+        core.require(
+            isinstance(allocations, list) and len(allocations) >= 2,
+            f"{field}.allocations must contain at least two target orders",
+        )
+        targets: set[str] = set()
+        customer_ids: set[str] = set()
+        parsed_allocations: list[tuple[str, Decimal]] = []
+        for allocation_position, allocation in enumerate(allocations):
+            allocation_field = f"{field}.allocations[{allocation_position}]"
+            core.require(isinstance(allocation, Mapping), f"{allocation_field} must be an object")
+            unknown_allocation_fields = sorted(
+                set(allocation) - {"target_case_id", "amount"}
+            )
+            core.require(
+                not unknown_allocation_fields,
+                f"{allocation_field}: unsupported fields: {', '.join(unknown_allocation_fields)}",
+            )
+            target_case_id = core.clean_text(allocation.get("target_case_id"))
+            core.require(
+                target_case_id in order_index,
+                f"{allocation_field}.target_case_id is unknown",
+            )
+            core.require(
+                target_case_id not in targets,
+                f"{field}.allocations repeats target order {target_case_id}",
+            )
+            targets.add(target_case_id)
+            target_order = order_index[target_case_id]
+            core.require(
+                target_order.get("legs") in (None, "", []),
+                f"{allocation_field}: settlement allocation does not support multi-leg target orders",
+            )
+            customer_id = core.clean_text(target_order.get("customer_id"))
+            core.require(bool(customer_id), f"{allocation_field}: target customer_id must be known")
+            customer_ids.add(customer_id)
+            _, payout_currency = core.direction_currencies(
+                target_order.get("direction"),
+                field=f"{allocation_field}.target_direction",
+            )
+            core.require(
+                payout_currency == source_currency,
+                f"{allocation_field}: target payout currency must be {source_currency}",
+            )
+            event_sides = target_order.get("event_sides", {})
+            core.require(
+                isinstance(event_sides, Mapping)
+                and any(
+                    core.clean_text(side).casefold() in {"payment", "payment_refund"}
+                    for side in event_sides.values()
+                ),
+                f"{allocation_field}: target order must contain its own payment evidence",
+            )
+            amount = _parse_positive_decimal(
+                allocation.get("amount"),
+                field=f"{allocation_field}.amount",
+            )
+            parsed_allocations.append((target_case_id, amount))
+        core.require(
+            len(customer_ids) == 1,
+            f"{field}.allocations must target orders for the same customer",
+        )
+        allocation_total = sum(
+            (amount for _, amount in parsed_allocations),
+            Decimal("0"),
+        )
+        core.require(
+            allocation_total == source_amount,
+            f"{field}.allocations total {core.decimal_text(allocation_total)} "
+            f"must equal source amount {core.decimal_text(source_amount)}",
+        )
+        source_message_ids = relation.get("source_message_ids", [])
+        core.require(isinstance(source_message_ids, list), f"{field}.source_message_ids must be a list")
+        normalized_source_message_ids = [str(item) for item in source_message_ids]
+        core.require(
+            len(normalized_source_message_ids) == len(set(normalized_source_message_ids)),
+            f"{field}.source_message_ids repeats a message",
+        )
+        core.require(
+            all(
+                message_id in messages
+                and messages[message_id].get("_group_key") == group_key
+                for message_id in normalized_source_message_ids
+            ),
+            f"{field}.source_message_ids contains an unknown or cross-group message",
+        )
+
+        compiled_allocations = []
+        allocation_count = len(parsed_allocations)
+        for allocation_index, (target_case_id, amount) in enumerate(parsed_allocations, start=1):
+            allocated_flow = {
+                **base_flow,
+                "event_id": f"{source_event_id}#allocation:{target_case_id}",
+                "amount": core.decimal_text(amount),
+                "settlement_allocation": True,
+                "source_event_id": source_event_id,
+                "source_amount": core.decimal_text(source_amount),
+                "allocation_index": allocation_index,
+                "allocation_count": allocation_count,
+            }
+            allocated_flows[target_case_id].append(allocated_flow)
+            compiled_allocations.append(
+                {
+                    "target_case_id": target_case_id,
+                    "amount": core.decimal_text(amount),
+                }
+            )
+        compiled_relation = {
+            "source_event_id": source_event_id,
+            "source_amount": core.decimal_text(source_amount),
+            "currency": source_currency,
+            "side": source_side,
+            "allocations": compiled_allocations,
+        }
+        if normalized_source_message_ids:
+            compiled_relation["source_message_ids"] = normalized_source_message_ids
+        compiled_relations.append(compiled_relation)
+        used_source_events.add(source_event_id)
+        assigned_events.add(source_event_id)
+    return dict(allocated_flows), compiled_relations
+
+
 def _assign_order_ids(orders: list[dict[str, Any]]) -> None:
     per_date: defaultdict[str, int] = defaultdict(int)
     orders.sort(key=lambda item: (str(item.get("start_time") or ""), str(item.get("case_id") or "")))
@@ -542,6 +756,7 @@ def _compile_order(
     messages: Mapping[str, Mapping[str, Any]],
     event_index: Mapping[str, Mapping[str, Any]],
     assigned_events: set[str],
+    allocated_flows: list[dict[str, Any]],
     require_model_judgments: bool,
 ) -> tuple[dict[str, Any], list[str]]:
     event_ids_value = raw_order.get("event_ids")
@@ -590,6 +805,8 @@ def _compile_order(
         if issue:
             issues.append(issue)
         assigned_events.add(event_id)
+
+    flows.extend(allocated_flows)
 
     flows.sort(key=lambda item: (str(item.get("message_time") or ""), item["event_id"]))
     start_message_id = core.clean_text(raw_order.get("start_message_id"))
@@ -1206,16 +1423,35 @@ def compile_simple_ledger(
     core.require(set(plan_groups) == set(normalized_groups), "simple plan must contain every selected group exactly once")
 
     assigned_events: set[str] = set()
-    require_model_judgments = plan.get("contract_version") == SIMPLE_PLAN_CONTRACT
+    require_model_judgments = plan.get("contract_version") in MODEL_JUDGMENT_PLAN_CONTRACTS
     result_groups: list[dict[str, Any]] = []
     warnings: list[str] = []
     for group_key, normalized_group in normalized_groups.items():
         plan_group = plan_groups[group_key]
         raw_orders = plan_group.get("orders")
         core.require(isinstance(raw_orders, list), f"{group_key}: simple plan orders must be a list")
+        raw_order_mappings = [
+            raw_order for raw_order in raw_orders if isinstance(raw_order, Mapping)
+        ]
+        core.require(
+            len(raw_order_mappings) == len(raw_orders),
+            f"{group_key}: simple order must be an object",
+        )
+        allocated_flows, compiled_settlement_allocations = _compile_settlement_allocations(
+            plan_group.get("settlement_allocations"),
+            group_key=group_key,
+            raw_orders=raw_order_mappings,
+            messages=messages,
+            event_index=event_index,
+            assigned_events=assigned_events,
+        )
         compiled_orders: list[dict[str, Any]] = []
         for position, raw_order in enumerate(raw_orders, start=1):
             core.require(isinstance(raw_order, Mapping), f"{group_key}: simple order must be an object")
+            target_case_id = (
+                core.clean_text(raw_order.get("case_id"))
+                or f"{group_key}:simple:{position:03d}"
+            )
             compiled, issues = _compile_order(
                 raw_order,
                 group_key=group_key,
@@ -1223,6 +1459,7 @@ def compile_simple_ledger(
                 messages=messages,
                 event_index=event_index,
                 assigned_events=assigned_events,
+                allocated_flows=allocated_flows.get(target_case_id, []),
                 require_model_judgments=require_model_judgments,
             )
             compiled_orders.append(compiled)
@@ -1260,6 +1497,7 @@ def compile_simple_ledger(
                 "group_name": normalized_group.get("group_name"),
                 "orders": compiled_orders,
                 "balance_links": compiled_balance_links,
+                "settlement_allocations": compiled_settlement_allocations,
             }
         )
 
