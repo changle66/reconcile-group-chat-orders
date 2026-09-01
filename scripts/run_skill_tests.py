@@ -25,6 +25,10 @@ CURRENT_TEST_IDS = frozenset(
         "test_reconcile.ReconcileWorkflowTests.test_apply_batch_atomically_updates_a_controlled_decision",
         "test_reconcile.ReconcileWorkflowTests.test_controlled_decision_rejects_direct_semantic_overwrite",
         "test_reconcile.ReconcileWorkflowTests.test_invalid_apply_batch_does_not_partially_write_the_decision",
+        "test_reconcile.ReconcileWorkflowTests.test_order_continuity_risk_flags_split_without_mutating_or_blocking",
+        "test_reconcile.ReconcileWorkflowTests.test_order_continuity_risk_ignores_correctly_merged_order",
+        "test_reconcile.ReconcileWorkflowTests.test_order_continuity_risk_ignores_two_complete_independent_orders",
+        "test_reconcile.ReconcileWorkflowTests.test_order_continuity_risk_skips_balance_linked_orders",
         "test_reconcile.ReconcileWorkflowTests.test_page_commit_advances_and_carries_open_order_context",
         "test_reconcile.ReconcileWorkflowTests.test_page_commit_requires_explicit_open_order_state_and_valid_token",
         "test_reconcile.ReconcileWorkflowTests.test_review_next_default_returns_largest_complete_page_within_budget",
@@ -47,7 +51,7 @@ COMPATIBILITY_TEST_IDS = frozenset(
     }
 )
 
-EXPECTED_ALL_TESTS = 98
+EXPECTED_ALL_TESTS = 102
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

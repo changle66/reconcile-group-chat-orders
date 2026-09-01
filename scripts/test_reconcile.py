@@ -520,6 +520,390 @@ class ReconcileWorkflowTests(unittest.TestCase):
             core.atomic_json(path, decision)
         return path
 
+    def _start_order_continuity_fixture(
+        self,
+        root: Path,
+    ) -> tuple[Path, dict[str, dict]]:
+        messages = [
+            {
+                "id": 1,
+                "type": "message",
+                "date_unixtime": "1780000000",
+                "from": "QQ财务3",
+                "from_id": "user:staff",
+                "text": "按32.6，1000/32.6=31",
+            },
+            {
+                "id": 2,
+                "type": "message",
+                "date_unixtime": "1780000060",
+                "from": "Alice",
+                "from_id": "user:alice",
+                "text": "31U付款",
+                "photo": "photos/customer.jpg",
+            },
+            {
+                "id": 3,
+                "type": "message",
+                "date_unixtime": "1780000120",
+                "from": "Alice",
+                "from_id": "user:alice",
+                "text": "我再多转16U，你们帮我付1500泰铢可以吗",
+            },
+            {
+                "id": 4,
+                "type": "message",
+                "date_unixtime": "1780000180",
+                "from": "QQ财务3",
+                "from_id": "user:staff",
+                "text": "可以",
+            },
+            {
+                "id": 5,
+                "type": "message",
+                "date_unixtime": "1780000240",
+                "from": "Alice",
+                "from_id": "user:alice",
+                "text": "16U付款",
+                "photo": "photos/customer.jpg",
+            },
+            {
+                "id": 6,
+                "type": "message",
+                "date_unixtime": "1780000300",
+                "from": "QQ财务3",
+                "from_id": "user:staff",
+                "text": "1500泰铢已回",
+                "photo": "photos/staff.jpg",
+            },
+        ]
+        work, _, _ = self._start_fixture(
+            root,
+            messages=messages,
+            controlled=True,
+        )
+        media_decisions = {
+            "M0001": {
+                "classification": "fund",
+                "viewed_original": True,
+                "entries": [
+                    {
+                        "amount": "31",
+                        "currency": "USDT",
+                        "payee": "TContinuationWallet",
+                    }
+                ],
+            },
+            "M0002": {
+                "classification": "fund",
+                "viewed_original": True,
+                "entries": [
+                    {
+                        "amount": "16",
+                        "currency": "USDT",
+                        "payee": "TContinuationWallet",
+                    }
+                ],
+            },
+            "M0003": {
+                "classification": "fund",
+                "viewed_original": True,
+                "entries": [
+                    {
+                        "amount": "1500",
+                        "currency": "THB",
+                        "payee": "79xxxx3249",
+                    }
+                ],
+            },
+        }
+        return work, media_decisions
+
+    def _split_continuation_orders(self) -> list[dict]:
+        return [
+            {
+                "id": "O011",
+                "entry_ids": ["M0001.1"],
+                "source_messages": ["S00001", "S00002"],
+                "customer_nickname": "Alice",
+                "direction": "USDT->THB",
+                "pricing": {
+                    "source_messages": ["S00001"],
+                    "terms": {"rate": "32.6", "operator": "multiply"},
+                    "expected": {"kind": "explicit", "amount": "1000"},
+                },
+            },
+            {
+                "id": "O012",
+                "entry_ids": ["M0002.1", "M0003.1"],
+                "source_messages": ["S00003", "S00004", "S00005", "S00006"],
+                "customer_nickname": "Alice",
+                "direction": "USDT->THB",
+                "pricing": {
+                    "source_messages": ["S00003", "S00004"],
+                    "expected": {"kind": "unknown", "reason": "not_stated"},
+                },
+            },
+        ]
+
+    def _apply_controlled_semantics(
+        self,
+        root: Path,
+        work: Path,
+        *,
+        batch_id: str,
+        media_decisions: dict[str, dict],
+        orders: list[dict],
+        **extra_fields: object,
+    ) -> dict:
+        run = reconcile._load_run(work)
+        decision_path = reconcile._decision_path(work, run["groups"][0])
+        batch = {
+            "contract_version": reconcile.REVIEW_BATCH_CONTRACT,
+            "batch_id": batch_id,
+            "base_fingerprint": reconcile._semantic_fingerprint(
+                reconcile._load_json(decision_path)
+            ),
+            "media_decisions": media_decisions,
+            "orders": orders,
+            **extra_fields,
+        }
+        batch_path = root / f"{batch_id}.json"
+        core.atomic_json(batch_path, batch)
+        return reconcile.review_command(
+            Namespace(
+                work=work,
+                review_action="apply-batch",
+                group="测试小额群",
+                input=batch_path,
+            )
+        )
+
+    def test_order_continuity_risk_flags_split_without_mutating_or_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            work, media_decisions = self._start_order_continuity_fixture(root)
+            report = self._apply_controlled_semantics(
+                root,
+                work,
+                batch_id="continuity-split",
+                media_decisions=media_decisions,
+                orders=self._split_continuation_orders(),
+            )
+
+            self.assertEqual(report["order_continuity_review_candidate_count"], 1)
+            self.assertEqual(
+                report["order_continuity_review_candidates"],
+                [
+                    {
+                        "earlier_order_id": "O011",
+                        "later_order_id": "O012",
+                        "customer_nickname": "Alice",
+                        "direction": "USDT->THB",
+                        "source_start": "S00001",
+                        "source_end": "S00006",
+                        "reason_codes": [
+                            "earlier_payment_without_payout",
+                            "earlier_confirmed_pricing",
+                            "later_payment_and_payout",
+                            "later_unknown_pricing",
+                        ],
+                    }
+                ],
+            )
+
+            run = reconcile._load_run(work)
+            decision_path = reconcile._decision_path(work, run["groups"][0])
+            before_audit = decision_path.read_bytes()
+            audit = reconcile.review_command(
+                Namespace(work=work, review_action="audit", group="测试小额群")
+            )
+            self.assertEqual(before_audit, decision_path.read_bytes())
+            self.assertEqual(
+                audit["groups"][0]["order_continuity_review_candidate_count"],
+                1,
+            )
+
+            sealed = reconcile.review_command(
+                Namespace(work=work, review_action="seal", group="测试小额群")
+            )
+            self.assertTrue(sealed["sealed"])
+            self.assertEqual(sealed["order_continuity_review_candidate_count"], 1)
+
+    def test_order_continuity_risk_ignores_correctly_merged_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            work, media_decisions = self._start_order_continuity_fixture(root)
+            report = self._apply_controlled_semantics(
+                root,
+                work,
+                batch_id="continuity-merged",
+                media_decisions=media_decisions,
+                orders=[
+                    {
+                        "id": "O011",
+                        "entry_ids": ["M0001.1", "M0002.1", "M0003.1"],
+                        "source_messages": [
+                            "S00001",
+                            "S00002",
+                            "S00003",
+                            "S00004",
+                            "S00005",
+                            "S00006",
+                        ],
+                        "customer_nickname": "Alice",
+                        "direction": "USDT->THB",
+                        "pricing": {
+                            "source_messages": ["S00001", "S00003", "S00004"],
+                            "terms": {"rate": "32.6", "operator": "multiply"},
+                            "expected": {"kind": "explicit", "amount": "1500"},
+                        },
+                    }
+                ],
+            )
+
+            self.assertEqual(report["order_continuity_review_candidate_count"], 0)
+            self.assertEqual(report["order_continuity_review_candidates"], [])
+
+    def test_order_continuity_risk_ignores_two_complete_independent_orders(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            messages = [
+                {
+                    "id": 1,
+                    "type": "message",
+                    "date_unixtime": "1780000000",
+                    "from": "Alice",
+                    "from_id": "user:alice",
+                    "text": "第一单31U，按32.5回1000泰铢",
+                    "photo": "photos/customer.jpg",
+                },
+                {
+                    "id": 2,
+                    "type": "message",
+                    "date_unixtime": "1780000060",
+                    "from": "QQ财务3",
+                    "from_id": "user:staff",
+                    "text": "第一单已回1000泰铢",
+                    "photo": "photos/staff.jpg",
+                },
+                {
+                    "id": 3,
+                    "type": "message",
+                    "date_unixtime": "1780000120",
+                    "from": "Alice",
+                    "from_id": "user:alice",
+                    "text": "新开第二单46U，按32.6回1500泰铢",
+                    "photo": "photos/customer.jpg",
+                },
+                {
+                    "id": 4,
+                    "type": "message",
+                    "date_unixtime": "1780000180",
+                    "from": "QQ财务3",
+                    "from_id": "user:staff",
+                    "text": "第二单已回1500泰铢",
+                    "photo": "photos/staff.jpg",
+                },
+            ]
+            work, _, _ = self._start_fixture(
+                root,
+                messages=messages,
+                controlled=True,
+            )
+            media_decisions = {
+                "M0001": {
+                    "classification": "fund",
+                    "viewed_original": True,
+                    "entries": [
+                        {"amount": "31", "currency": "USDT", "payee": "TWallet1"}
+                    ],
+                },
+                "M0002": {
+                    "classification": "fund",
+                    "viewed_original": True,
+                    "entries": [
+                        {"amount": "1000", "currency": "THB", "payee": "11xxxx1111"}
+                    ],
+                },
+                "M0003": {
+                    "classification": "fund",
+                    "viewed_original": True,
+                    "entries": [
+                        {"amount": "46", "currency": "USDT", "payee": "TWallet2"}
+                    ],
+                },
+                "M0004": {
+                    "classification": "fund",
+                    "viewed_original": True,
+                    "entries": [
+                        {"amount": "1500", "currency": "THB", "payee": "22xxxx2222"}
+                    ],
+                },
+            }
+            orders = [
+                {
+                    "id": "O001",
+                    "entry_ids": ["M0001.1", "M0002.1"],
+                    "source_messages": ["S00001", "S00002"],
+                    "customer_nickname": "Alice",
+                    "direction": "USDT->THB",
+                    "pricing": {
+                        "source_messages": ["S00001"],
+                        "terms": {"rate": "32.5", "operator": "multiply"},
+                        "expected": {"kind": "explicit", "amount": "1000"},
+                    },
+                },
+                {
+                    "id": "O002",
+                    "entry_ids": ["M0003.1", "M0004.1"],
+                    "source_messages": ["S00003", "S00004"],
+                    "customer_nickname": "Alice",
+                    "direction": "USDT->THB",
+                    "pricing": {
+                        "source_messages": ["S00003"],
+                        "terms": {"rate": "32.6", "operator": "multiply"},
+                        "expected": {"kind": "explicit", "amount": "1500"},
+                    },
+                },
+            ]
+            report = self._apply_controlled_semantics(
+                root,
+                work,
+                batch_id="continuity-independent",
+                media_decisions=media_decisions,
+                orders=orders,
+            )
+
+            self.assertEqual(report["order_continuity_review_candidate_count"], 0)
+            self.assertEqual(report["order_continuity_review_candidates"], [])
+
+    def test_order_continuity_risk_skips_balance_linked_orders(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            work, media_decisions = self._start_order_continuity_fixture(root)
+            report = self._apply_controlled_semantics(
+                root,
+                work,
+                batch_id="continuity-balance-link",
+                media_decisions=media_decisions,
+                orders=self._split_continuation_orders(),
+                balance_links=[
+                    {
+                        "source_order_id": "O011",
+                        "target_order_id": "O012",
+                        "kind": "shortfall_carryover",
+                        "amount": "1",
+                        "currency": "THB",
+                        "source_messages": ["S00003"],
+                        "already_in_expected": False,
+                    }
+                ],
+            )
+
+            self.assertEqual(report["order_continuity_review_candidate_count"], 0)
+            self.assertEqual(report["order_continuity_review_candidates"], [])
+
     def test_review_next_is_read_only_until_page_commit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

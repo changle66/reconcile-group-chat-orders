@@ -1537,6 +1537,68 @@ def _validate_open_orders(
     return len(open_orders)
 
 
+def _order_continuity_review_candidates(
+    facts: list[dict[str, Any]],
+    *,
+    advanced_relation_order_ids: set[str],
+) -> list[dict[str, Any]]:
+    """Return narrow, non-mutating candidates for a possible split continuation."""
+
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for fact in facts:
+        customer_key = core.clean_text(fact.get("customer_key"))
+        direction = core.clean_text(fact.get("direction"))
+        if not customer_key or not direction:
+            continue
+        grouped.setdefault((customer_key, direction), []).append(fact)
+
+    candidates: list[dict[str, Any]] = []
+    for related_orders in grouped.values():
+        related_orders.sort(
+            key=lambda item: (
+                int(item["source_start_position"]),
+                int(item["source_end_position"]),
+                int(item["order_position"]),
+            )
+        )
+        for earlier, later in zip(related_orders, related_orders[1:]):
+            earlier_order_id = str(earlier["order_id"])
+            later_order_id = str(later["order_id"])
+            if (
+                earlier_order_id in advanced_relation_order_ids
+                or later_order_id in advanced_relation_order_ids
+                or earlier["has_complex_flow"]
+                or later["has_complex_flow"]
+            ):
+                continue
+            if not (
+                earlier["has_completed_payment"]
+                and not earlier["has_completed_payout"]
+                and earlier["has_confirmed_pricing"]
+                and later["has_completed_payment"]
+                and later["has_completed_payout"]
+                and later["has_unknown_pricing"]
+            ):
+                continue
+            candidates.append(
+                {
+                    "earlier_order_id": earlier_order_id,
+                    "later_order_id": later_order_id,
+                    "customer_nickname": earlier["customer_nickname"],
+                    "direction": earlier["direction"],
+                    "source_start": f"S{min(int(earlier['source_start_position']), int(later['source_start_position'])):05d}",
+                    "source_end": f"S{max(int(earlier['source_end_position']), int(later['source_end_position'])):05d}",
+                    "reason_codes": [
+                        "earlier_payment_without_payout",
+                        "earlier_confirmed_pricing",
+                        "later_payment_and_payout",
+                        "later_unknown_pricing",
+                    ],
+                }
+            )
+    return candidates
+
+
 def _validate_decision(
     normalized: Mapping[str, Any],
     group: Mapping[str, Any],
@@ -1693,6 +1755,7 @@ def _validate_decision(
     mass_degenerate_orders = 0
     single_unknown_pricing_orders = 0
     order_degradation_signals: list[tuple[bool, bool, bool, bool, str]] = []
+    order_continuity_facts: list[dict[str, Any]] = []
     order_note_counts: dict[str, int] = {}
     order_fields = {
         "id",
@@ -1951,6 +2014,42 @@ def _validate_decision(
                 meaningful_chat_context,
                 f"{field}: completed ordinary order requires meaningful chat context, not fund images alone",
             )
+        source_positions = [
+            int(match.group(1))
+            for label in source_labels
+            if (match := re.fullmatch(r"S(\d+)", label)) is not None
+        ]
+        pricing_value = order.get("pricing")
+        has_confirmed_pricing = (
+            isinstance(pricing_value, Mapping)
+            and isinstance(pricing_value.get("terms"), Mapping)
+            and isinstance(pricing_value.get("expected"), Mapping)
+            and core.clean_text(pricing_value["expected"].get("kind")).casefold()
+            in {"explicit", "calculated_from_terms"}
+        )
+        entry_sides = {
+            core.clean_text(entry_records[entry_id].get("side")).casefold()
+            for entry_id in refs
+        }
+        if source_positions:
+            order_continuity_facts.append(
+                {
+                    "order_id": order_id,
+                    "order_position": position,
+                    "customer_nickname": core.clean_text(order.get("customer_nickname")),
+                    "customer_key": core.clean_text(order.get("customer_nickname")).casefold(),
+                    "direction": core.clean_text(order.get("direction")),
+                    "source_start_position": min(source_positions),
+                    "source_end_position": max(source_positions),
+                    "has_completed_payment": "payment" in completed_ordinary_sides,
+                    "has_completed_payout": "payout" in completed_ordinary_sides,
+                    "has_confirmed_pricing": has_confirmed_pricing,
+                    "has_unknown_pricing": unknown_pricing,
+                    "has_complex_flow": bool(legs)
+                    or bool(same_transactions)
+                    or bool(entry_sides & {"payment_refund", "recovery"}),
+                }
+            )
         if (
             is_single_entry_order
             and blank_direction
@@ -1995,6 +2094,7 @@ def _validate_decision(
         )
     )
 
+    advanced_relation_order_ids: set[str] = set()
     settlement_allocations = decision.get("settlement_allocations", [])
     core.require(
         isinstance(settlement_allocations, list),
@@ -2115,6 +2215,7 @@ def _validate_decision(
             len(target_customer_nicknames) == 1,
             f"{field}.allocations must target orders for the same customer",
         )
+        advanced_relation_order_ids.update(target_order_ids)
         allocated_total = sum(allocated_amounts, start=source_amount * 0)
         core.require(
             allocated_total == source_amount,
@@ -2164,6 +2265,7 @@ def _validate_decision(
         core.require(source_order_id in order_ids, f"{field}.source_order_id is unknown")
         core.require(target_order_id in order_ids, f"{field}.target_order_id is unknown")
         core.require(source_order_id != target_order_id, f"{field} cannot link an order to itself")
+        advanced_relation_order_ids.update({source_order_id, target_order_id})
         kind = core.clean_text(link.get("kind")).casefold()
         core.require(kind in {"shortfall_carryover", "overpayment_carryover"}, f"{field}.kind is unsupported")
         link["kind"] = kind
@@ -2180,6 +2282,11 @@ def _validate_decision(
         source_labels = [str(item) for item in source_messages]
         core.require(len(source_labels) == len(set(source_labels)), f"{field}.source_messages repeats a label")
         core.require(set(source_labels) <= set(message_by_label), f"{field}.source_messages contains an unknown label")
+
+    order_continuity_review_candidates = _order_continuity_review_candidates(
+        order_continuity_facts,
+        advanced_relation_order_ids=advanced_relation_order_ids,
+    )
 
     return {
         "available_media": len(available),
@@ -2213,6 +2320,10 @@ def _validate_decision(
         "multi_signal_degenerate_orders": multi_signal_degenerate_orders,
         "multi_signal_degenerate_order_ratio": multi_signal_degenerate_order_ratio,
         "suspected_bulk_order_creation": suspected_bulk_order_creation,
+        "order_continuity_review_candidate_count": len(
+            order_continuity_review_candidates
+        ),
+        "order_continuity_review_candidates": order_continuity_review_candidates,
         "order_to_fund_entry_ratio": order_count / len(entry_ids) if entry_ids else 0.0,
         "pricing_scopes": pricing_scopes,
         "missing_pricing_scopes": len(missing_pricing_scopes),
@@ -2422,6 +2533,7 @@ RISK_DIAGNOSTIC_FIELDS = (
     "repeated_note_orders",
     "multi_signal_degenerate_orders",
     "suspected_bulk_order_creation",
+    "order_continuity_review_candidate_count",
     "unassigned_entries",
     "unknown_payees",
     "unknown_payee_warning",
@@ -2432,6 +2544,7 @@ RISK_FLAG_FIELDS = (
     "repeated_note_orders",
     "multi_signal_degenerate_orders",
     "suspected_bulk_order_creation",
+    "order_continuity_review_candidate_count",
     "unassigned_entries",
     "unknown_payee_warning",
 )
