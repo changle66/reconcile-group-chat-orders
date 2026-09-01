@@ -64,8 +64,29 @@ def fund_event(
     status_class: str,
     confidence: str = "high",
     payee: str | None = "测试收款方",
+    flow_side: str | None = None,
 ) -> dict[str, object]:
-    return {
+    effective_payee = (
+        "现金" if event_type in {"cash_payment", "cash_payout"} else payee
+    )
+    effective_payee_state = (
+        "cash"
+        if event_type in {"cash_payment", "cash_payout"}
+        else "not_shown"
+        if effective_payee in (None, "", "未显示")
+        else "unreadable"
+        if effective_payee == "无法辨认"
+        else "visible"
+    )
+    effective_side = flow_side or {
+        "payment_screenshot": "payment",
+        "cash_payment": "payment",
+        "payout_screenshot": "payout",
+        "cash_payout": "payout",
+        "payment_refund": "payment_refund",
+        "payout_recovery": "recovery",
+    }.get(event_type)
+    event = {
         "event_id": event_id,
         "group_key": GROUP_KEY,
         "message_id": message_id,
@@ -74,7 +95,8 @@ def fund_event(
         "ocr": {
             "amount": amount,
             "currency": currency,
-            "payee": "现金" if event_type in {"cash_payment", "cash_payout"} else payee,
+            "payee": effective_payee,
+            "payee_state": effective_payee_state,
             "payee_type": "crypto" if currency == "USDT" else "bank",
             "status_text": status_text,
             "status_class": status_class,
@@ -83,9 +105,16 @@ def fund_event(
             "confidence": confidence,
         },
     }
+    if effective_side is not None:
+        event["flow_side"] = effective_side
+    return event
 
 
-def fixture(*, payment_confidence: str = "high", payment_status: str = "completed") -> tuple[dict, list[dict], dict]:
+def base_fixture(
+    *,
+    payment_confidence: str = "high",
+    payment_status: str = "completed",
+) -> tuple[dict, list[dict]]:
     normalized = {
         "timezone": "Asia/Bangkok",
         "source_fingerprint": "sha256:normalized-test",
@@ -145,6 +174,57 @@ def fixture(*, payment_confidence: str = "high", payment_status: str = "complete
             status_class="completed",
         ),
     ]
+    return normalized, events
+
+
+def legacy_simple_fixture(
+    *,
+    payment_confidence: str = "high",
+    payment_status: str = "completed",
+) -> tuple[dict, list[dict], dict]:
+    """Return the one plan 1.0 fixture kept for compatibility coverage."""
+    normalized, events = base_fixture(
+        payment_confidence=payment_confidence,
+        payment_status=payment_status,
+    )
+    return normalized, events, {
+        "contract_version": simple_ledger.LEGACY_SIMPLE_PLAN_CONTRACT,
+        "normalized_source_fingerprint": normalized["source_fingerprint"],
+        "events_fingerprint": "sha256:events-test",
+        "groups": [
+            {
+                "group_key": GROUP_KEY,
+                "orders": [
+                    {
+                        "event_ids": [event["event_id"] for event in events],
+                        "event_sides": {
+                            events[0]["event_id"]: "payment",
+                            events[1]["event_id"]: "payout",
+                        },
+                        "customer_nickname": "梅鮪花黔",
+                        "direction": "USDT->THB",
+                        "rate": "32.5",
+                        "expected_payout": "30000",
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def current_contract_fixture(
+    *,
+    payment_confidence: str = "high",
+    payment_status: str = "completed",
+) -> tuple[dict, list[dict], dict]:
+    normalized, events = base_fixture(
+        payment_confidence=payment_confidence,
+        payment_status=payment_status,
+    )
+    payment_message_id = str(events[0]["message_id"])
+    payout_message_id = str(events[1]["message_id"])
+    context_message_id = str(normalized["groups"][0]["messages"][0]["message_id"])
+    events[1]["ocr"]["payee"] = "206-4-xxx781"
     plan = {
         "contract_version": simple_ledger.SIMPLE_PLAN_CONTRACT,
         "normalized_source_fingerprint": normalized["source_fingerprint"],
@@ -159,17 +239,36 @@ def fixture(*, payment_confidence: str = "high", payment_status: str = "complete
                             events[0]["event_id"]: "payment",
                             events[1]["event_id"]: "payout",
                         },
-                        "customer_id": "user5570170493",
+                        "source_message_ids": [
+                            context_message_id,
+                            payment_message_id,
+                            payout_message_id,
+                        ],
                         "customer_nickname": "梅鮪花黔",
                         "direction": "USDT->THB",
-                        "rate": "32.5",
-                        "expected_payout": "30000",
+                        "pricing": {
+                            "source_message_ids": [context_message_id],
+                            "terms": {"rate": "32.5", "operator": "multiply"},
+                            "expected": {"kind": "explicit", "amount": "30000"},
+                        },
                     }
                 ],
             }
         ],
     }
     return normalized, events, plan
+
+
+def fixture(
+    *,
+    payment_confidence: str = "high",
+    payment_status: str = "completed",
+) -> tuple[dict, list[dict], dict]:
+    """Return the plan 2.0 fixture used by all current business tests."""
+    return current_contract_fixture(
+        payment_confidence=payment_confidence,
+        payment_status=payment_status,
+    )
 
 
 def append_fund(
@@ -208,12 +307,43 @@ def append_fund(
         currency=currency,
         status_text="成功",
         status_class="completed",
+        payee="206-4-xxx781" if currency == "THB" else "测试收款方",
     )
     events.append(event)
     return event
 
 
 class SimpleLedgerTests(unittest.TestCase):
+    def test_v3_formula_applies_only_explicit_rounding(self) -> None:
+        pricing = {
+            "source_message_ids": ["message-1"],
+            "terms": {"rate": "1.005", "operator": "multiply"},
+            "expected": {"kind": "calculated_from_terms"},
+        }
+        exact = simple_ledger._pricing_authority_result(
+            pricing,
+            payment_total=core.parse_decimal("1", field="payment"),
+            payment_currency="CNY",
+            payout_currency="THB",
+            field="order",
+        )
+        self.assertEqual(str(exact["expected"]), "1.005")
+
+        rounded_pricing = deepcopy(pricing)
+        rounded_pricing["terms"]["rounding"] = {
+            "unit": "0.01",
+            "mode": "half_up",
+            "currency": "THB",
+        }
+        rounded = simple_ledger._pricing_authority_result(
+            rounded_pricing,
+            payment_total=core.parse_decimal("1", field="payment"),
+            payment_currency="CNY",
+            payout_currency="THB",
+            field="order",
+        )
+        self.assertEqual(str(rounded["expected"]), "1.01")
+
     def test_event_loader_requires_and_normalizes_payee(self) -> None:
         normalized, events, _ = fixture()
         with tempfile.TemporaryDirectory(prefix="simple-events-payee-") as temporary:
@@ -237,6 +367,7 @@ class SimpleLedgerTests(unittest.TestCase):
 
             events[0]["type"] = "cash_payment"
             events[0]["ocr"]["payee"] = None
+            events[0]["ocr"]["payee_state"] = "cash"
             event_path.write_text(
                 "\n".join(json.dumps(event, ensure_ascii=False) for event in events) + "\n",
                 encoding="utf-8",
@@ -245,8 +376,7 @@ class SimpleLedgerTests(unittest.TestCase):
             self.assertEqual(loaded[0]["ocr"]["payee"], "现金")
 
     def test_legacy_simple_plan_contract_remains_supported(self) -> None:
-        normalized, events, plan = fixture()
-        plan["contract_version"] = simple_ledger.LEGACY_SIMPLE_PLAN_CONTRACT
+        normalized, events, plan = legacy_simple_fixture()
 
         orders, _ = simple_ledger.compile_simple_ledger(
             normalized,
@@ -269,7 +399,7 @@ class SimpleLedgerTests(unittest.TestCase):
 
         order = orders["groups"][0]["orders"][0]
         self.assertEqual(order["order_id"], "20260808-001")
-        self.assertEqual(order["customer_id"], "user5570170493")
+        self.assertNotIn("customer_id", order)
         self.assertEqual(order["direction"], "USDT->THB")
         self.assertEqual(order["payment_total"], "923")
         self.assertEqual(order["actual_payout_total"], "30000")
@@ -284,6 +414,9 @@ class SimpleLedgerTests(unittest.TestCase):
 
     def test_uncertain_side_is_unknown_not_zero_and_never_becomes_overpayment(self) -> None:
         normalized, events, plan = fixture(payment_confidence="low")
+        plan["groups"][0]["orders"][0]["pricing"]["expected"] = {
+            "kind": "calculated_from_terms"
+        }
 
         orders, _ = simple_ledger.compile_simple_ledger(
             normalized,
@@ -321,23 +454,22 @@ class SimpleLedgerTests(unittest.TestCase):
         self.assertEqual(order["review_result"], "待确认")
         self.assertNotIn("失败", order["anomaly_note"])
 
-    def test_model_declared_status_is_authoritative_over_status_text(self) -> None:
+    def test_explicit_failure_text_cannot_be_overridden_as_completed(self) -> None:
         normalized, events, plan = fixture()
         events[0]["ocr"]["status_text"] = "失败"
         events[0]["ocr"]["status_class"] = "completed"
         events[0]["ocr"]["status_class_confidence"] = "high"
 
-        orders, _ = simple_ledger.compile_simple_ledger(
-            normalized,
-            events,
-            "sha256:events-test",
-            plan,
-        )
-
-        order = orders["groups"][0]["orders"][0]
-        self.assertEqual(order["flows"][0]["status"], "completed")
-        self.assertTrue(order["flows"][0]["included"])
-        self.assertEqual(order["payment_total"], "923")
+        with self.assertRaisesRegex(
+            ValueError,
+            "explicit failure status must use status_class=failed",
+        ):
+            simple_ledger.compile_simple_ledger(
+                normalized,
+                events,
+                "sha256:events-test",
+                plan,
+            )
 
     def test_model_unknown_status_is_not_counted_even_when_amount_is_clear(self) -> None:
         normalized, events, plan = fixture(payment_status="unknown")
@@ -402,6 +534,7 @@ class SimpleLedgerTests(unittest.TestCase):
         raw_order = plan["groups"][0]["orders"][0]
         raw_order["event_ids"].insert(1, duplicate_event["event_id"])
         raw_order["event_sides"][duplicate_event["event_id"]] = "payment"
+        raw_order["source_message_ids"].append(duplicate_event["message_id"])
 
         orders, statistics = simple_ledger.compile_simple_ledger(
             normalized,
@@ -431,7 +564,7 @@ class SimpleLedgerTests(unittest.TestCase):
                 plan,
             )
 
-    def test_current_contract_rejects_missing_explicit_event_side(self) -> None:
+    def test_current_plan_requires_explicit_event_side(self) -> None:
         normalized, events, plan = fixture()
         plan["groups"][0]["orders"][0].pop("event_sides")
 
@@ -454,8 +587,13 @@ class SimpleLedgerTests(unittest.TestCase):
             events[0]["event_id"]: "payment",
             events[1]["event_id"]: "payout",
         }
-        raw_order["customer_id"] = "user5570170493"
         raw_order["customer_nickname"] = "梅鮪花黔"
+        context_message_id = raw_order["source_message_ids"][0]
+        events[0]["side_exception"] = {
+            "kind": "relayed_customer_payment",
+            "source_message_ids": [context_message_id],
+            "detail": "内部人员代客户转发付款凭证",
+        }
 
         orders, _ = simple_ledger.compile_simple_ledger(
             normalized,
@@ -469,6 +607,114 @@ class SimpleLedgerTests(unittest.TestCase):
         self.assertNotIn("sender_role", order["flows"][0])
         self.assertEqual(order["payment_total"], "923")
         self.assertEqual(order["order_status"], "completed")
+
+    def test_current_contract_rejects_internal_sender_payment_without_side_exception(self) -> None:
+        normalized, events, plan = current_contract_fixture()
+        payment_message = normalized["groups"][0]["messages"][1]
+        payment_message["sender_id"] = "user6372534512"
+        payment_message["sender_name"] = "QQ～财务4"
+        payment_message["role"] = "内部人员"
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "internal sender.*ordinary fund event.*side=payout",
+        ):
+            simple_ledger.compile_simple_ledger(
+                normalized,
+                events,
+                "sha256:events-test",
+                plan,
+            )
+
+    def test_current_contract_order_side_must_match_validated_event_side(self) -> None:
+        normalized, events, plan = current_contract_fixture()
+        raw_order = plan["groups"][0]["orders"][0]
+        raw_order["event_sides"][events[0]["event_id"]] = "payout"
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "event_sides.*must match event.flow_side",
+        ):
+            simple_ledger.compile_simple_ledger(
+                normalized,
+                events,
+                "sha256:events-test",
+                plan,
+            )
+
+    def test_current_contract_side_exception_basis_must_belong_to_order(self) -> None:
+        normalized, events, plan = current_contract_fixture()
+        payment_message = normalized["groups"][0]["messages"][1]
+        payment_message["sender_id"] = "user6372534512"
+        payment_message["sender_name"] = "QQ～财务4"
+        payment_message["role"] = "内部人员"
+        context_message_id = str(normalized["groups"][0]["messages"][0]["message_id"])
+        events[0]["side_exception"] = {
+            "kind": "relayed_customer_payment",
+            "source_message_ids": [context_message_id],
+            "detail": "内部人员代客户转发付款凭证",
+        }
+        raw_order = plan["groups"][0]["orders"][0]
+        raw_order["source_message_ids"].remove(context_message_id)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "side_exception.source_message_ids must belong to simple order",
+        ):
+            simple_ledger.compile_simple_ledger(
+                normalized,
+                events,
+                "sha256:events-test",
+                plan,
+            )
+
+    def test_current_contract_rejects_pending_for_normal_processing_status(self) -> None:
+        for status_text in ("待区块确认", "Pending", "Processing", "Confirming", "Unconfirmed"):
+            with self.subTest(status_text=status_text):
+                normalized, events, plan = current_contract_fixture()
+                events[0]["ocr"]["status_text"] = status_text
+                events[0]["ocr"]["status_class"] = "pending"
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "normal processing status.*status_class=completed",
+                ):
+                    simple_ledger.compile_simple_ledger(
+                        normalized,
+                        events,
+                        "sha256:events-test",
+                        plan,
+                    )
+
+    def test_current_contract_counts_normal_processing_status_as_completed(self) -> None:
+        normalized, events, plan = current_contract_fixture()
+        events[0]["ocr"]["status_text"] = "确认中"
+        events[0]["ocr"]["status_class"] = "completed"
+
+        orders, _ = simple_ledger.compile_simple_ledger(
+            normalized,
+            events,
+            "sha256:events-test",
+            plan,
+        )
+        order = orders["groups"][0]["orders"][0]
+        self.assertEqual(order["payment_total"], "923")
+        self.assertTrue(order["flows"][0]["included"])
+
+    def test_current_contract_does_not_count_explicit_failed_fund_attempt(self) -> None:
+        normalized, events, plan = current_contract_fixture()
+        events[0]["ocr"]["status_text"] = "交易失败"
+        events[0]["ocr"]["status_class"] = "failed"
+
+        orders, _ = simple_ledger.compile_simple_ledger(
+            normalized,
+            events,
+            "sha256:events-test",
+            plan,
+        )
+        order = orders["groups"][0]["orders"][0]
+        self.assertIsNone(order["payment_total"])
+        self.assertFalse(order["flows"][0]["included"])
 
     def test_different_screenshots_of_same_transaction_are_counted_once(self) -> None:
         normalized, events, plan = fixture()
@@ -488,6 +734,7 @@ class SimpleLedgerTests(unittest.TestCase):
         raw_order = plan["groups"][0]["orders"][0]
         raw_order["event_ids"].insert(1, duplicate["event_id"])
         raw_order["event_sides"][duplicate["event_id"]] = "payment"
+        raw_order["source_message_ids"].append(duplicate["message_id"])
         raw_order["same_transactions"] = [
             {"event_id": duplicate["event_id"], "same_as": events[0]["event_id"]}
         ]
@@ -516,6 +763,7 @@ class SimpleLedgerTests(unittest.TestCase):
         normalized, events, plan = fixture()
         summary = events[0]
         summary["ocr"]["payee"] = "未显示"
+        summary["ocr"]["payee_state"] = "not_shown"
         detail = append_fund(
             normalized,
             events,
@@ -530,9 +778,11 @@ class SimpleLedgerTests(unittest.TestCase):
             blob_sha256="sha256:detail-page",
         )
         detail["ocr"]["payee"] = "TZ7nsfaXoJCsNytYFcT5yEZLXMAH87QKUg"
+        detail["ocr"]["payee_state"] = "visible"
         raw_order = plan["groups"][0]["orders"][0]
         raw_order["event_ids"].insert(1, detail["event_id"])
         raw_order["event_sides"][detail["event_id"]] = "payment"
+        raw_order["source_message_ids"].append(detail["message_id"])
         raw_order["same_transactions"] = [
             {"event_id": summary["event_id"], "same_as": detail["event_id"]}
         ]
@@ -561,6 +811,10 @@ class SimpleLedgerTests(unittest.TestCase):
             with self.subTest(payee=payee):
                 normalized, events, plan = fixture()
                 events[0]["ocr"]["payee"] = payee
+                events[0]["ocr"]["payee_state"] = {
+                    "未显示": "not_shown",
+                    "无法辨认": "unreadable",
+                }[payee]
 
                 orders, statistics = simple_ledger.compile_simple_ledger(
                     normalized,
@@ -601,6 +855,7 @@ class SimpleLedgerTests(unittest.TestCase):
         )
         self.assertEqual(core.HEADERS[-2], "收款方")
         self.assertEqual(core.HEADERS[-1], "聊天消息时间")
+        self.assertNotIn("客户标识", core.HEADERS)
         self.assertEqual(len(payment_row), len(core.HEADERS))
         self.assertEqual(payment_row[core.HEADERS.index("收款方")], "某收款人")
 
@@ -647,6 +902,7 @@ class SimpleLedgerTests(unittest.TestCase):
         normalized, events, plan = fixture()
         events[0]["type"] = "cash_payment"
         events[0]["ocr"]["payee"] = None
+        events[0]["ocr"]["payee_state"] = "cash"
 
         orders, _ = simple_ledger.compile_simple_ledger(
             normalized,
@@ -665,7 +921,11 @@ class SimpleLedgerTests(unittest.TestCase):
         payout["ocr"]["amount"] = "100000"
         payout["ocr"]["amount_text"] = "100,000"
         payout["ocr"]["payee"] = None
-        plan["groups"][0]["orders"][0]["expected_payout"] = "100000"
+        payout["ocr"]["payee_state"] = "cash"
+        plan["groups"][0]["orders"][0]["pricing"]["expected"] = {
+            "kind": "explicit",
+            "amount": "100000",
+        }
 
         orders, _ = simple_ledger.compile_simple_ledger(
             normalized,
@@ -689,9 +949,11 @@ class SimpleLedgerTests(unittest.TestCase):
         events[1]["ocr"]["currency"] = "USDT"
         raw_order = plan["groups"][0]["orders"][0]
         raw_order["direction"] = "CNY->USDT"
-        raw_order["rate"] = "5"
-        raw_order["rate_operator"] = "divide"
-        raw_order.pop("expected_payout")
+        raw_order["pricing"] = {
+            "source_message_ids": raw_order["pricing"]["source_message_ids"],
+            "terms": {"rate": "5", "operator": "divide"},
+            "expected": {"kind": "calculated_from_terms"},
+        }
 
         orders, _ = simple_ledger.compile_simple_ledger(
             normalized,
@@ -710,9 +972,7 @@ class SimpleLedgerTests(unittest.TestCase):
         events[0]["ocr"]["amount"] = "102"
         events[1]["ocr"]["amount"] = "3245"
         raw_order = plan["groups"][0]["orders"][0]
-        raw_order["rate"] = "32.5"
-        raw_order.pop("expected_payout")
-        raw_order["fees"] = [
+        fees = [
             {
                 "kind": "delivery_fee",
                 "amount": "2",
@@ -733,7 +993,16 @@ class SimpleLedgerTests(unittest.TestCase):
                 "customer_requested": True,
             },
         ]
-        raw_order["rounding"] = {"unit": "5", "mode": "down", "currency": "THB"}
+        raw_order["pricing"] = {
+            "source_message_ids": raw_order["pricing"]["source_message_ids"],
+            "terms": {
+                "rate": "32.5",
+                "operator": "multiply",
+                "fees": fees,
+                "rounding": {"unit": "5", "mode": "down", "currency": "THB"},
+            },
+            "expected": {"kind": "calculated_from_terms"},
+        }
 
         orders, _ = simple_ledger.compile_simple_ledger(
             normalized,
@@ -768,16 +1037,22 @@ class SimpleLedgerTests(unittest.TestCase):
         events[0]["ocr"]["amount"] = "3102"
         events[1]["ocr"]["amount"] = "100000"
         raw_order = plan["groups"][0]["orders"][0]
-        raw_order["rate"] = "32.4"
-        raw_order["expected_payout"] = "100000"
-        raw_order["fees"] = [
-            {
-                "kind": "delivery_fee",
-                "amount": "500",
-                "currency": "THB",
-                "treatment": "deducted_from_payout",
-            }
-        ]
+        raw_order["pricing"] = {
+            "source_message_ids": raw_order["pricing"]["source_message_ids"],
+            "terms": {
+                "rate": "32.4",
+                "operator": "multiply",
+                "fees": [
+                    {
+                        "kind": "delivery_fee",
+                        "amount": "500",
+                        "currency": "THB",
+                        "treatment": "deducted_from_payout",
+                    }
+                ],
+            },
+            "expected": {"kind": "explicit", "amount": "100000"},
+        }
 
         orders, _ = simple_ledger.compile_simple_ledger(
             normalized,
@@ -801,16 +1076,22 @@ class SimpleLedgerTests(unittest.TestCase):
         events[0]["ocr"]["amount"] = "100"
         events[1]["ocr"]["amount"] = "3250"
         raw_order = plan["groups"][0]["orders"][0]
-        raw_order["rate"] = "32.5"
-        raw_order.pop("expected_payout")
-        raw_order["fees"] = [
-            {
-                "kind": "network_fee",
-                "amount": "1",
-                "currency": "THB",
-                "treatment": "deducted_from_payout",
-            }
-        ]
+        raw_order["pricing"] = {
+            "source_message_ids": raw_order["pricing"]["source_message_ids"],
+            "terms": {
+                "rate": "32.5",
+                "operator": "multiply",
+                "fees": [
+                    {
+                        "kind": "network_fee",
+                        "amount": "1",
+                        "currency": "THB",
+                        "treatment": "deducted_from_payout",
+                    }
+                ],
+            },
+            "expected": {"kind": "calculated_from_terms"},
+        }
 
         orders, _ = simple_ledger.compile_simple_ledger(
             normalized,
@@ -828,7 +1109,7 @@ class SimpleLedgerTests(unittest.TestCase):
     def test_customer_requested_network_fee_must_be_deducted(self) -> None:
         normalized, events, plan = fixture()
         raw_order = plan["groups"][0]["orders"][0]
-        raw_order["fees"] = [
+        raw_order["pricing"]["terms"]["fees"] = [
             {
                 "kind": "network_fee",
                 "amount": "1",
@@ -864,9 +1145,12 @@ class SimpleLedgerTests(unittest.TestCase):
         raw_order = plan["groups"][0]["orders"][0]
         raw_order["event_ids"].insert(1, second_payment["event_id"])
         raw_order["event_sides"][second_payment["event_id"]] = "payment"
-        raw_order["customer_id"] = ""
+        raw_order["source_message_ids"].append(second_payment["message_id"])
         raw_order["customer_nickname"] = ""
-        raw_order["expected_payout"] = "32500"
+        raw_order["pricing"]["expected"] = {
+            "kind": "explicit",
+            "amount": "32500",
+        }
 
         orders, _ = simple_ledger.compile_simple_ledger(
             normalized,
@@ -877,7 +1161,7 @@ class SimpleLedgerTests(unittest.TestCase):
 
         order = orders["groups"][0]["orders"][0]
         self.assertEqual(order["payment_total"], "1000")
-        self.assertEqual(order["customer_id"], "")
+        self.assertNotIn("customer_id", order)
         self.assertEqual(order["review_result"], "待确认")
         self.assertEqual(order["order_status"], "pending_identity")
         self.assertIn("客户无法唯一确认", order["anomaly_note"])
@@ -917,22 +1201,33 @@ class SimpleLedgerTests(unittest.TestCase):
         raw_order = plan["groups"][0]["orders"][0]
         raw_order["event_ids"].append(second_payout["event_id"])
         raw_order["event_sides"][second_payout["event_id"]] = "payout"
-        raw_order.pop("rate")
-        raw_order.pop("expected_payout")
+        raw_order["source_message_ids"].append(second_payout["message_id"])
+        pricing_source_ids = raw_order["pricing"]["source_message_ids"]
+        raw_order.pop("pricing")
         raw_order["legs"] = [
             {
                 "leg_id": "thb",
                 "direction": "USDT->THB",
                 "allocation_amount": "600",
-                "rate": "32.5",
+                "pricing": {
+                    "source_message_ids": pricing_source_ids,
+                    "terms": {"rate": "32.5", "operator": "multiply"},
+                    "expected": {"kind": "calculated_from_terms"},
+                },
                 "payout_event_ids": [events[1]["event_id"]],
+                "recovery_event_ids": [],
             },
             {
                 "leg_id": "cny",
                 "direction": "USDT->CNY",
                 "allocation_amount": "400",
-                "rate": "5",
+                "pricing": {
+                    "source_message_ids": pricing_source_ids,
+                    "terms": {"rate": "5", "operator": "multiply"},
+                    "expected": {"kind": "calculated_from_terms"},
+                },
                 "payout_event_ids": [second_payout["event_id"]],
+                "recovery_event_ids": [],
             },
         ]
 
@@ -960,6 +1255,166 @@ class SimpleLedgerTests(unittest.TestCase):
             ["客户付款", "内部回款", "内部回款"],
         )
 
+    def test_bern_style_split_labels_only_conflicted_crypto_legs_pending(self) -> None:
+        normalized, events, plan = current_contract_fixture()
+        events[0]["ocr"]["amount"] = "6000"
+        events[1]["ocr"]["amount"] = "32000"
+        cash_payout = append_fund(
+            normalized,
+            events,
+            sequence=65741,
+            sender_id="user6372534512",
+            sender_name="QQ～财务4",
+            role="内部人员",
+            timestamp="2026-08-24T15:48:31+07:00",
+            event_type="cash_payout",
+            amount="158860",
+            currency="THB",
+        )
+        trx_initial = append_fund(
+            normalized,
+            events,
+            sequence=65742,
+            sender_id="user6372534512",
+            sender_name="QQ～财务4",
+            role="内部人员",
+            timestamp="2026-08-24T15:37:15+07:00",
+            event_type="payout_screenshot",
+            amount="7.75",
+            currency="TRX",
+        )
+        trx_followup = append_fund(
+            normalized,
+            events,
+            sequence=65743,
+            sender_id="user6372534512",
+            sender_name="QQ～财务4",
+            role="内部人员",
+            timestamp="2026-08-24T17:41:43+07:00",
+            event_type="payout_screenshot",
+            amount="44",
+            currency="TRX",
+        )
+        for event in (cash_payout, trx_initial, trx_followup):
+            event["flow_side"] = "payout"
+            event["ocr"]["payee_state"] = (
+                "cash" if event["type"] == "cash_payout" else "visible"
+            )
+
+        raw_order = plan["groups"][0]["orders"][0]
+        new_events = [cash_payout, trx_initial, trx_followup]
+        raw_order["event_ids"].extend(event["event_id"] for event in new_events)
+        raw_order["event_sides"].update(
+            {event["event_id"]: "payout" for event in new_events}
+        )
+        raw_order["source_message_ids"].extend(
+            event["message_id"] for event in new_events
+        )
+        context_message_id = raw_order["source_message_ids"][0]
+        raw_order["direction"] = ""
+        raw_order.pop("pricing")
+        raw_order["note"] = (
+            "20 USDT 的 TRX 部分同时出现预期49、声称到账30和凭证44，"
+            "没有最终数值确认。"
+        )
+        raw_order["legs"] = [
+            {
+                "leg_id": "thb_transfer",
+                "display_label": "USDT->THB（转账）",
+                "direction": "USDT->THB",
+                "allocation_amount": "1000",
+                "pricing": {
+                    "source_message_ids": [context_message_id],
+                    "terms": {"rate": "32", "operator": "multiply"},
+                    "expected": {"kind": "explicit", "amount": "32000"},
+                },
+                "payout_event_ids": [events[1]["event_id"]],
+                "recovery_event_ids": [],
+            },
+            {
+                "leg_id": "thb_cash",
+                "display_label": "USDT->THB（现金）",
+                "direction": "USDT->THB",
+                "allocation_amount": "4980",
+                "pricing": {
+                    "source_message_ids": [context_message_id],
+                    "terms": {"rate": "31.9", "operator": "multiply"},
+                    "expected": {"kind": "explicit", "amount": "158860"},
+                },
+                "payout_event_ids": [cash_payout["event_id"]],
+                "recovery_event_ids": [],
+            },
+            {
+                "leg_id": "trx_initial",
+                "display_label": "USDT->TRX（首段3U）",
+                "direction": "USDT->TRX",
+                "allocation_amount": "3",
+                "pricing": {
+                    "source_message_ids": [context_message_id],
+                    "expected": {"kind": "unknown", "reason": "not_stated"},
+                },
+                "payout_event_ids": [trx_initial["event_id"]],
+                "recovery_event_ids": [],
+            },
+            {
+                "leg_id": "trx_followup",
+                "display_label": "USDT->TRX（后段17U）",
+                "direction": "USDT->TRX",
+                "allocation_amount": "17",
+                "pricing": {
+                    "source_message_ids": [context_message_id],
+                    "expected": {
+                        "kind": "unknown",
+                        "reason": "conflicting_authority",
+                    },
+                },
+                "payout_event_ids": [trx_followup["event_id"]],
+                "recovery_event_ids": [],
+            },
+        ]
+
+        orders, statistics = simple_ledger.compile_simple_ledger(
+            normalized,
+            events,
+            "sha256:events-test",
+            plan,
+        )
+
+        order = orders["groups"][0]["orders"][0]
+        self.assertEqual(
+            order["direction"],
+            "USDT->THB（转账）\nUSDT->THB（现金）\nUSDT->TRX（首段3U）\nUSDT->TRX（后段17U）",
+        )
+        self.assertEqual(
+            order["actual_rate_display"],
+            "USDT->THB（转账）：32\nUSDT->THB（现金）：31.9\n"
+            "USDT->TRX（首段3U）：待确认\nUSDT->TRX（后段17U）：待确认",
+        )
+        self.assertEqual(
+            order["review_result"],
+            "USDT->TRX（首段3U）：待确认\nUSDT->TRX（后段17U）：待确认",
+        )
+        self.assertEqual(order["order_status"], "pending_pricing")
+        self.assertEqual(statistics["pending_orders"], 1)
+        rows = build_workbook.order_rows(order)
+        summary = rows[0]
+        self.assertEqual(summary[core.HEADERS.index("备注")], raw_order["note"])
+        self.assertNotIn("群聊中的最终金额", summary[core.HEADERS.index("备注")])
+        payout_directions = [
+            row[core.HEADERS.index("换汇方向")]
+            for row in rows
+            if row[0] == "内部回款"
+        ]
+        self.assertEqual(
+            payout_directions,
+            [
+                "USDT->THB（转账）",
+                "USDT->TRX（首段3U）",
+                "USDT->THB（现金）",
+                "USDT->TRX（后段17U）",
+            ],
+        )
+
     def test_order_row_note_uses_only_model_note(self) -> None:
         self.assertEqual(
             build_workbook.order_row_note(
@@ -970,6 +1425,18 @@ class SimpleLedgerTests(unittest.TestCase):
         self.assertEqual(
             build_workbook.order_row_note({"note": "", "anomaly_note": "实际异常"}),
             None,
+        )
+        self.assertEqual(
+            build_workbook.order_row_note(
+                {
+                    "note": "具体冲突只写一次",
+                    "reconciliation": {
+                        "status": "pending",
+                        "detail": "脚本通用待确认说明",
+                    },
+                }
+            ),
+            "具体冲突只写一次",
         )
 
     def test_payment_refund_and_payout_recovery_use_net_amounts(self) -> None:
@@ -1001,6 +1468,19 @@ class SimpleLedgerTests(unittest.TestCase):
             currency="THB",
         )
         raw_order = plan["groups"][0]["orders"][0]
+        context_message_id = raw_order["source_message_ids"][0]
+        refund["flow_side"] = "payment_refund"
+        refund["side_exception"] = {
+            "kind": "explicit_payment_refund",
+            "source_message_ids": [context_message_id],
+            "detail": "聊天明确该笔为付款退款",
+        }
+        recovery["flow_side"] = "recovery"
+        recovery["side_exception"] = {
+            "kind": "explicit_recovery",
+            "source_message_ids": [context_message_id],
+            "detail": "聊天明确该笔为回款追回",
+        }
         raw_order["event_ids"] = [event["event_id"] for event in events]
         raw_order["event_sides"] = {
             events[0]["event_id"]: "payment",
@@ -1008,8 +1488,14 @@ class SimpleLedgerTests(unittest.TestCase):
             refund["event_id"]: "payment_refund",
             recovery["event_id"]: "recovery",
         }
-        raw_order["rate"] = "32.5"
-        raw_order.pop("expected_payout")
+        raw_order["source_message_ids"].extend(
+            [refund["message_id"], recovery["message_id"]]
+        )
+        raw_order["pricing"] = {
+            "source_message_ids": [context_message_id],
+            "terms": {"rate": "32.5", "operator": "multiply"},
+            "expected": {"kind": "calculated_from_terms"},
+        }
 
         orders, _ = simple_ledger.compile_simple_ledger(
             normalized,
@@ -1064,10 +1550,17 @@ class SimpleLedgerTests(unittest.TestCase):
                             first_payment["event_id"]: "payment",
                             first_payout["event_id"]: "payout",
                         },
-                        "customer_id": "customer-1",
+                        "source_message_ids": [
+                            first_payment["message_id"],
+                            first_payout["message_id"],
+                        ],
                         "customer_nickname": "客户甲",
                         "direction": "USDT->THB",
-                        "rate": "32.5",
+                        "pricing": {
+                            "source_message_ids": [first_payment["message_id"]],
+                            "terms": {"rate": "32.5", "operator": "multiply"},
+                            "expected": {"kind": "calculated_from_terms"},
+                        },
                     },
                     {
                         "case_id": "second",
@@ -1076,10 +1569,17 @@ class SimpleLedgerTests(unittest.TestCase):
                             second_payment["event_id"]: "payment",
                             second_payout["event_id"]: "payout",
                         },
-                        "customer_id": "customer-1",
+                        "source_message_ids": [
+                            second_payment["message_id"],
+                            second_payout["message_id"],
+                        ],
                         "customer_nickname": "客户甲",
                         "direction": "USDT->THB",
-                        "rate": "32.5",
+                        "pricing": {
+                            "source_message_ids": [second_payment["message_id"]],
+                            "terms": {"rate": "32.5", "operator": "multiply"},
+                            "expected": {"kind": "calculated_from_terms"},
+                        },
                     },
                 ]
                 plan["groups"][0]["balance_links"] = [
@@ -1089,6 +1589,10 @@ class SimpleLedgerTests(unittest.TestCase):
                         "kind": kind,
                         "amount": "50",
                         "currency": "THB",
+                        "source_message_ids": [
+                            first_payment["message_id"],
+                            second_payment["message_id"],
+                        ],
                     }
                 ]
 
@@ -1131,9 +1635,23 @@ class SimpleLedgerTests(unittest.TestCase):
             plan,
         )
         short_order = deepcopy(orders["groups"][0]["orders"][0])
+        short_order["reconciliation"] = {
+            "status": "short",
+            "difference": "-10",
+            "currency": "THB",
+            "reason": None,
+            "detail": None,
+        }
         short_order["review_result"] = "少转 10 THB"
         over_order = deepcopy(short_order)
         over_order["order_id"] = "20260808-002"
+        over_order["reconciliation"] = {
+            "status": "over",
+            "difference": "20",
+            "currency": "THB",
+            "reason": None,
+            "detail": None,
+        }
         over_order["review_result"] = "多转 20 THB"
         orders["groups"][0]["orders"] = [short_order, over_order]
 
@@ -1210,7 +1728,8 @@ class SimpleLedgerTests(unittest.TestCase):
 
     def test_simple_output_builds_and_checks_workbook(self) -> None:
         normalized, events, plan = fixture()
-        plan["groups"][0]["orders"][0]["fees"] = [
+        pricing_terms = plan["groups"][0]["orders"][0]["pricing"]["terms"]
+        pricing_terms["fees"] = [
             {
                 "kind": "service_fee",
                 "amount": "10",
@@ -1218,7 +1737,7 @@ class SimpleLedgerTests(unittest.TestCase):
                 "treatment": "included_in_quote",
             }
         ]
-        plan["groups"][0]["orders"][0]["rounding"] = {
+        pricing_terms["rounding"] = {
             "unit": "1",
             "mode": "half_up",
             "currency": "THB",
@@ -1254,7 +1773,7 @@ class SimpleLedgerTests(unittest.TestCase):
                 worksheet = workbook.worksheets[0]
                 headers = [worksheet.cell(1, column).value for column in range(1, len(core.HEADERS) + 1)]
                 self.assertEqual(headers, core.HEADERS)
-                self.assertEqual(len(headers), 15)
+                self.assertEqual(len(headers), len(core.HEADERS))
                 self.assertNotIn("客户付款币种", headers)
                 self.assertNotIn("内部回款币种", headers)
                 self.assertIn("付款合计", headers)

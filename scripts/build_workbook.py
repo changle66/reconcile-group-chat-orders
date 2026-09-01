@@ -18,6 +18,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 import core
+import simple_ledger
 
 
 ILLEGAL_SHEET = re.compile(r"[\\/*?:\[\]]")
@@ -44,6 +45,47 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _validate_reconciliation(value: object, *, field: str) -> bool:
+    core.require(isinstance(value, Mapping), f"{field} must be an object")
+    status = core.clean_text(value.get("status")).casefold()
+    core.require(
+        status in {"matched", "short", "over", "pending", "composite"},
+        f"{field}.status is unsupported",
+    )
+    if status == "pending":
+        core.require(bool(core.clean_text(value.get("reason"))), f"{field}.reason is required")
+        core.require(bool(core.clean_text(value.get("detail"))), f"{field}.detail is required")
+        return True
+    if status == "composite":
+        items = value.get("items")
+        core.require(isinstance(items, list) and items, f"{field}.items is required")
+        pending = False
+        for index, item in enumerate(items):
+            item_field = f"{field}.items[{index}]"
+            core.require(isinstance(item, Mapping), f"{item_field} must be an object")
+            core.require(bool(core.clean_text(item.get("label"))), f"{item_field}.label is required")
+            pending = _validate_reconciliation(
+                item.get("reconciliation"),
+                field=f"{item_field}.reconciliation",
+            ) or pending
+        return pending
+
+    difference = core.parse_decimal(value.get("difference"), field=f"{field}.difference")
+    core.require(difference is not None, f"{field}.difference is required")
+    currency = core.normalize_currency(value.get("currency"), field=f"{field}.currency")
+    assert currency is not None
+    if status == "matched":
+        core.require(
+            abs(difference) <= core.currency_tolerance(currency),
+            f"{field}.difference does not match status matched",
+        )
+    elif status == "short":
+        core.require(difference < 0, f"{field}.difference must be negative for short")
+    else:
+        core.require(difference > 0, f"{field}.difference must be positive for over")
+    return False
+
+
 def validate_orders(data: object) -> list[dict[str, Any]]:
     core.require(isinstance(data, dict), "orders top level must be an object")
     core.require(
@@ -68,6 +110,21 @@ def validate_orders(data: object) -> list[dict[str, Any]]:
                 isinstance(order, Mapping),
                 f"groups[{group_index}].orders[{order_index}] must be an object",
             )
+            order_field = f"groups[{group_index}].orders[{order_index}]"
+            pending = _validate_reconciliation(
+                order.get("reconciliation"),
+                field=f"{order_field}.reconciliation",
+            )
+            core.require(
+                order.get("review_result")
+                == simple_ledger.format_reconciliation(order.get("reconciliation")),
+                f"{order_field}.review_result does not match reconciliation",
+            )
+            if pending:
+                core.require(
+                    bool(order_row_note(order)),
+                    f"{order_field}: pending reconciliation must produce a workbook note",
+                )
             flows = order.get("flows")
             core.require(
                 isinstance(flows, list),
@@ -79,14 +136,26 @@ def validate_orders(data: object) -> list[dict[str, Any]]:
                     f"groups[{group_index}].orders[{order_index}].flows[{flow_index}] "
                     "must be an object",
                 )
-                core.validate_payee(
-                    flow.get("payee"),
-                    field=(
-                        f"groups[{group_index}].orders[{order_index}].flows[{flow_index}].payee"
-                    ),
-                    cash=flow.get("cash") is True,
-                    payee_state=flow.get("payee_state"),
+                payee_field = (
+                    f"groups[{group_index}].orders[{order_index}].flows[{flow_index}].payee"
                 )
+                if (
+                    data.get("payee_policy") == "thai_bank_account_only"
+                    and flow.get("cash") is not True
+                    and flow.get("currency") == "THB"
+                ):
+                    core.validate_thai_bank_account_payee(
+                        flow.get("payee"),
+                        field=payee_field,
+                        payee_state=flow.get("payee_state"),
+                    )
+                else:
+                    core.validate_payee(
+                        flow.get("payee"),
+                        field=payee_field,
+                        cash=flow.get("cash") is True,
+                        payee_state=flow.get("payee_state"),
+                    )
     return groups
 
 
@@ -142,7 +211,12 @@ def rate_cell(value: Mapping[str, Any]) -> int | float | str | None:
         display_text = str(display)
         if "\n" in display_text or "：" in display_text or display_text.startswith("÷"):
             return display_text
-    return excel_number(value.get("actual_rate"))
+    rate = excel_number(value.get("actual_rate"))
+    if rate is not None:
+        return rate
+    if value.get("pricing_basis") == "unknown":
+        return "待确认"
+    return None
 
 
 def flow_row_label(flow: Mapping[str, Any]) -> str | None:
@@ -168,7 +242,31 @@ def flow_row_note(flow: Mapping[str, Any]) -> str | None:
 
 
 def order_row_note(order: Mapping[str, Any]) -> str | None:
-    return core.clean_text(order.get("note")) or None
+    notes: list[str] = []
+    manual = core.clean_text(order.get("note"))
+    if manual:
+        return manual
+
+    def collect(value: object, label: str | None = None) -> None:
+        if not isinstance(value, Mapping):
+            return
+        status = core.clean_text(value.get("status")).casefold()
+        if status == "pending":
+            detail = core.clean_text(value.get("detail"))
+            if detail:
+                notes.append(f"{label}：{detail}" if label else detail)
+            return
+        if status != "composite":
+            return
+        for item in value.get("items", []):
+            if isinstance(item, Mapping):
+                collect(
+                    item.get("reconciliation"),
+                    core.clean_text(item.get("label")) or None,
+                )
+
+    collect(order.get("reconciliation"))
+    return "\n".join(dict.fromkeys(notes)) or None
 
 
 def pricing_detail_rows(order: Mapping[str, Any]) -> list[list[Any]]:
@@ -183,7 +281,9 @@ def pricing_detail_rows(order: Mapping[str, Any]) -> list[list[Any]]:
         for leg in legs:
             sources.append(
                 (
-                    core.clean_text(leg.get("direction")) or None,
+                    core.clean_text(leg.get("display_label"))
+                    or core.clean_text(leg.get("direction"))
+                    or None,
                     [item for item in leg.get("fees", []) if isinstance(item, Mapping)],
                     leg.get("rounding") if isinstance(leg.get("rounding"), Mapping) else None,
                 )
@@ -213,7 +313,6 @@ def pricing_detail_rows(order: Mapping[str, Any]) -> list[list[Any]]:
                     label,
                     order.get("order_id"),
                     None,
-                    None,
                     direction,
                     None,
                     None,
@@ -232,7 +331,6 @@ def pricing_detail_rows(order: Mapping[str, Any]) -> list[list[Any]]:
                 [
                     "舍入",
                     order.get("order_id"),
-                    None,
                     None,
                     direction,
                     None,
@@ -256,7 +354,6 @@ def order_rows(order: Mapping[str, Any]) -> list[list[Any]]:
             "订单汇总",
             order.get("order_id"),
             order.get("customer_nickname"),
-            order.get("customer_id"),
             order.get("direction"),
             excel_number(order.get("payment_total")),
             rate_cell(order),
@@ -264,7 +361,12 @@ def order_rows(order: Mapping[str, Any]) -> list[list[Any]]:
             None,
             excel_number(order.get("expected_payout")),
             excel_number(order.get("actual_payout_total")),
-            order.get("review_result") or None,
+            (
+                simple_ledger.format_reconciliation(order.get("reconciliation"))
+                if isinstance(order.get("reconciliation"), Mapping)
+                else order.get("review_result")
+            )
+            or None,
             order_row_note(order),
             None,
             None,
@@ -279,8 +381,7 @@ def order_rows(order: Mapping[str, Any]) -> list[list[Any]]:
                 flow_row_label(flow),
                 order.get("order_id"),
                 None,
-                None,
-                flow.get("leg_direction"),
+                flow.get("leg_display_label") or flow.get("leg_direction"),
                 None,
                 None,
                 excel_number(flow.get("amount")),

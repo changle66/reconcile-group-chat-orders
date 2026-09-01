@@ -17,18 +17,22 @@ import core
 LEGACY_SIMPLE_PLAN_CONTRACT = "small-group-simple-plan/1.0"
 INTERMEDIATE_SIMPLE_PLAN_CONTRACT = "small-group-simple-plan/1.1"
 PREVIOUS_SIMPLE_PLAN_CONTRACT = "small-group-simple-plan/1.2"
-SIMPLE_PLAN_CONTRACT = "small-group-simple-plan/1.3"
+LEGACY_MODEL_SIMPLE_PLAN_CONTRACT = "small-group-simple-plan/1.3"
+SIMPLE_PLAN_CONTRACT = "small-group-simple-plan/2.0"
 SUPPORTED_SIMPLE_PLAN_CONTRACTS = {
     LEGACY_SIMPLE_PLAN_CONTRACT,
     INTERMEDIATE_SIMPLE_PLAN_CONTRACT,
     PREVIOUS_SIMPLE_PLAN_CONTRACT,
+    LEGACY_MODEL_SIMPLE_PLAN_CONTRACT,
     SIMPLE_PLAN_CONTRACT,
 }
 MODEL_JUDGMENT_PLAN_CONTRACTS = {
     PREVIOUS_SIMPLE_PLAN_CONTRACT,
+    LEGACY_MODEL_SIMPLE_PLAN_CONTRACT,
     SIMPLE_PLAN_CONTRACT,
 }
-SIMPLE_MODE_VERSION = "1.4"
+PRICING_AUTHORITY_PLAN_CONTRACTS = {SIMPLE_PLAN_CONTRACT}
+SIMPLE_MODE_VERSION = "2.0"
 SUPPORTED_FUND_EVENT_TYPES = frozenset(core.FUND_EVENT_TYPES)
 FLOW_LABEL = {
     "payment": "客户付款",
@@ -38,6 +42,39 @@ FLOW_LABEL = {
 }
 FLOW_SIDES = frozenset(FLOW_LABEL)
 MODEL_FLOW_SIDES = FLOW_SIDES | {"unknown"}
+SIDE_EXCEPTION_SIDES = {
+    "relayed_customer_payment": "payment",
+    "relayed_internal_payout": "payout",
+    "explicit_payment_refund": "payment_refund",
+    "explicit_recovery": "recovery",
+}
+NORMAL_PROCESSING_STATUS_MARKERS = (
+    "确认中",
+    "处理中",
+    "等待确认",
+    "待区块确认",
+    "pending",
+    "processing",
+    "confirming",
+    "unconfirmed",
+)
+FAILURE_STATUS_MARKERS = (
+    "失败",
+    "取消",
+    "拒绝",
+    "作废",
+    "无效",
+    "风控导致未完成",
+    "风控未完成",
+    "风控未通过",
+    "风控拦截",
+    "failed",
+    "declined",
+    "rejected",
+    "cancelled",
+    "canceled",
+    "invalid",
+)
 RATE_OPERATORS = frozenset({"multiply", "divide"})
 FEE_KINDS = frozenset({"delivery_fee", "service_fee", "network_fee"})
 NETWORK_FEE_TREATMENTS = frozenset({"added_to_payment", "deducted_from_payout"})
@@ -55,6 +92,11 @@ ROUNDING_MODES = {
     "down": ROUND_DOWN,
     "up": ROUND_UP,
 }
+PRICING_UNKNOWN_DETAILS = {
+    "not_stated": "群聊未说明权威应回金额，也未给出可完整计算的换算公式。",
+    "conflicting_authority": "群聊中的最终金额与公式权威相互冲突，无法确定应以哪一个为准。",
+    "incomplete_formula": "群聊给出的换算公式不完整，无法计算权威应回金额。",
+}
 
 
 def _simple_side(side_override: str | None) -> str:
@@ -63,6 +105,136 @@ def _simple_side(side_override: str | None) -> str:
         return "unknown"
     core.require(side in MODEL_FLOW_SIDES, f"unsupported simple flow side: {side}")
     return side
+
+
+def _validate_current_event_role_side(
+    event: Mapping[str, Any],
+    message: Mapping[str, Any],
+    *,
+    messages: Mapping[str, Mapping[str, Any]],
+) -> str:
+    event_id = str(event.get("event_id") or "")
+    core.require(
+        "flow_side" in event,
+        f"{event_id}: current fund event requires flow_side",
+    )
+    side = _simple_side(str(event.get("flow_side") or ""))
+    role = core.clean_text(message.get("role"))
+    exception = event.get("side_exception")
+    exception_kind: str | None = None
+    if exception not in (None, ""):
+        core.require(
+            isinstance(exception, Mapping),
+            f"{event_id}.side_exception must be an object",
+        )
+        unknown_fields = sorted(
+            set(exception) - {"kind", "source_message_ids", "detail"}
+        )
+        core.require(
+            not unknown_fields,
+            f"{event_id}.side_exception has unsupported fields: {', '.join(unknown_fields)}",
+        )
+        exception_kind = core.clean_text(exception.get("kind")).casefold()
+        core.require(
+            exception_kind in SIDE_EXCEPTION_SIDES,
+            f"{event_id}.side_exception.kind is unsupported",
+        )
+        core.require(
+            SIDE_EXCEPTION_SIDES[exception_kind] == side,
+            f"{event_id}.side_exception.kind does not support side={side}",
+        )
+        source_ids_value = exception.get("source_message_ids")
+        core.require(
+            isinstance(source_ids_value, list) and source_ids_value,
+            f"{event_id}.side_exception.source_message_ids is required",
+        )
+        source_ids = [str(item) for item in source_ids_value]
+        core.require(
+            len(source_ids) == len(set(source_ids)),
+            f"{event_id}.side_exception.source_message_ids repeats a message",
+        )
+        group_key = str(event.get("group_key") or message.get("_group_key") or "")
+        core.require(
+            all(
+                source_id in messages
+                and messages[source_id].get("_group_key") == group_key
+                for source_id in source_ids
+            ),
+            f"{event_id}.side_exception.source_message_ids contains an unknown or cross-group message",
+        )
+        event_message_id = str(event.get("message_id") or "")
+        core.require(
+            any(source_id != event_message_id for source_id in source_ids),
+            f"{event_id}.side_exception must cite chat context beyond the fund image itself",
+        )
+        core.require(
+            bool(core.clean_text(exception.get("detail"))),
+            f"{event_id}.side_exception.detail is required",
+        )
+
+    if side in {"payment", "payout"}:
+        expected_side = {"内部人员": "payout", "客户候选": "payment"}.get(role)
+        if expected_side is None:
+            raise ValueError(
+                f"{event_id}: unknown sender role ordinary fund event must use side=unknown"
+            )
+        if side != expected_side:
+            required_exception = (
+                "relayed_customer_payment"
+                if role == "内部人员"
+                else "relayed_internal_payout"
+            )
+            role_name = "internal" if role == "内部人员" else "customer"
+            core.require(
+                exception_kind == required_exception,
+                f"{event_id}: {role_name} sender ordinary fund event must use "
+                f"side={expected_side} unless side_exception.kind={required_exception}",
+            )
+        else:
+            core.require(
+                exception_kind is None,
+                f"{event_id}.side_exception is only allowed when ordinary side differs from sender role",
+            )
+    elif side == "payment_refund":
+        core.require(
+            exception_kind == "explicit_payment_refund",
+            f"{event_id}: side=payment_refund requires an explicit exception",
+        )
+    elif side == "recovery":
+        core.require(
+            exception_kind == "explicit_recovery",
+            f"{event_id}: side=recovery requires an explicit exception",
+        )
+    else:
+        core.require(
+            exception_kind is None,
+            f"{event_id}.side_exception is not allowed when side=unknown",
+        )
+    return side
+
+
+def _validate_current_event_status(event: Mapping[str, Any]) -> None:
+    event_id = str(event.get("event_id") or "")
+    ocr = event.get("ocr") if isinstance(event.get("ocr"), Mapping) else {}
+    status_text = core.clean_text(ocr.get("status_text"))
+    normalized_status_text = status_text.casefold()
+    status_class = core.clean_text(ocr.get("status_class")).casefold()
+    if any(marker in normalized_status_text for marker in NORMAL_PROCESSING_STATUS_MARKERS):
+        core.require(
+            status_class == "completed",
+            f"{event_id}: normal processing status must use status_class=completed",
+        )
+    if any(marker in normalized_status_text for marker in FAILURE_STATUS_MARKERS):
+        core.require(
+            status_class == "failed",
+            f"{event_id}: explicit failure status must use status_class=failed",
+        )
+    if status_class == "failed":
+        failure_text = f"{status_text} {core.clean_text(event.get('note'))}".casefold()
+        core.require(
+            any(marker in failure_text for marker in FAILURE_STATUS_MARKERS),
+            f"{event_id}: status_class=failed requires explicit failure text",
+        )
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -186,6 +358,7 @@ def _flow_from_event(
             "display_in_workbook": display_in_workbook,
             "leg_id": None,
             "leg_direction": None,
+            "leg_display_label": None,
         },
         issue,
     )
@@ -442,6 +615,189 @@ def _pricing_result(
     )
 
 
+def _pricing_authority_result(
+    value: object,
+    *,
+    payment_total: Decimal | None,
+    payment_currency: str,
+    payout_currency: str,
+    field: str,
+) -> dict[str, Any]:
+    """Resolve the v2 internal pricing object without changing its authority."""
+    core.require(isinstance(value, Mapping), f"{field}.pricing must be an object")
+    unknown = sorted(set(value) - {"source_message_ids", "terms", "expected"})
+    core.require(not unknown, f"{field}.pricing has unsupported fields: {', '.join(unknown)}")
+    source_ids_value = value.get("source_message_ids")
+    core.require(
+        isinstance(source_ids_value, list) and source_ids_value,
+        f"{field}.pricing.source_message_ids is required",
+    )
+    source_message_ids = [str(item) for item in source_ids_value]
+    core.require(
+        len(source_message_ids) == len(set(source_message_ids)),
+        f"{field}.pricing.source_message_ids repeats a message",
+    )
+
+    terms_value = value.get("terms")
+    rate: Decimal | None = None
+    operator = "multiply"
+    fees: list[dict[str, str]] = []
+    rounding: dict[str, str] | None = None
+    payment_deduction = Decimal("0")
+    payout_adjustment = Decimal("0")
+    if terms_value not in (None, ""):
+        core.require(isinstance(terms_value, Mapping), f"{field}.pricing.terms must be an object")
+        unknown_terms = sorted(set(terms_value) - {"rate", "operator", "fees", "rounding"})
+        core.require(
+            not unknown_terms,
+            f"{field}.pricing.terms has unsupported fields: {', '.join(unknown_terms)}",
+        )
+        rate = _parse_positive_decimal(
+            terms_value.get("rate"),
+            field=f"{field}.pricing.terms.rate",
+        )
+        operator = _rate_operator(
+            terms_value.get("operator"),
+            field=f"{field}.pricing.terms.operator",
+            required=True,
+        )
+        fees, payment_deduction, payout_adjustment = _compile_fees(
+            terms_value.get("fees"),
+            payment_currency=payment_currency,
+            payout_currency=payout_currency,
+            field=f"{field}.pricing.terms.fees",
+        )
+        rounding_rule, explicit_rounding = _compile_rounding(
+            terms_value.get("rounding"),
+            payout_currency=payout_currency,
+            field=f"{field}.pricing.terms.rounding",
+        )
+        rounding = rounding_rule if explicit_rounding else None
+
+    expected_value = value.get("expected")
+    core.require(isinstance(expected_value, Mapping), f"{field}.pricing.expected is required")
+    kind = core.clean_text(expected_value.get("kind")).casefold()
+    core.require(
+        kind in {"explicit", "calculated_from_terms", "unknown"},
+        f"{field}.pricing.expected.kind is unsupported",
+    )
+    expected: Decimal | None = None
+    pending_reason: str | None = None
+    pending_detail: str | None = None
+    diagnostics: list[str] = []
+
+    def calculated_amount() -> Decimal | None:
+        if rate is None or payment_total is None:
+            return None
+        payment_basis = payment_total - payment_deduction
+        core.require(payment_basis >= 0, f"{field}.pricing fees exceed customer payment")
+        base = payment_basis * rate if operator == "multiply" else payment_basis / rate
+        adjusted = base + payout_adjustment
+        core.require(adjusted >= 0, f"{field}.pricing fees exceed expected payout")
+        return _round_to_unit(adjusted, rounding) if rounding else adjusted
+
+    if kind == "explicit":
+        unknown_expected = sorted(set(expected_value) - {"kind", "amount"})
+        core.require(
+            not unknown_expected,
+            f"{field}.pricing.expected has unsupported fields: {', '.join(unknown_expected)}",
+        )
+        expected = _parse_optional_decimal(
+            expected_value.get("amount"),
+            field=f"{field}.pricing.expected.amount",
+        )
+        core.require(expected is not None and expected >= 0, f"{field}.pricing.expected.amount cannot be negative")
+        diagnostic_amount = calculated_amount()
+        if diagnostic_amount is not None and diagnostic_amount != expected:
+            diagnostics.append(
+                f"明确应回 {core.decimal_text(expected)} 与群内公式复算 "
+                f"{core.decimal_text(diagnostic_amount)} 不一致；核对仍以明确应回为准"
+            )
+    elif kind == "calculated_from_terms":
+        unknown_expected = sorted(set(expected_value) - {"kind"})
+        core.require(
+            not unknown_expected,
+            f"{field}.pricing.expected has unsupported fields: {', '.join(unknown_expected)}",
+        )
+        core.require(rate is not None, f"{field}.pricing.terms is required for calculated_from_terms")
+        expected = calculated_amount()
+    else:
+        unknown_expected = sorted(set(expected_value) - {"kind", "reason"})
+        core.require(
+            not unknown_expected,
+            f"{field}.pricing.expected has unsupported fields: {', '.join(unknown_expected)}",
+        )
+        pending_reason = core.clean_text(expected_value.get("reason")).casefold()
+        core.require(
+            pending_reason in PRICING_UNKNOWN_DETAILS,
+            f"{field}.pricing.expected.reason is unsupported",
+        )
+        pending_detail = PRICING_UNKNOWN_DETAILS[pending_reason]
+
+    return {
+        "kind": kind,
+        "expected": expected,
+        "rate": rate,
+        "operator": operator,
+        "fees": fees,
+        "rounding": rounding,
+        "pending_reason": pending_reason,
+        "pending_detail": pending_detail,
+        "diagnostics": diagnostics,
+        "source_message_ids": source_message_ids,
+    }
+
+
+def _legacy_pricing_scope_result(
+    raw: Mapping[str, Any],
+    *,
+    payment_total: Decimal,
+    payment_currency: str,
+    payout_currency: str,
+    field: str,
+) -> dict[str, Any]:
+    expected, rate, operator, fees, rounding, diagnostic = _pricing_result(
+        payment_total=payment_total,
+        payment_currency=payment_currency,
+        payout_currency=payout_currency,
+        rate_value=raw.get("rate"),
+        operator_value=raw.get("rate_operator"),
+        explicit_expected_value=raw.get("expected_payout"),
+        fees_value=raw.get("fees"),
+        rounding_value=raw.get("rounding"),
+        field=field,
+    )
+    return {
+        "kind": "legacy",
+        "expected": expected,
+        "rate": rate,
+        "operator": operator,
+        "fees": fees,
+        "rounding": rounding,
+        "pending_reason": None,
+        "pending_detail": None,
+        "diagnostics": [diagnostic] if diagnostic else [],
+        "source_message_ids": [],
+    }
+
+
+def _validate_pricing_source_messages(
+    source_message_ids: list[str],
+    *,
+    messages: Mapping[str, Mapping[str, Any]],
+    group_key: str,
+    field: str,
+) -> None:
+    core.require(
+        all(
+            message_id in messages
+            and messages[message_id].get("_group_key") == group_key
+            for message_id in source_message_ids
+        ),
+        f"{field}.pricing.source_message_ids contains an unknown or cross-group message",
+    )
+
+
 def _rate_display(
     direction: str,
     rate: Decimal | None,
@@ -516,18 +872,88 @@ def _same_transaction_map(
     return mapping
 
 
-def _review_result(actual: Decimal, expected: Decimal | None, currency: str | None) -> str:
-    if expected is None or not currency:
-        return ""
-    try:
-        tolerance = core.currency_tolerance(currency)
-    except ValueError:
-        return ""
+def _reconciliation_result(
+    actual: Decimal | None,
+    expected: Decimal | None,
+    currency: str | None,
+    *,
+    pending_reason: str | None = None,
+    pending_detail: str | None = None,
+) -> dict[str, Any]:
+    if pending_reason or actual is None or expected is None or not currency:
+        return {
+            "status": "pending",
+            "difference": None,
+            "currency": currency,
+            "reason": pending_reason or "missing_amount",
+            "detail": core.clean_text(pending_detail) or "核对所需事实尚未完整确认。",
+        }
+    tolerance = core.currency_tolerance(currency)
     difference = actual - expected
     if abs(difference) <= tolerance:
+        status = "matched"
+    elif difference < 0:
+        status = "short"
+    else:
+        status = "over"
+    return {
+        "status": status,
+        "difference": core.decimal_text(difference),
+        "currency": currency,
+        "reason": None,
+        "detail": None,
+    }
+
+
+def format_reconciliation(value: Mapping[str, Any] | None) -> str:
+    if not isinstance(value, Mapping):
         return ""
-    label = "多转" if difference > 0 else "少转"
+    status = core.clean_text(value.get("status")).casefold()
+    if status == "pending":
+        return "待确认"
+    if status == "composite":
+        lines: list[str] = []
+        for item in value.get("items", []):
+            if not isinstance(item, Mapping):
+                continue
+            label = core.clean_text(item.get("label"))
+            result = format_reconciliation(item.get("reconciliation"))
+            if result:
+                lines.append(f"{label}：{result}" if label else result)
+        return "\n".join(lines)
+    if status == "matched":
+        return ""
+    if status not in {"short", "over"}:
+        return ""
+    difference = core.parse_decimal(
+        value.get("difference"),
+        field="reconciliation.difference",
+        allow_none=True,
+    )
+    currency = core.clean_text(value.get("currency"))
+    if difference is None or not currency:
+        return ""
+    label = "少转" if status == "short" else "多转"
     return f"{label} {core.decimal_text(abs(difference))} {currency}"
+
+
+def reconciliation_is_pending(value: Mapping[str, Any] | None) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    if core.clean_text(value.get("status")).casefold() == "pending":
+        return True
+    if core.clean_text(value.get("status")).casefold() != "composite":
+        return False
+    return any(
+        isinstance(item, Mapping)
+        and reconciliation_is_pending(item.get("reconciliation"))
+        for item in value.get("items", [])
+    )
+
+
+def _review_result(actual: Decimal, expected: Decimal | None, currency: str | None) -> str:
+    """Legacy adapter retained for old internal plan contracts."""
+    return format_reconciliation(_reconciliation_result(actual, expected, currency))
 
 
 def _parse_optional_decimal(value: object, *, field: str) -> Decimal | None:
@@ -623,7 +1049,7 @@ def _compile_settlement_allocations(
             f"{field}.allocations must contain at least two target orders",
         )
         targets: set[str] = set()
-        customer_ids: set[str] = set()
+        customer_nicknames: set[str] = set()
         parsed_allocations: list[tuple[str, Decimal]] = []
         for allocation_position, allocation in enumerate(allocations):
             allocation_field = f"{field}.allocations[{allocation_position}]"
@@ -650,9 +1076,12 @@ def _compile_settlement_allocations(
                 target_order.get("legs") in (None, "", []),
                 f"{allocation_field}: settlement allocation does not support multi-leg target orders",
             )
-            customer_id = core.clean_text(target_order.get("customer_id"))
-            core.require(bool(customer_id), f"{allocation_field}: target customer_id must be known")
-            customer_ids.add(customer_id)
+            customer_nickname = core.clean_text(target_order.get("customer_nickname"))
+            core.require(
+                bool(customer_nickname),
+                f"{allocation_field}: target customer_nickname must be known",
+            )
+            customer_nicknames.add(customer_nickname.casefold())
             _, payout_currency = core.direction_currencies(
                 target_order.get("direction"),
                 field=f"{allocation_field}.target_direction",
@@ -676,7 +1105,7 @@ def _compile_settlement_allocations(
             )
             parsed_allocations.append((target_case_id, amount))
         core.require(
-            len(customer_ids) == 1,
+            len(customer_nicknames) == 1,
             f"{field}.allocations must target orders for the same customer",
         )
         allocation_total = sum(
@@ -758,6 +1187,8 @@ def _compile_order(
     assigned_events: set[str],
     allocated_flows: list[dict[str, Any]],
     require_model_judgments: bool,
+    require_pricing_authority: bool,
+    require_role_side_validation: bool,
 ) -> tuple[dict[str, Any], list[str]]:
     event_ids_value = raw_order.get("event_ids")
     core.require(
@@ -770,13 +1201,34 @@ def _compile_order(
         f"{group_key}: simple order {position} repeats an event_id",
     )
     if require_model_judgments:
-        for field in ("customer_id", "customer_nickname", "direction"):
+        for field in ("customer_nickname", "direction"):
             core.require(field in raw_order, f"simple_order.{field} must be explicitly supplied by the model")
     side_overrides = _event_side_overrides(
         raw_order,
         event_ids,
         require_complete=require_model_judgments,
     )
+    order_source_message_ids: set[str] = set()
+    if require_role_side_validation:
+        raw_source_message_ids = raw_order.get("source_message_ids")
+        core.require(
+            isinstance(raw_source_message_ids, list) and raw_source_message_ids,
+            "current simple order requires source_message_ids",
+        )
+        source_message_ids = [str(item) for item in raw_source_message_ids]
+        core.require(
+            len(source_message_ids) == len(set(source_message_ids)),
+            "current simple order source_message_ids repeats a message",
+        )
+        core.require(
+            all(
+                message_id in messages
+                and messages[message_id].get("_group_key") == group_key
+                for message_id in source_message_ids
+            ),
+            "current simple order source_message_ids contains an unknown or cross-group message",
+        )
+        order_source_message_ids = set(source_message_ids)
     semantic_duplicates = _same_transaction_map(raw_order, event_ids, event_index)
     flows: list[dict[str, Any]] = []
     issues: list[str] = []
@@ -789,6 +1241,22 @@ def _compile_order(
             event.get("type") in SUPPORTED_FUND_EVENT_TYPES,
             f"simple order event is not supported fund evidence: {event_id}",
         )
+        if require_role_side_validation:
+            core.require(
+                side_overrides.get(event_id)
+                == _simple_side(str(event.get("flow_side") or "")),
+                f"simple_order.event_sides[{event_id}] must match event.flow_side",
+            )
+            side_exception = event.get("side_exception")
+            if isinstance(side_exception, Mapping):
+                exception_source_ids = {
+                    str(item)
+                    for item in side_exception.get("source_message_ids", [])
+                }
+                core.require(
+                    exception_source_ids <= order_source_message_ids,
+                    "side_exception.source_message_ids must belong to simple order",
+                )
         message_id = str(event.get("message_id") or "")
         message = messages.get(message_id)
         core.require(message is not None, f"simple order event has no source message: {event_id}")
@@ -801,6 +1269,16 @@ def _compile_order(
             duplicate_basis=duplicate_basis,
             side_override=side_overrides.get(event_id),
         )
+        if (
+            require_pricing_authority
+            and flow.get("cash") is not True
+            and flow.get("currency") == "THB"
+        ):
+            flow["payee"] = core.validate_thai_bank_account_payee(
+                flow.get("payee"),
+                field=f"{event_id}.payee",
+                payee_state=flow.get("payee_state"),
+            )
         flows.append(flow)
         if issue:
             issues.append(issue)
@@ -826,11 +1304,10 @@ def _compile_order(
             f"same transaction sides differ: {event_id} vs {same_as}",
         )
 
-    customer_id = core.clean_text(raw_order.get("customer_id"))
     customer_nickname = core.clean_text(raw_order.get("customer_nickname"))
-    identity_pending = not customer_id or not customer_nickname
+    identity_pending = not customer_nickname
     if identity_pending:
-        issues.append(f"{group_key}: simple order {position} customer identity is not unique")
+        issues.append(f"{group_key}: simple order {position} customer nickname is not known")
 
     relevant_flows = [
         flow
@@ -866,6 +1343,7 @@ def _compile_order(
     fee_adjustments: list[dict[str, str]] = []
     expected: Decimal | None = None
     payout_total: Decimal | None = None
+    payout_known = False
     rate: Decimal | None = None
     rate_operator = "multiply"
     rate_display: str | None = None
@@ -874,7 +1352,11 @@ def _compile_order(
     direction = ""
     pair_complete = False
     pricing_pending = False
-    pricing_notes: list[str] = []
+    pricing_pending_details: list[str] = []
+    pricing_diagnostics: list[str] = []
+    pricing_basis: str | None = None
+    pricing_source_message_ids: list[str] = []
+    reconciliation: dict[str, Any] | None = None
 
     if multi_leg:
         core.require(isinstance(raw_legs, list) and len(raw_legs) >= 2, "simple_order.legs requires at least two legs")
@@ -895,7 +1377,16 @@ def _compile_order(
                 leg_direction,
                 field=f"{field}.direction",
             )
-            leg_directions.append(leg_direction)
+            has_display_label = "display_label" in raw_leg
+            raw_display_label = core.clean_text(raw_leg.get("display_label"))
+            display_label = raw_display_label or leg_direction
+            if has_display_label:
+                core.require(bool(raw_display_label), f"{field}.display_label cannot be blank")
+                core.require(
+                    len(display_label) <= 80 and "\n" not in display_label and "\r" not in display_label,
+                    f"{field}.display_label must be a single line of at most 80 characters",
+                )
+            leg_directions.append(display_label)
             leg_payment_currencies.add(leg_payment_currency)
             allocation_amount = _parse_positive_decimal(
                 raw_leg.get("allocation_amount"),
@@ -929,6 +1420,8 @@ def _compile_order(
                     "raw": raw_leg,
                     "field": field,
                     "leg_id": leg_id,
+                    "display_label": display_label,
+                    "has_display_label": has_display_label,
                     "direction": leg_direction,
                     "payment_currency": leg_payment_currency,
                     "payout_currency": leg_payout_currency,
@@ -937,6 +1430,22 @@ def _compile_order(
                     "recovery_ids": recovery_ids,
                 }
             )
+        if require_pricing_authority:
+            specs_by_direction: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            for spec in leg_specs:
+                specs_by_direction[spec["direction"]].append(spec)
+            for repeated_direction, matching_specs in specs_by_direction.items():
+                if len(matching_specs) < 2:
+                    continue
+                core.require(
+                    all(spec["has_display_label"] for spec in matching_specs),
+                    f"simple_order.legs sharing direction {repeated_direction} require display_label on every leg",
+                )
+                display_labels = [str(spec["display_label"]) for spec in matching_specs]
+                core.require(
+                    len({label.casefold() for label in display_labels}) == len(display_labels),
+                    f"simple_order.legs sharing direction {repeated_direction} require distinct display_label values",
+                )
         core.require(len(leg_payment_currencies) == 1, "simple_order.legs must share one payment currency")
         payment_currency = next(iter(leg_payment_currencies))
         direction = "\n".join(leg_directions)
@@ -957,7 +1466,6 @@ def _compile_order(
         all_legs_complete = allocation_closed and order_settlement_ids == referenced_settlement_ids
         rate_lines: list[str] = []
         payout_currency_lines: list[str] = []
-        leg_result_lines: list[str] = []
         leg_note_lines: list[str] = []
         for spec in leg_specs:
             raw_leg = spec["raw"]
@@ -965,6 +1473,7 @@ def _compile_order(
             for flow in selected:
                 flow["leg_id"] = spec["leg_id"]
                 flow["leg_direction"] = spec["direction"]
+                flow["leg_display_label"] = spec["display_label"]
             leg_payout, leg_payout_known = _net_side_total(selected, "payout", "recovery")
             if any(
                 flow.get("currency") not in (None, spec["payout_currency"])
@@ -973,91 +1482,84 @@ def _compile_order(
             ):
                 leg_payout, leg_payout_known = None, False
             leg_complete = allocation_closed and leg_payout_known and leg_payout is not None
-            leg_rate = _parse_optional_decimal(raw_leg.get("rate"), field=f"{spec['field']}.rate")
-            if leg_rate is not None:
-                core.require(leg_rate > 0, f"{spec['field']}.rate must be positive")
-            leg_operator = _rate_operator(raw_leg.get("rate_operator"), field=f"{spec['field']}.rate_operator")
-            leg_explicit_expected = _parse_optional_decimal(
-                raw_leg.get("expected_payout"),
-                field=f"{spec['field']}.expected_payout",
-            )
-            if leg_explicit_expected is not None:
-                core.require(
-                    leg_explicit_expected >= 0,
-                    f"{spec['field']}.expected_payout cannot be negative",
-                )
-            leg_expected: Decimal | None = None
-            leg_fees: list[dict[str, str]] = []
-            leg_rounding: dict[str, str] | None = None
-            leg_pricing_issue: str | None = None
-            if leg_complete:
-                (
-                    leg_expected,
-                    leg_rate,
-                    leg_operator,
-                    leg_fees,
-                    leg_rounding,
-                    leg_pricing_issue,
-                ) = _pricing_result(
+            if require_pricing_authority:
+                leg_pricing = _pricing_authority_result(
+                    raw_leg.get("pricing"),
                     payment_total=spec["allocation_amount"],
                     payment_currency=spec["payment_currency"],
                     payout_currency=spec["payout_currency"],
-                    rate_value=raw_leg.get("rate"),
-                    operator_value=raw_leg.get("rate_operator"),
-                    explicit_expected_value=raw_leg.get("expected_payout"),
-                    fees_value=raw_leg.get("fees"),
-                    rounding_value=raw_leg.get("rounding"),
                     field=spec["field"],
                 )
             else:
-                (
-                    leg_fees,
-                    leg_payment_deduction,
-                    _leg_payout_adjustment,
-                ) = _compile_fees(
-                    raw_leg.get("fees"),
+                leg_pricing = _legacy_pricing_scope_result(
+                    raw_leg,
+                    payment_total=spec["allocation_amount"],
                     payment_currency=spec["payment_currency"],
                     payout_currency=spec["payout_currency"],
-                    field=f"{spec['field']}.fees",
+                    field=spec["field"],
                 )
-                core.require(
-                    leg_payment_deduction <= spec["allocation_amount"],
-                    f"{spec['field']} fees exceed allocated customer payment",
-                )
-                leg_rounding_rule, explicit_leg_rounding = _compile_rounding(
-                    raw_leg.get("rounding"),
-                    payout_currency=spec["payout_currency"],
-                    field=f"{spec['field']}.rounding",
-                )
-                leg_rounding = leg_rounding_rule if explicit_leg_rounding else None
-            leg_result = (
-                _review_result(leg_payout, leg_expected, spec["payout_currency"])
-                if leg_complete and leg_payout is not None
-                else "待确认"
+            _validate_pricing_source_messages(
+                leg_pricing["source_message_ids"],
+                messages=messages,
+                group_key=group_key,
+                field=spec["field"],
             )
+            leg_expected = leg_pricing["expected"]
+            leg_rate = leg_pricing["rate"]
+            leg_operator = leg_pricing["operator"]
+            leg_fees = leg_pricing["fees"]
+            leg_rounding = leg_pricing["rounding"]
             leg_issue_notes: list[str] = []
-            if leg_pricing_issue:
+            leg_pricing_detail: str | None = None
+            if leg_pricing["pending_reason"]:
                 pricing_pending = True
-                leg_result = "待确认"
-                leg_issue_notes.append(leg_pricing_issue)
-                pricing_notes.append(f"{spec['direction']}：{leg_pricing_issue}。")
-                issues.append(f"{spec['field']}: {leg_pricing_issue}")
+                leg_pricing_detail = str(leg_pricing["pending_detail"])
+                pricing_pending_details.append(
+                    f"{spec['display_label']}：{leg_pricing_detail}"
+                )
             if not leg_complete:
                 leg_issue_notes.append("该换汇明细的付款分配或内部回款尚未完整确认。")
+                if leg_pricing_detail:
+                    leg_issue_notes.append(leg_pricing_detail)
+                leg_reconciliation = _reconciliation_result(
+                    leg_payout,
+                    leg_expected,
+                    spec["payout_currency"],
+                    pending_reason="evidence_incomplete",
+                    pending_detail="\n".join(leg_issue_notes),
+                )
+            elif leg_pricing_detail:
+                leg_issue_notes.append(leg_pricing_detail)
+                leg_reconciliation = _reconciliation_result(
+                    leg_payout,
+                    leg_expected,
+                    spec["payout_currency"],
+                    pending_reason=f"pricing_{leg_pricing['pending_reason']}",
+                    pending_detail=leg_pricing_detail,
+                )
+            else:
+                leg_reconciliation = _reconciliation_result(
+                    leg_payout,
+                    leg_expected,
+                    spec["payout_currency"],
+                )
+            for diagnostic in leg_pricing["diagnostics"]:
+                pricing_diagnostics.append(f"{spec['display_label']}：{diagnostic}")
+            leg_result = format_reconciliation(leg_reconciliation)
             leg_anomaly = "\n".join(leg_issue_notes)
             rate_line = _rate_display(
-                spec["direction"],
+                spec["display_label"],
                 leg_rate,
                 leg_operator,
                 labeled=True,
             )
+            if not rate_line and leg_pricing["kind"] == "unknown":
+                rate_line = f"{spec['display_label']}：待确认"
             if rate_line:
                 rate_lines.append(rate_line)
             payout_currency_lines.append(spec["payout_currency"])
-            if leg_result:
-                leg_result_lines.append(f"{spec['direction']}：{leg_result}")
             if leg_anomaly:
-                leg_note_lines.append(f"{spec['direction']}：{leg_anomaly}")
+                leg_note_lines.append(f"{spec['display_label']}：{leg_anomaly}")
             for fee in leg_fees:
                 fee["leg_id"] = spec["leg_id"]
                 fee["direction"] = spec["direction"]
@@ -1065,6 +1567,7 @@ def _compile_order(
             compiled_legs.append(
                 {
                     "leg_id": spec["leg_id"],
+                    "display_label": spec["display_label"],
                     "direction": spec["direction"],
                     "payment_currency": spec["payment_currency"],
                     "payment_total": core.decimal_text(spec["allocation_amount"]),
@@ -1079,8 +1582,12 @@ def _compile_order(
                     "payout_currency": spec["payout_currency"],
                     "expected_payout": core.decimal_text(leg_expected),
                     "actual_payout_total": core.decimal_text(leg_payout),
+                    "reconciliation": leg_reconciliation,
                     "review_result": leg_result,
                     "anomaly_note": leg_anomaly,
+                    "pricing_basis": leg_pricing["kind"],
+                    "pricing_source_message_ids": leg_pricing["source_message_ids"],
+                    "pricing_diagnostics": leg_pricing["diagnostics"],
                     "payout_event_ids": spec["payout_ids"],
                     "recovery_event_ids": spec["recovery_ids"],
                     "fees": leg_fees,
@@ -1090,7 +1597,17 @@ def _compile_order(
             all_legs_complete = all_legs_complete and leg_complete
         rate_display = "\n".join(rate_lines) or None
         payout_currency = "\n".join(payout_currency_lines)
-        result = "\n".join(leg_result_lines)
+        reconciliation = {
+            "status": "composite",
+            "items": [
+                {
+                    "label": leg["display_label"],
+                    "reconciliation": leg["reconciliation"],
+                }
+                for leg in compiled_legs
+            ],
+        }
+        result = format_reconciliation(reconciliation)
         pair_complete = all_legs_complete
     else:
         requested_direction = core.clean_text(raw_order.get("direction"))
@@ -1123,48 +1640,44 @@ def _compile_order(
             payout_total, payout_known = None, False
             issues.append(f"{group_key}: simple order {position} payout flow currency conflicts with direction")
         pair_complete = bool(direction) and payment_known and payout_known
-        rate = _parse_optional_decimal(raw_order.get("rate"), field="simple_order.rate")
-        if rate is not None:
-            core.require(rate > 0, "simple_order.rate must be positive")
-        rate_operator = _rate_operator(raw_order.get("rate_operator"), field="simple_order.rate_operator")
-        explicit_expected = _parse_optional_decimal(
-            raw_order.get("expected_payout"),
-            field="simple_order.expected_payout",
-        )
-        if explicit_expected is not None:
-            core.require(explicit_expected >= 0, "simple_order.expected_payout cannot be negative")
-        if pair_complete and payment_total is not None and payout_total is not None:
-            assert payment_currency is not None and payout_currency is not None
-            (
-                expected,
-                rate,
-                rate_operator,
-                fee_adjustments,
-                rounding,
-                pricing_issue,
-            ) = _pricing_result(
-                payment_total=payment_total,
-                payment_currency=payment_currency,
-                payout_currency=payout_currency,
-                rate_value=raw_order.get("rate"),
-                operator_value=raw_order.get("rate_operator"),
-                explicit_expected_value=raw_order.get("expected_payout"),
-                fees_value=raw_order.get("fees"),
-                rounding_value=raw_order.get("rounding"),
+        pricing_scope: dict[str, Any] | None = None
+        if payment_currency is not None and payout_currency is not None:
+            if require_pricing_authority:
+                pricing_scope = _pricing_authority_result(
+                    raw_order.get("pricing"),
+                    payment_total=payment_total,
+                    payment_currency=payment_currency,
+                    payout_currency=payout_currency,
+                    field="simple_order",
+                )
+            elif payment_total is not None:
+                pricing_scope = _legacy_pricing_scope_result(
+                    raw_order,
+                    payment_total=payment_total,
+                    payment_currency=payment_currency,
+                    payout_currency=payout_currency,
+                    field="simple_order",
+                )
+        if pricing_scope is not None:
+            _validate_pricing_source_messages(
+                pricing_scope["source_message_ids"],
+                messages=messages,
+                group_key=group_key,
                 field="simple_order",
             )
-            result = _review_result(payout_total, expected, payout_currency)
-            if pricing_issue:
+            expected = pricing_scope["expected"]
+            rate = pricing_scope["rate"]
+            rate_operator = pricing_scope["operator"]
+            fee_adjustments = pricing_scope["fees"]
+            rounding = pricing_scope["rounding"]
+            pricing_basis = pricing_scope["kind"]
+            pricing_source_message_ids = pricing_scope["source_message_ids"]
+            pricing_diagnostics.extend(pricing_scope["diagnostics"])
+            if pricing_scope["pending_reason"]:
                 pricing_pending = True
-                result = "待确认"
-                pricing_notes.append(pricing_issue + "。")
-                issues.append(f"{group_key}: simple order {position}: {pricing_issue}")
+                pricing_pending_details.append(str(pricing_scope["pending_detail"]))
         elif payment_currency is not None and payout_currency is not None:
-            (
-                fee_adjustments,
-                payment_deduction,
-                _payout_adjustment,
-            ) = _compile_fees(
+            fee_adjustments, payment_deduction, _payout_adjustment = _compile_fees(
                 raw_order.get("fees"),
                 payment_currency=payment_currency,
                 payout_currency=payout_currency,
@@ -1178,6 +1691,26 @@ def _compile_order(
                 field="simple_order.rounding",
             )
             rounding = rounding_rule if explicit_rounding else None
+        if pair_complete and payout_total is not None:
+            if pricing_pending:
+                reconciliation = _reconciliation_result(
+                    payout_total,
+                    expected,
+                    payout_currency,
+                    pending_reason=(
+                        f"pricing_{pricing_scope['pending_reason']}"
+                        if pricing_scope is not None
+                        else "pricing_unknown"
+                    ),
+                    pending_detail="\n".join(pricing_pending_details),
+                )
+            else:
+                reconciliation = _reconciliation_result(
+                    payout_total,
+                    expected,
+                    payout_currency,
+                )
+            result = format_reconciliation(reconciliation)
         rate_display = (
             _rate_display(direction, rate, rate_operator, labeled=False)
             if rate_operator == "divide"
@@ -1185,29 +1718,45 @@ def _compile_order(
         )
 
     notes: list[str] = []
+    if not direction:
+        notes.append("换汇方向尚未确认。")
     if not payment_known:
         notes.insert(0, "客户付款或付款退款图片的金额、币种尚未完整确认。")
-    if not multi_leg and not pair_complete:
+    if not multi_leg and not payout_known:
         notes.append("内部回款或回款追回图片的金额、币种尚未完整确认。")
     if multi_leg and any("allocation" in issue for issue in issues):
         notes.append("付款拆分金额尚未闭合。")
     if multi_leg:
         notes.extend(leg_note_lines)
-    notes.extend(pricing_notes)
+    else:
+        notes.extend(pricing_pending_details)
     if identity_pending:
         notes.append("该订单客户无法唯一确认。")
-        result = "待确认"
-    if not pair_complete:
-        result = "待确认"
     anomaly_note = "\n".join(dict.fromkeys(note for note in notes if note))
-    if pair_complete and not identity_pending and not pricing_pending:
-        order_status = "completed"
-    elif pricing_pending:
-        order_status = "pending_pricing"
-    elif identity_pending and pair_complete:
-        order_status = "pending_identity"
-    else:
+    if not pair_complete or identity_pending:
+        pending_reason = "evidence_incomplete" if not pair_complete else "identity_unknown"
+        reconciliation = _reconciliation_result(
+            payout_total,
+            expected,
+            payout_currency,
+            pending_reason=pending_reason,
+            pending_detail=anomaly_note,
+        )
+    elif reconciliation is None:
+        reconciliation = _reconciliation_result(
+            payout_total,
+            expected,
+            payout_currency,
+        )
+    result = format_reconciliation(reconciliation)
+    if not pair_complete:
         order_status = "pending_evidence"
+    elif identity_pending:
+        order_status = "pending_identity"
+    elif pricing_pending or reconciliation_is_pending(reconciliation):
+        order_status = "pending_pricing"
+    else:
+        order_status = "completed"
 
     case_id = core.clean_text(raw_order.get("case_id")) or f"{group_key}:simple:{position:03d}"
     return (
@@ -1217,7 +1766,6 @@ def _compile_order(
             "start_time": start_message.get("timestamp"),
             "start_message_id": start_message_id,
             "customer_nickname": customer_nickname,
-            "customer_id": customer_id,
             "direction": direction,
             "payment_currency": payment_currency,
             "payment_total": core.decimal_text(payment_total),
@@ -1228,10 +1776,14 @@ def _compile_order(
             "expected_payout": core.decimal_text(expected),
             "balance_adjustment": "0",
             "actual_payout_total": core.decimal_text(payout_total),
+            "reconciliation": reconciliation,
             "review_result": result,
             "anomaly_note": anomaly_note,
             "note": order_note,
             "order_status": order_status,
+            "pricing_basis": pricing_basis,
+            "pricing_source_message_ids": pricing_source_message_ids,
+            "pricing_diagnostics": pricing_diagnostics,
             "fee_adjustments": fee_adjustments,
             "rounding": rounding,
             "legs": compiled_legs,
@@ -1242,7 +1794,30 @@ def _compile_order(
 
 
 def _mark_relationship_pending(order: dict[str, Any], note: str) -> None:
-    order["review_result"] = "待确认"
+    existing = order.get("reconciliation")
+    existing_detail = (
+        core.clean_text(existing.get("detail"))
+        if isinstance(existing, Mapping)
+        and core.clean_text(existing.get("status")).casefold() == "pending"
+        else ""
+    )
+    detail = _append_note(existing_detail, note)
+    actual = _parse_optional_decimal(
+        order.get("actual_payout_total"),
+        field="relationship.actual_payout_total",
+    )
+    expected = _parse_optional_decimal(
+        order.get("expected_payout"),
+        field="relationship.expected_payout",
+    )
+    order["reconciliation"] = _reconciliation_result(
+        actual,
+        expected,
+        core.clean_text(order.get("payout_currency")) or None,
+        pending_reason="relationship_unresolved",
+        pending_detail=detail,
+    )
+    order["review_result"] = format_reconciliation(order["reconciliation"])
     order["anomaly_note"] = _append_note(str(order.get("anomaly_note") or ""), note)
     if order.get("order_status") == "completed":
         order["order_status"] = "pending_relationship"
@@ -1314,7 +1889,9 @@ def _apply_balance_links(
             seen_links.add(link_signature)
         if source.get("legs") or target.get("legs"):
             reasons.append("多方向订单暂不应用跨单余额")
-        if not source.get("customer_id") or source.get("customer_id") != target.get("customer_id"):
+        source_customer = core.clean_text(source.get("customer_nickname"))
+        target_customer = core.clean_text(target.get("customer_nickname"))
+        if not source_customer or source_customer.casefold() != target_customer.casefold():
             reasons.append("前后订单客户不一致或未确认")
         if source.get("payout_currency") != currency or target.get("payout_currency") != currency:
             reasons.append("前后订单回款币种与余额币种不一致")
@@ -1363,8 +1940,15 @@ def _apply_balance_links(
                     target["balance_adjustment"] = core.decimal_text(
                         Decimal(str(target.get("balance_adjustment") or "0")) + signed_adjustment
                     )
-                    if target.get("review_result") != "待确认" and target_actual is not None:
-                        target["review_result"] = _review_result(target_actual, adjusted_expected, currency)
+                    if not reconciliation_is_pending(target.get("reconciliation")) and target_actual is not None:
+                        target["reconciliation"] = _reconciliation_result(
+                            target_actual,
+                            adjusted_expected,
+                            currency,
+                        )
+                        target["review_result"] = format_reconciliation(
+                            target["reconciliation"]
+                        )
             if status == "applied":
                 consumed_source_balances[(source_case_id, currency, kind)] += amount
                 source_order_id = str(source.get("order_id") or source_case_id)
@@ -1412,6 +1996,22 @@ def compile_simple_ledger(
     messages, normalized_groups = core.message_and_group_indexes(normalized)
     event_index = {str(event.get("event_id") or ""): event for event in events}
     core.require(len(event_index) == len(events), "duplicate event IDs")
+    if plan.get("contract_version") == SIMPLE_PLAN_CONTRACT:
+        for event in events:
+            if event.get("type") not in SUPPORTED_FUND_EVENT_TYPES:
+                continue
+            event_id = str(event.get("event_id") or "")
+            message = messages.get(str(event.get("message_id") or ""))
+            core.require(
+                message is not None,
+                f"current fund event has no source message: {event_id}",
+            )
+            _validate_current_event_role_side(
+                event,
+                message,
+                messages=messages,
+            )
+            _validate_current_event_status(event)
     plan_groups_value = plan.get("groups")
     core.require(isinstance(plan_groups_value, list), "simple plan groups must be a list")
     plan_groups = {
@@ -1424,6 +2024,10 @@ def compile_simple_ledger(
 
     assigned_events: set[str] = set()
     require_model_judgments = plan.get("contract_version") in MODEL_JUDGMENT_PLAN_CONTRACTS
+    require_pricing_authority = (
+        plan.get("contract_version") in PRICING_AUTHORITY_PLAN_CONTRACTS
+    )
+    require_role_side_validation = plan.get("contract_version") == SIMPLE_PLAN_CONTRACT
     result_groups: list[dict[str, Any]] = []
     warnings: list[str] = []
     for group_key, normalized_group in normalized_groups.items():
@@ -1461,6 +2065,8 @@ def compile_simple_ledger(
                 assigned_events=assigned_events,
                 allocated_flows=allocated_flows.get(target_case_id, []),
                 require_model_judgments=require_model_judgments,
+                require_pricing_authority=require_pricing_authority,
+                require_role_side_validation=require_role_side_validation,
             )
             compiled_orders.append(compiled)
             warnings.extend(issues)
@@ -1513,6 +2119,9 @@ def compile_simple_ledger(
         "rule_version": core.RULE_VERSION,
         "accounting_mode": "simple",
         "simple_mode_version": SIMPLE_MODE_VERSION,
+        "payee_policy": (
+            "thai_bank_account_only" if require_pricing_authority else None
+        ),
         "timezone": normalized.get("timezone"),
         "source_fingerprint": normalized.get("source_fingerprint"),
         "events_fingerprint": events_fingerprint,

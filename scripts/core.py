@@ -19,15 +19,14 @@ except ImportError:  # The roster subset also has a small stdlib fallback parser
 
 
 NORMALIZED_CONTRACT = "small-group-normalized/1.0"
-ORDERS_CONTRACT = "small-group-simple-orders/1.2"
-RULE_VERSION = "simple-ledger/1.3"
+ORDERS_CONTRACT = "small-group-simple-orders/2.0"
+RULE_VERSION = "simple-ledger/2.0"
 getcontext().prec = 60
 
 HEADERS = [
     "记录类型",
     "订单编号",
     "客户昵称",
-    "客户标识",
     "换汇方向",
     "付款合计",
     "汇率",
@@ -117,6 +116,8 @@ GENERIC_PAYEE_RE = re.compile(
     r"^(?:截图所示|聊天指定|固定金额二维码|支付宝截图所示).*(?:收款方|收款账户|收款地址|账户)?$",
     re.IGNORECASE,
 )
+THAI_BANK_ACCOUNT_RE = re.compile(r"^[0-9Xx*#•·×.\- –—]+$")
+THAI_BANK_ACCOUNT_TOKEN_RE = re.compile(r"[0-9Xx*#•×]")
 BOT_NAME_RE = re.compile(r"(?:自动统计机器人|统计机器人|机器人A\d+)", re.IGNORECASE)
 CASH_AMOUNT_NOTATION_RE = re.compile(
     r"(?P<sign>[+-])?\s*(?:(?P<number>(?:\d+(?:\.\d*)?|\.\d+))\s*)?(?P<suffix>[wk])",
@@ -292,6 +293,31 @@ def validate_payee(
         require(payee == "未显示", f"{field} must be 未显示 when payee_state is not_shown")
     elif state == "unreadable":
         require(payee == "无法辨认", f"{field} must be 无法辨认 when payee_state is unreadable")
+    return payee
+
+
+def validate_thai_bank_account_payee(
+    value: object,
+    *,
+    field: str,
+    payee_state: object,
+) -> str:
+    """Require a Thai-bank recipient to be recorded as the visible account only."""
+    payee = validate_payee(
+        value,
+        field=field,
+        payee_state=payee_state,
+        require_state=True,
+    )
+    state = clean_text(payee_state).casefold()
+    if state != "visible":
+        return payee
+    require(
+        THAI_BANK_ACCOUNT_RE.fullmatch(payee) is not None
+        and THAI_BANK_ACCOUNT_TOKEN_RE.search(payee) is not None,
+        f"{field} must contain only the exact visible Thai bank account or masked account; "
+        "do not record the Thai recipient name or bank name",
+    )
     return payee
 
 
