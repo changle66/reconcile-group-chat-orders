@@ -20,6 +20,8 @@ import check_workbook
 import core
 import extract_line_android_miui
 import extract_line_ios
+import finance_materials
+import large_daily
 import normalize_exports
 import simple_ledger
 
@@ -110,6 +112,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     start = commands.add_parser("start", help="create a new run from raw exports")
     start.add_argument("inputs", nargs="+", type=Path, help="raw export files or roots")
     start.add_argument("--work", required=True, type=Path, help="new, non-existing run directory")
+    start.add_argument(
+        "--mode",
+        choices=("small", "large", "finance"),
+        default="small",
+        help=(
+            "small selects the existing name filter; large selects every group except 小额出 and 财务资料群; "
+            "finance selects 财务资料群 for identity and chat-account records"
+        ),
+    )
     start.add_argument("--contains", default="小额", help="required text in the parsed group name")
     start.add_argument("--date", help="optional accounting date in YYYY-MM-DD")
     start.add_argument(
@@ -323,7 +334,28 @@ def _discover_line_android_backups(
     return sorted(candidates, key=lambda item: str(item).casefold())
 
 
-def _line_has_matching_group(device_dir: Path, contains: str) -> bool:
+def _large_group_name(value: object) -> bool:
+    normalized = core.normalize_name(value)
+    return all(
+        core.normalize_name(excluded) not in normalized
+        for excluded in ("小额出", "财务资料群")
+    )
+
+
+def _group_name_selected(value: object, *, group_mode: str, contains: str) -> bool:
+    if group_mode == "large":
+        return _large_group_name(value)
+    if group_mode == finance_materials.GROUP_MODE:
+        return finance_materials.group_name_selected(value)
+    return contains.casefold() in str(value or "").casefold()
+
+
+def _line_has_matching_group(
+    device_dir: Path,
+    contains: str,
+    *,
+    group_mode: str,
+) -> bool:
     manifest = extract_line_ios.sqlite_ro(device_dir / "Manifest.db")
     line_db = None
     group_db = None
@@ -335,8 +367,14 @@ def _line_has_matching_group(device_dir: Path, contains: str) -> bool:
         line_db = extract_line_ios.sqlite_ro(line_path)
         group_db = extract_line_ios.sqlite_ro(group_path)
         groups = extract_line_ios.available_groups(line_db, group_db)
-        needle = contains.casefold()
-        return any(needle in str(group.get("group_name") or "").casefold() for group in groups)
+        return any(
+            _group_name_selected(
+                group.get("group_name"),
+                group_mode=group_mode,
+                contains=contains,
+            )
+            for group in groups
+        )
     finally:
         if line_db is not None:
             line_db.close()
@@ -350,25 +388,23 @@ def _line_documents(
     backups: Iterable[Path],
     *,
     contains: str,
+    group_mode: str,
     timezone_name: str,
     roster_path: Path,
     self_name: str,
 ) -> list[dict[str, Any]]:
     documents: list[dict[str, Any]] = []
     for index, backup in enumerate(backups, start=1):
-        if not _line_has_matching_group(backup, contains):
+        if not _line_has_matching_group(backup, contains, group_mode=group_mode):
             continue
         output = work / "snapshot" / "sources" / f"line_{index:02d}.json"
         media_dir = work / "snapshot" / "line_media" / f"backup_{index:02d}"
-        exit_code = extract_line_ios.main(
-            [
+        extraction_args = [
                 str(backup),
                 "-o",
                 str(output),
                 "--timezone",
                 timezone_name,
-                "--group-pattern",
-                re.escape(contains),
                 "--self-name",
                 self_name,
                 "--roster",
@@ -376,7 +412,11 @@ def _line_documents(
                 "--media-dir",
                 str(media_dir),
             ]
-        )
+        if group_mode == "large":
+            extraction_args.append("--all-group-chats")
+        else:
+            extraction_args.extend(["--group-pattern", re.escape(contains)])
+        exit_code = extract_line_ios.main(extraction_args)
         core.require(exit_code == 0, f"LINE extraction failed for {backup}")
         documents.append(core.load_normalized(output))
     return documents
@@ -387,56 +427,78 @@ def _line_android_documents(
     backups: Iterable[Path],
     *,
     contains: str,
+    group_mode: str,
     timezone_name: str,
     roster_path: Path,
 ) -> list[dict[str, Any]]:
     documents: list[dict[str, Any]] = []
-    needle = contains.casefold()
     for index, backup in enumerate(backups, start=1):
         groups = extract_line_android_miui.available_groups_for_backup(backup)
-        if not any(needle in str(group.get("group_name") or "").casefold() for group in groups):
+        if not any(
+            _group_name_selected(
+                group.get("group_name"),
+                group_mode=group_mode,
+                contains=contains,
+            )
+            for group in groups
+        ):
             continue
         output = work / "snapshot" / "sources" / f"line_android_{index:02d}.json"
         media_dir = work / "snapshot" / "line_android_media" / f"backup_{index:02d}"
-        exit_code = extract_line_android_miui.main(
-            [
+        extraction_args = [
                 str(backup),
                 "-o",
                 str(output),
                 "--timezone",
                 timezone_name,
-                "--group-pattern",
-                re.escape(contains),
                 "--roster",
                 str(roster_path),
                 "--media-dir",
                 str(media_dir),
             ]
-        )
+        if group_mode == "large":
+            extraction_args.append("--all-group-chats")
+        else:
+            extraction_args.extend(["--group-pattern", re.escape(contains)])
+        exit_code = extract_line_android_miui.main(extraction_args)
         core.require(exit_code == 0, f"LINE Android extraction failed for {backup}")
         documents.append(core.load_normalized(output))
     return documents
 
 
-def _merge_documents(documents: list[dict[str, Any]], *, contains: str, timezone_name: str) -> dict[str, Any]:
+def _merge_documents(
+    documents: list[dict[str, Any]],
+    *,
+    contains: str,
+    group_mode: str,
+    timezone_name: str,
+) -> dict[str, Any]:
     core.require(bool(documents), "no supported raw chat exports were found")
     groups: list[dict[str, Any]] = []
     warnings: list[str] = []
     source_fingerprints: list[str] = []
     seen: set[str] = set()
-    needle = contains.casefold()
     for document in documents:
         core.require(document.get("timezone") == timezone_name, "normalized source timezone mismatch")
         source_fingerprints.append(str(document.get("source_fingerprint") or ""))
         warnings.extend(str(item) for item in document.get("warnings", []))
         for group in document.get("groups", []):
-            if needle not in str(group.get("group_name") or "").casefold():
+            group_name = group.get("group_name")
+            selected = _group_name_selected(
+                group_name,
+                group_mode=group_mode,
+                contains=contains,
+            )
+            if not selected:
                 continue
             key = str(group.get("group_key") or "")
             core.require(key and key not in seen, f"duplicate group snapshot: {key}")
             seen.add(key)
             groups.append(copy.deepcopy(group))
-    core.require(bool(groups), f"no parsed group name contains {contains!r}")
+    if group_mode == "large":
+        core.require(bool(groups), "no large groups remain after excluding 小额出 and 财务资料群")
+    else:
+        core.require(bool(groups), f"no parsed group name contains {contains!r}")
     groups.sort(key=lambda item: (str(item.get("platform")), str(item.get("group_name")), str(item.get("group_key"))))
     messages = [message for group in groups for message in group.get("messages", [])]
     media = [item for message in messages for item in message.get("media", [])]
@@ -444,6 +506,7 @@ def _merge_documents(documents: list[dict[str, Any]], *, contains: str, timezone
         {
             "normalizer": NORMALIZER_VERSION,
             "contains": contains,
+            "group_mode": group_mode,
             "sources": sorted(source_fingerprints),
             "groups": [group["group_key"] for group in groups],
         }
@@ -471,10 +534,22 @@ def _decision_filename(group_key: str) -> str:
     return f"decision_{group_key.replace(':', '-')}.json"
 
 
-def _decision_template(normalized: Mapping[str, Any], group: Mapping[str, Any]) -> dict[str, Any]:
+def _decision_template(
+    normalized: Mapping[str, Any],
+    group: Mapping[str, Any],
+    *,
+    group_mode: str = "small",
+) -> dict[str, Any]:
     evidence = _media_inventory(group)
+    contract_version = (
+        finance_materials.DECISION_CONTRACT
+        if group_mode == finance_materials.GROUP_MODE
+        else large_daily.DECISION_CONTRACT
+        if group_mode == "large"
+        else DECISION_CONTRACT
+    )
     decision = {
-        "contract_version": DECISION_CONTRACT,
+        "contract_version": contract_version,
         "normalized_source_fingerprint": normalized.get("source_fingerprint"),
         "group_fingerprint": core.fingerprint_json(group),
         "group_key": group.get("group_key"),
@@ -487,12 +562,36 @@ def _decision_template(normalized: Mapping[str, Any], group: Mapping[str, Any]) 
         "sealed": False,
         "sealed_decision_fingerprint": None,
         "media_decisions": {},
-        "orders": [],
-        "open_orders": [],
-        "balance_links": [],
-        "settlement_allocations": [],
-        "unknown_payee_reviewed_entry_ids": [],
     }
+    if group_mode == finance_materials.GROUP_MODE:
+        decision.update(
+            {
+                "group_mode": finance_materials.GROUP_MODE,
+                "people": [],
+                "open_people": [],
+            }
+        )
+    elif group_mode == "large":
+        decision.update(
+            {
+                "group_mode": "large",
+                "orders": [],
+                "open_orders": [],
+                "balance_links": [],
+                "settlement_allocations": [],
+                "unknown_payee_reviewed_entry_ids": [],
+            }
+        )
+    else:
+        decision.update(
+            {
+                "orders": [],
+                "open_orders": [],
+                "balance_links": [],
+                "settlement_allocations": [],
+                "unknown_payee_reviewed_entry_ids": [],
+            }
+        )
     decision["edit_control"] = _new_edit_control(_semantic_fingerprint(decision))
     return decision
 
@@ -613,7 +712,17 @@ def start_run(args: argparse.Namespace) -> dict[str, Any]:
     inputs = [path.resolve() for path in args.inputs]
     for path in inputs:
         core.require(path.exists(), f"input does not exist: {path}")
-    core.require(bool(core.clean_text(args.contains)), "--contains cannot be empty")
+    group_mode = core.clean_text(getattr(args, "mode", "small")).casefold()
+    core.require(
+        group_mode in {"small", "large", finance_materials.GROUP_MODE},
+        "--mode must be small, large, or finance",
+    )
+    contains = (
+        finance_materials.GROUP_NAME_MARKER
+        if group_mode == finance_materials.GROUP_MODE
+        else core.clean_text(getattr(args, "contains", "小额"))
+    )
+    core.require(bool(contains), "--contains cannot be empty")
     zone = ZoneInfo(args.timezone)
     core.require(args.timezone == "Asia/Bangkok", "accounting timezone must be Asia/Bangkok")
     accounting_date = _normalize_accounting_date(getattr(args, "date", None))
@@ -631,6 +740,13 @@ def start_run(args: argparse.Namespace) -> dict[str, Any]:
         accounting_date is None or accounting_from is None,
         "--date cannot be combined with --from or --to",
     )
+    if group_mode == "large":
+        core.require(
+            accounting_date is not None
+            and accounting_from is None
+            and accounting_to is None,
+            "--mode large requires exactly one accounting day via --date",
+        )
     if accounting_from is not None and accounting_to is not None:
         core.require(
             datetime.strptime(accounting_from, "%Y-%m-%d %H:%M")
@@ -652,7 +768,8 @@ def start_run(args: argparse.Namespace) -> dict[str, Any]:
         _line_documents(
             work,
             line_backups,
-            contains=args.contains,
+            contains=contains,
+            group_mode=group_mode,
             timezone_name=args.timezone,
             roster_path=roster_path,
             self_name=args.line_self_name,
@@ -665,12 +782,18 @@ def start_run(args: argparse.Namespace) -> dict[str, Any]:
         _line_android_documents(
             work,
             line_android_backups,
-            contains=args.contains,
+            contains=contains,
+            group_mode=group_mode,
             timezone_name=args.timezone,
             roster_path=roster_path,
         )
     )
-    normalized = _merge_documents(documents, contains=args.contains, timezone_name=args.timezone)
+    normalized = _merge_documents(
+        documents,
+        contains=contains,
+        group_mode=group_mode,
+        timezone_name=args.timezone,
+    )
     if accounting_date is not None:
         normalized = _filter_normalized_date(
             normalized,
@@ -691,7 +814,7 @@ def start_run(args: argparse.Namespace) -> dict[str, Any]:
     group_reports: list[dict[str, Any]] = []
     used_labels: set[str] = set()
     for group in normalized["groups"]:
-        decision = _decision_template(normalized, group)
+        decision = _decision_template(normalized, group, group_mode=group_mode)
         filename = _decision_filename(str(group["group_key"]))
         decision_path = work / "decisions" / filename
         core.atomic_json(decision_path, decision)
@@ -711,13 +834,14 @@ def start_run(args: argparse.Namespace) -> dict[str, Any]:
                 "evidence_media": media_count,
                 "decision_file": f"decisions/{filename}",
                 "edit_mode": EDIT_CONTROL_MODE,
+                "group_mode": group_mode,
             }
         )
     run = {
         "contract_version": RUN_CONTRACT,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "accounting_timezone": args.timezone,
-        "group_name_contains": args.contains,
+        "group_mode": group_mode,
         "status": "reviewing",
         "normalized_source_fingerprint": normalized["source_fingerprint"],
         "snapshot_sha256": core.sha256_file(snapshot_path),
@@ -726,6 +850,10 @@ def start_run(args: argparse.Namespace) -> dict[str, Any]:
         "line_android_backups": [str(path) for path in line_android_backups],
         "groups": group_reports,
     }
+    if group_mode == "large":
+        run["group_name_excludes"] = ["小额出", "财务资料群"]
+    else:
+        run["group_name_contains"] = contains
     if accounting_date is not None:
         run["accounting_date"] = accounting_date
     elif accounting_from is not None and accounting_to is not None:
@@ -798,6 +926,29 @@ def _decision_path(work: Path, run_group: Mapping[str, Any]) -> Path:
 
 
 def _semantic_fingerprint(decision: Mapping[str, Any]) -> str:
+    if decision.get("contract_version") == finance_materials.DECISION_CONTRACT:
+        return core.fingerprint_json(
+            {
+                "reviewed_through": decision.get("reviewed_through"),
+                "read_complete": decision.get("read_complete"),
+                "media_decisions": decision.get("media_decisions"),
+                "people": decision.get("people"),
+                "open_people": decision.get("open_people"),
+            }
+        )
+    if decision.get("contract_version") == large_daily.LEGACY_DECISION_CONTRACT:
+        return core.fingerprint_json(
+            {
+                "reviewed_through": decision.get("reviewed_through"),
+                "read_complete": decision.get("read_complete"),
+                "media_decisions": decision.get("media_decisions"),
+                "exchanges": decision.get("exchanges"),
+                "open_exchanges": decision.get("open_exchanges"),
+                "unknown_payee_reviewed_entry_ids": decision.get(
+                    "unknown_payee_reviewed_entry_ids"
+                ),
+            }
+        )
     return core.fingerprint_json(
         {
             "reviewed_through": decision.get("reviewed_through"),
@@ -812,6 +963,24 @@ def _semantic_fingerprint(decision: Mapping[str, Any]) -> str:
             ),
         }
     )
+
+
+def _open_field_for_decision(decision: Mapping[str, Any]) -> str:
+    contract_version = decision.get("contract_version")
+    if contract_version == finance_materials.DECISION_CONTRACT:
+        return "open_people"
+    if contract_version == large_daily.LEGACY_DECISION_CONTRACT:
+        return "open_exchanges"
+    return "open_orders"
+
+
+def _expected_contracts_for_run_group(run_group: Mapping[str, Any]) -> set[str]:
+    group_mode = core.clean_text(run_group.get("group_mode")).casefold()
+    if group_mode == finance_materials.GROUP_MODE:
+        return {finance_materials.DECISION_CONTRACT}
+    if group_mode == "large":
+        return {large_daily.DECISION_CONTRACT, large_daily.LEGACY_DECISION_CONTRACT}
+    return {DECISION_CONTRACT}
 
 
 def _legacy_semantic_fingerprint_3_1(decision: Mapping[str, Any]) -> str:
@@ -919,6 +1088,12 @@ def _load_review_batch(path: Path) -> dict[str, Any]:
         "balance_links",
         "settlement_allocations",
         "unknown_payee_reviewed_entry_ids",
+        "exchanges",
+        "remove_exchange_ids",
+        "open_exchanges",
+        "people",
+        "remove_person_ids",
+        "open_people",
     }
     unknown = sorted(set(batch) - allowed)
     core.require(
@@ -964,11 +1139,19 @@ def _load_review_batch(path: Path) -> dict[str, Any]:
         )
         page_commit["page_token"] = page_token
         core.require(
-            "open_orders" in batch,
-            "review batch that commits a page must include the complete open_orders list",
+            any(field in batch for field in ("open_orders", "open_exchanges", "open_people")),
+            "review batch that commits a page must include the complete open_orders, "
+            "open_exchanges, or open_people list",
         )
     if "open_orders" in batch:
         core.require(isinstance(batch["open_orders"], list), "review batch open_orders must be a list")
+    if "open_exchanges" in batch:
+        core.require(
+            isinstance(batch["open_exchanges"], list),
+            "review batch open_exchanges must be a list",
+        )
+    if "open_people" in batch:
+        core.require(isinstance(batch["open_people"], list), "review batch open_people must be a list")
     return batch
 
 
@@ -999,6 +1182,131 @@ def _merge_review_batch(
     for label, value in media_updates.items():
         candidate_media[str(label)] = copy.deepcopy(value)
 
+    if candidate.get("contract_version") == finance_materials.DECISION_CONTRACT:
+        incompatible = (
+            "orders",
+            "remove_order_ids",
+            "open_orders",
+            "balance_links",
+            "settlement_allocations",
+            "unknown_payee_reviewed_entry_ids",
+            "exchanges",
+            "remove_exchange_ids",
+            "open_exchanges",
+        )
+        core.require(
+            not any(field in batch for field in incompatible),
+            "finance-material review batches must use people and open_people",
+        )
+        return finance_materials.merge_review_batch(candidate, batch)
+
+    if candidate.get("contract_version") == large_daily.LEGACY_DECISION_CONTRACT:
+        core.require(
+            not any(
+                field in batch
+                for field in (
+                    "orders",
+                    "remove_order_ids",
+                    "open_orders",
+                    "balance_links",
+                    "settlement_allocations",
+                    "people",
+                    "remove_person_ids",
+                    "open_people",
+                )
+            ),
+            "large-group review batches must use exchanges and open_exchanges",
+        )
+        exchange_updates = batch.get("exchanges", [])
+        core.require(
+            isinstance(exchange_updates, list),
+            "review batch exchanges must be a list",
+        )
+        update_ids: list[str] = []
+        for position, exchange in enumerate(exchange_updates):
+            core.require(
+                isinstance(exchange, Mapping),
+                f"review batch exchanges[{position}] must be an object",
+            )
+            exchange_id = core.clean_text(exchange.get("id"))
+            core.require(
+                bool(exchange_id),
+                f"review batch exchanges[{position}].id is required",
+            )
+            update_ids.append(exchange_id)
+        core.require(
+            len(update_ids) == len(set(update_ids)),
+            "review batch exchanges repeats an exchange id",
+        )
+        remove_value = batch.get("remove_exchange_ids", [])
+        core.require(
+            isinstance(remove_value, list),
+            "review batch remove_exchange_ids must be a list",
+        )
+        remove_ids = [str(item) for item in remove_value]
+        core.require(
+            len(remove_ids) == len(set(remove_ids)),
+            "review batch remove_exchange_ids repeats an exchange id",
+        )
+        core.require(
+            not (set(update_ids) & set(remove_ids)),
+            "review batch cannot update and remove the same exchange id",
+        )
+        candidate_exchanges = candidate.get("exchanges")
+        core.require(isinstance(candidate_exchanges, list), "decision exchanges must be a list")
+        existing_ids = {
+            core.clean_text(item.get("id"))
+            for item in candidate_exchanges
+            if isinstance(item, Mapping)
+        }
+        missing_ids = sorted(set(remove_ids) - existing_ids)
+        core.require(
+            not missing_ids,
+            f"review batch removes unknown exchange ids: {missing_ids[:20]}",
+        )
+        if remove_ids:
+            candidate_exchanges[:] = [
+                item
+                for item in candidate_exchanges
+                if not isinstance(item, Mapping)
+                or core.clean_text(item.get("id")) not in set(remove_ids)
+            ]
+        positions = {
+            core.clean_text(item.get("id")): position
+            for position, item in enumerate(candidate_exchanges)
+            if isinstance(item, Mapping)
+        }
+        for exchange in exchange_updates:
+            exchange_id = core.clean_text(exchange.get("id"))
+            replacement = copy.deepcopy(dict(exchange))
+            if exchange_id in positions:
+                candidate_exchanges[positions[exchange_id]] = replacement
+            else:
+                positions[exchange_id] = len(candidate_exchanges)
+                candidate_exchanges.append(replacement)
+        for field in ("open_exchanges", "unknown_payee_reviewed_entry_ids"):
+            if field in batch:
+                core.require(
+                    isinstance(batch[field], list),
+                    f"review batch {field} must be a list",
+                )
+                candidate[field] = copy.deepcopy(batch[field])
+        return candidate
+
+    core.require(
+        not any(
+            field in batch
+            for field in (
+                "exchanges",
+                "remove_exchange_ids",
+                "open_exchanges",
+                "people",
+                "remove_person_ids",
+                "open_people",
+            )
+        ),
+        "order-based review batches must use orders and open_orders",
+    )
     order_updates = batch.get("orders", [])
     core.require(isinstance(order_updates, list), "review batch orders must be a list")
     update_order_ids: list[str] = []
@@ -1411,6 +1719,7 @@ def _validate_open_orders(
     *,
     reviewed_through: int,
     require_complete: bool,
+    require_fund_type: bool = False,
 ) -> int:
     open_orders = decision.get("open_orders")
     core.require(isinstance(open_orders, list), "open_orders must be a list")
@@ -1444,6 +1753,8 @@ def _validate_open_orders(
         "summary",
         "unresolved",
     }
+    if require_fund_type:
+        allowed_fields.add("fund_type")
     for position, item in enumerate(open_orders):
         field = f"open_orders[{position}]"
         core.require(isinstance(item, dict), f"{field} must be an object")
@@ -1501,6 +1812,11 @@ def _validate_open_orders(
             f"{field}.source_messages must include every media source message",
         )
         item["media_labels"] = media_labels
+
+        if "fund_type" in item:
+            item["fund_type"] = large_daily.normalize_fund_type(
+                item.get("fund_type"), field=f"{field}.fund_type"
+            )
 
         if "customer_nickname" in item:
             item["customer_nickname"] = core.clean_text(item.get("customer_nickname"))
@@ -1599,7 +1915,252 @@ def _order_continuity_review_candidates(
     return candidates
 
 
-def _validate_decision(
+def _validate_open_exchanges(
+    group: Mapping[str, Any],
+    decision: dict[str, Any],
+    *,
+    reviewed_through: int,
+    require_complete: bool,
+) -> int:
+    open_exchanges = decision.get("open_exchanges")
+    core.require(isinstance(open_exchanges, list), "open_exchanges must be a list")
+    if require_complete:
+        core.require(
+            not open_exchanges,
+            "open_exchanges must be resolved or discarded before seal",
+        )
+    _, message_by_label = _message_labels(group)
+    positions = {
+        label: position for position, label in enumerate(message_by_label, start=1)
+    }
+    seen_ids: set[str] = set()
+    allowed_fields = {
+        "id",
+        "start_message",
+        "source_messages",
+        "fund_type",
+        "direction",
+        "rate",
+        "operator",
+        "summary",
+        "unresolved",
+    }
+    for position, item in enumerate(open_exchanges):
+        field = f"open_exchanges[{position}]"
+        core.require(isinstance(item, dict), f"{field} must be an object")
+        unknown = sorted(set(item) - allowed_fields)
+        core.require(not unknown, f"{field}: unsupported fields: {', '.join(unknown)}")
+        exchange_id = core.clean_text(item.get("id"))
+        core.require(bool(exchange_id), f"{field}.id is required")
+        core.require(exchange_id not in seen_ids, f"open_exchanges repeats id {exchange_id}")
+        seen_ids.add(exchange_id)
+        item["id"] = exchange_id
+        start_message = core.clean_text(item.get("start_message"))
+        core.require(start_message in positions, f"{field}.start_message is unknown")
+        source_value = item.get("source_messages")
+        core.require(
+            isinstance(source_value, list) and source_value,
+            f"{field}.source_messages must be a non-empty list",
+        )
+        source_messages = [str(value) for value in source_value]
+        core.require(
+            len(source_messages) == len(set(source_messages)),
+            f"{field}.source_messages repeats a label",
+        )
+        core.require(
+            start_message in source_messages and set(source_messages) <= set(positions),
+            f"{field}.source_messages must contain valid labels including start_message",
+        )
+        core.require(
+            all(positions[label] <= reviewed_through for label in source_messages),
+            f"{field}.source_messages cannot cite an uncommitted page",
+        )
+        item["start_message"] = start_message
+        item["source_messages"] = source_messages
+        if "fund_type" in item:
+            fund_type = core.clean_text(item.get("fund_type")).casefold()
+            core.require(fund_type in large_daily.FUND_TYPES, f"{field}.fund_type is unsupported")
+            item["fund_type"] = fund_type
+        if core.clean_text(item.get("direction")):
+            item["direction"] = core.canonical_direction(
+                item.get("direction"), field=f"{field}.direction"
+            )
+        rate_text = core.clean_text(item.get("rate"))
+        operator = core.clean_text(item.get("operator")).casefold()
+        if rate_text:
+            rate = core.parse_decimal(rate_text, field=f"{field}.rate")
+            core.require(rate is not None and rate > 0, f"{field}.rate must be positive")
+            core.require(
+                operator in large_daily.RATE_OPERATORS,
+                f"{field}.operator is required with rate",
+            )
+            item["rate"] = core.decimal_text(rate)
+            item["operator"] = operator
+        else:
+            core.require(not operator, f"{field}.operator requires rate")
+            item.pop("rate", None)
+            item.pop("operator", None)
+        summary = core.clean_text(item.get("summary"))
+        core.require(bool(summary), f"{field}.summary is required")
+        item["summary"] = summary
+        unresolved_value = item.get("unresolved")
+        core.require(
+            isinstance(unresolved_value, list) and unresolved_value,
+            f"{field}.unresolved must explain why the exchange is still open",
+        )
+        unresolved = [core.clean_text(value) for value in unresolved_value]
+        core.require(all(unresolved), f"{field}.unresolved cannot contain blank items")
+        item["unresolved"] = unresolved
+    return len(open_exchanges)
+
+
+def _validate_large_media_decisions(
+    group: Mapping[str, Any],
+    decision: dict[str, Any],
+    *,
+    require_complete: bool,
+    capture_hashes: bool,
+) -> tuple[dict[str, Any], set[str], set[str]]:
+    inventory = _media_inventory(group)
+    label_by_message_id, message_by_label = _message_labels(group)
+    message_labels = set(message_by_label)
+    available = {
+        label
+        for label, (_, media) in inventory.items()
+        if media.get("availability") == "available"
+    }
+    missing = set(inventory) - available
+    media_decisions = decision.get("media_decisions")
+    core.require(
+        isinstance(media_decisions, dict),
+        "media_decisions must be an object keyed by M labels",
+    )
+    unknown_labels = sorted(set(media_decisions) - available)
+    core.require(
+        not unknown_labels,
+        f"media decisions contain missing or unknown labels: {unknown_labels[:10]}",
+    )
+    if require_complete:
+        unclassified = sorted(available - set(media_decisions))
+        core.require(not unclassified, f"unclassified available media: {unclassified[:20]}")
+
+    entry_ids: set[str] = set()
+    completed_entry_ids: set[str] = set()
+    transfer_payees = 0
+    unknown_payees: set[str] = set()
+    unreadable_payees: set[str] = set()
+    reference_count = 0
+    fund_media_count = 0
+    for label, raw in media_decisions.items():
+        field = f"{group.get('group_key')}.media_decisions.{label}"
+        core.require(isinstance(raw, dict), f"{field} must be an object")
+        classification = core.clean_text(raw.get("classification")).casefold()
+        core.require(
+            classification in {"reference", "fund"},
+            f"{field}.classification must be reference or fund",
+        )
+        if classification == "reference":
+            unknown = sorted(set(raw) - {"classification", "note"})
+            core.require(not unknown, f"{field}: reference has unsupported fields: {', '.join(unknown)}")
+            reference_count += 1
+            continue
+        unknown = sorted(
+            set(raw)
+            - {"classification", "viewed_original", "evidence_sha256", "entries", "note"}
+        )
+        core.require(not unknown, f"{field}: fund decision has unsupported fields: {', '.join(unknown)}")
+        core.require(
+            raw.get("viewed_original") is True,
+            f"{field}: open the original image before recording fund facts",
+        )
+        entries = raw.get("entries")
+        core.require(
+            isinstance(entries, list) and entries,
+            f"{field}.entries must contain at least one fund entry",
+        )
+        message, media = inventory[label]
+        media_path = Path(str(media.get("path") or ""))
+        core.require(media_path.is_file(), f"{field}: original media file is unavailable: {media_path}")
+        actual_hash = core.sha256_file(media_path)
+        recorded_hash = core.clean_text(raw.get("evidence_sha256"))
+        if recorded_hash:
+            core.require(recorded_hash == actual_hash, f"{field}: original fund evidence changed after review")
+        elif capture_hashes:
+            raw["evidence_sha256"] = actual_hash
+        elif require_complete:
+            raise ValueError(f"{field}: evidence hash has not been captured; run review seal")
+        source_message_label = label_by_message_id[str(message.get("message_id") or "")]
+        for entry_position, entry in enumerate(entries, start=1):
+            core.require(
+                isinstance(entry, dict),
+                f"{field}.entries[{entry_position - 1}] must be an object",
+            )
+            _validate_entry(
+                entry,
+                field=f"{field}.entries[{entry_position - 1}]",
+                sender_role=core.clean_text(message.get("role")),
+                source_message_label=source_message_label,
+                message_labels=message_labels,
+            )
+            entry_id = f"{label}.{entry_position}"
+            entry_ids.add(entry_id)
+            if entry["result"] == "completed":
+                completed_entry_ids.add(entry_id)
+            if entry["kind"] == "transfer" and entry["result"] == "completed":
+                transfer_payees += 1
+                if entry["payee"] in core.UNKNOWN_PAYEES:
+                    unknown_payees.add(entry_id)
+                if entry.get("payee_state") == "unreadable":
+                    unreadable_payees.add(entry_id)
+        fund_media_count += 1
+
+    reviewed_value = decision.get("unknown_payee_reviewed_entry_ids", [])
+    core.require(
+        isinstance(reviewed_value, list),
+        "unknown_payee_reviewed_entry_ids must be a list",
+    )
+    reviewed = [str(item) for item in reviewed_value]
+    core.require(
+        len(reviewed) == len(set(reviewed)),
+        "unknown_payee_reviewed_entry_ids repeats an entry",
+    )
+    core.require(
+        set(reviewed) <= unknown_payees,
+        "unknown_payee_reviewed_entry_ids may only cite unknown transfer payees",
+    )
+    unreviewed = unreadable_payees - set(reviewed)
+    if require_complete:
+        core.require(
+            not unreviewed,
+            f"unreadable payee review is required: {sorted(unreviewed)[:40]}",
+        )
+    warning = (
+        transfer_payees >= UNKNOWN_PAYEE_WARNING_MIN_TRANSFERS
+        and len(unknown_payees) * 2 > transfer_payees
+    )
+    return (
+        {
+            "available_media": len(available),
+            "missing_media": len(missing),
+            "classified_media": len(media_decisions),
+            "reference_media": reference_count,
+            "fund_media": fund_media_count,
+            "fund_entries": len(entry_ids),
+            "excluded_failed_or_incomplete_fund_entries": len(
+                entry_ids - completed_entry_ids
+            ),
+            "transfer_payees": transfer_payees,
+            "unknown_payees": len(unknown_payees),
+            "unknown_payee_warning": int(warning),
+            "unknown_payee_review_required": int(bool(unreadable_payees)),
+            "unreviewed_unknown_payees": len(unreviewed),
+        },
+        entry_ids,
+        completed_entry_ids,
+    )
+
+
+def _validate_large_decision(
     normalized: Mapping[str, Any],
     group: Mapping[str, Any],
     decision: dict[str, Any],
@@ -1607,11 +2168,11 @@ def _validate_decision(
     require_complete: bool,
     capture_hashes: bool,
 ) -> dict[str, Any]:
-    expected = _decision_template(normalized, group)
-    decision_contract = core.clean_text(decision.get("contract_version"))
+    expected = _decision_template(normalized, group, group_mode="large")
     core.require(
-        decision_contract == DECISION_CONTRACT,
-        f"unsupported decision contract; expected {DECISION_CONTRACT}",
+        decision.get("contract_version") == large_daily.LEGACY_DECISION_CONTRACT,
+        "unsupported legacy large decision contract; expected "
+        f"{large_daily.LEGACY_DECISION_CONTRACT}",
     )
     for field in (
         "normalized_source_fingerprint",
@@ -1621,7 +2182,115 @@ def _validate_decision(
         "platform",
         "message_count",
         "evidence_media_count",
+        "group_mode",
     ):
+        core.require(
+            decision.get(field) == expected.get(field),
+            f"{group.get('group_key')}: generated {field} was edited",
+        )
+    messages = list(group.get("messages", []))
+    reviewed_through = decision.get("reviewed_through")
+    core.require(
+        isinstance(reviewed_through, int) and 0 <= reviewed_through <= len(messages),
+        "invalid reviewed_through",
+    )
+    core.require(isinstance(decision.get("read_complete"), bool), "read_complete must be boolean")
+    core.require(
+        decision.get("read_complete") is (reviewed_through == len(messages)),
+        "read_complete must exactly match reviewed_through",
+    )
+    if require_complete:
+        core.require(
+            decision.get("read_complete") is True,
+            "group chronology has not been read completely",
+        )
+    open_count = _validate_open_exchanges(
+        group,
+        decision,
+        reviewed_through=reviewed_through,
+        require_complete=require_complete,
+    )
+    media_statistics, entry_ids, completed_entry_ids = _validate_large_media_decisions(
+        group,
+        decision,
+        require_complete=require_complete,
+        capture_hashes=capture_hashes,
+    )
+    _, message_by_label = _message_labels(group)
+    exchange_statistics = large_daily.validate_exchanges(
+        decision.get("exchanges"),
+        group_key=str(group.get("group_key") or ""),
+        message_labels=set(message_by_label),
+        fund_entry_ids=completed_entry_ids,
+    )
+    if require_complete:
+        core.require(
+            exchange_statistics["unassigned_exchange_entries"] == 0,
+            "fund entries must be explicitly assigned to an exchange",
+        )
+    return {
+        **media_statistics,
+        **exchange_statistics,
+        "open_exchanges": open_count,
+        "unassigned_entries": exchange_statistics["unassigned_exchange_entries"],
+    }
+
+
+def _validate_decision(
+    normalized: Mapping[str, Any],
+    group: Mapping[str, Any],
+    decision: dict[str, Any],
+    *,
+    require_complete: bool,
+    capture_hashes: bool,
+) -> dict[str, Any]:
+    if decision.get("contract_version") == finance_materials.DECISION_CONTRACT:
+        expected = _decision_template(
+            normalized,
+            group,
+            group_mode=finance_materials.GROUP_MODE,
+        )
+        return finance_materials.validate_decision(
+            normalized,
+            group,
+            decision,
+            expected,
+            require_complete=require_complete,
+            capture_hashes=capture_hashes,
+        )
+    if decision.get("contract_version") == large_daily.LEGACY_DECISION_CONTRACT:
+        return _validate_large_decision(
+            normalized,
+            group,
+            decision,
+            require_complete=require_complete,
+            capture_hashes=capture_hashes,
+        )
+    decision_contract = core.clean_text(decision.get("contract_version"))
+    large_order_mode = decision_contract == large_daily.DECISION_CONTRACT
+    expected_contract = large_daily.DECISION_CONTRACT if large_order_mode else DECISION_CONTRACT
+    expected = _decision_template(
+        normalized,
+        group,
+        group_mode="large" if large_order_mode else "small",
+    )
+    core.require(
+        decision_contract == expected_contract,
+        "unsupported decision contract; expected "
+        f"{DECISION_CONTRACT} or {large_daily.DECISION_CONTRACT}",
+    )
+    generated_fields = [
+        "normalized_source_fingerprint",
+        "group_fingerprint",
+        "group_key",
+        "group_name",
+        "platform",
+        "message_count",
+        "evidence_media_count",
+    ]
+    if large_order_mode:
+        generated_fields.append("group_mode")
+    for field in generated_fields:
         core.require(decision.get(field) == expected.get(field), f"{group.get('group_key')}: generated {field} was edited")
     messages = list(group.get("messages", []))
     reviewed_through = decision.get("reviewed_through")
@@ -1638,6 +2307,7 @@ def _validate_decision(
         decision,
         reviewed_through=reviewed_through,
         require_complete=require_complete,
+        require_fund_type=large_order_mode,
     )
 
     inventory = _media_inventory(group)
@@ -1768,11 +2438,17 @@ def _validate_decision(
         "same_transactions",
         "legs",
     }
+    if large_order_mode:
+        order_fields.add("fund_type")
     for position, order in enumerate(orders):
         field = f"{group.get('group_key')}.orders[{position}]"
         core.require(isinstance(order, dict), f"{field} must be an object")
         unknown = sorted(set(order) - order_fields)
         core.require(not unknown, f"{field}: unsupported fields: {', '.join(unknown)}")
+        if large_order_mode:
+            order["fund_type"] = large_daily.normalize_fund_type(
+                order.get("fund_type"), field=f"{field}.fund_type"
+            )
         for required_field in ("customer_nickname", "direction"):
             core.require(
                 required_field in order,
@@ -2487,7 +3163,8 @@ def _review_page_result(
     end: int,
     group_fingerprint: str,
     semantic_fingerprint: str,
-    open_orders: list[Any],
+    open_field: str,
+    open_records: list[Any],
     carry_messages: list[dict[str, Any]],
 ) -> dict[str, Any]:
     messages = list(group.get("messages", []))
@@ -2504,7 +3181,7 @@ def _review_page_result(
         if start < end
         else None
     )
-    return {
+    result = {
         "contract_version": REVIEW_PAGE_CONTRACT,
         "group_key": group_key,
         "run_label": run_group.get("run_label"),
@@ -2517,12 +3194,13 @@ def _review_page_result(
         "page_reaches_group_end": end == len(messages),
         "done": bool(decision.get("read_complete")),
         "commit_required": start < end,
-        "open_orders": open_orders,
         "carry_messages": carry_messages,
         "controlled_editing": _controlled_editing(run_group),
         "page_token": page_token,
         "semantic_fingerprint": semantic_fingerprint,
     }
+    result[open_field] = open_records
+    return result
 
 
 RISK_DIAGNOSTIC_FIELDS = (
@@ -2537,6 +3215,8 @@ RISK_DIAGNOSTIC_FIELDS = (
     "unassigned_entries",
     "unknown_payees",
     "unknown_payee_warning",
+    "pending_people",
+    "unassigned_material_media",
 )
 RISK_FLAG_FIELDS = (
     "blank_direction_orders",
@@ -2547,6 +3227,8 @@ RISK_FLAG_FIELDS = (
     "order_continuity_review_candidate_count",
     "unassigned_entries",
     "unknown_payee_warning",
+    "pending_people",
+    "unassigned_material_media",
 )
 
 
@@ -2653,8 +3335,8 @@ def review_command(args: argparse.Namespace) -> dict[str, Any]:
                 if isinstance(control, Mapping)
                 else ""
             )
-            reports.append(
-                {
+            open_field = _open_field_for_decision(decision)
+            report = {
                     "group_key": run_group.get("group_key"),
                     "run_label": run_group.get("run_label"),
                     "reviewed_through": decision.get("reviewed_through"),
@@ -2662,7 +3344,6 @@ def review_command(args: argparse.Namespace) -> dict[str, Any]:
                     "message_count": decision.get("message_count"),
                     "classified_media": len(decision.get("media_decisions", {})),
                     "evidence_media_count": decision.get("evidence_media_count"),
-                    "open_orders": copy.deepcopy(decision.get("open_orders", [])),
                     "sealed": bool(decision.get("sealed")),
                     "controlled_editing": _controlled_editing(run_group),
                     "semantic_fingerprint": semantic_fingerprint,
@@ -2671,7 +3352,8 @@ def review_command(args: argparse.Namespace) -> dict[str, Any]:
                         and approved_fingerprint != semantic_fingerprint
                     ),
                 }
-            )
+            report[open_field] = copy.deepcopy(decision.get(open_field, []))
+            reports.append(report)
         return {"groups": reports}
 
     if args.review_action == "audit":
@@ -2739,6 +3421,23 @@ def review_command(args: argparse.Namespace) -> dict[str, Any]:
             _require_controlled_semantics(run_group, decision)
         current_fingerprint = _semantic_fingerprint(decision)
         batch = _load_review_batch(args.input.resolve())
+        expected_open_field = _open_field_for_decision(decision)
+        other_open_fields = {
+            "open_orders",
+            "open_exchanges",
+            "open_people",
+        } - {expected_open_field}
+        if batch.get("page_commit") is not None:
+            core.require(
+                expected_open_field in batch,
+                f"page commit for this group must include {expected_open_field}",
+            )
+            supplied_other_open_fields = sorted(other_open_fields & set(batch))
+            core.require(
+                not supplied_other_open_fields,
+                "page commit for this group cannot include "
+                + ", ".join(supplied_other_open_fields),
+            )
         input_fingerprint = core.fingerprint_json(batch)
         control = decision.get("edit_control")
         last_batch = (
@@ -2836,9 +3535,11 @@ def review_command(args: argparse.Namespace) -> dict[str, Any]:
         }
 
     if args.review_action == "next":
+        expected_contracts = _expected_contracts_for_run_group(run_group)
         core.require(
-            decision.get("contract_version") == DECISION_CONTRACT,
-            f"review next requires {DECISION_CONTRACT}; start a fresh work directory for the new safe paging protocol",
+            decision.get("contract_version") in expected_contracts,
+            "review next decision contract does not match this run; "
+            "start a fresh work directory for this paging protocol",
         )
         core.require(
             _require_controlled_semantics(run_group, decision),
@@ -2856,8 +3557,9 @@ def review_command(args: argparse.Namespace) -> dict[str, Any]:
         maximum_end = min(start + maximum_count, len(messages))
         group_fingerprint = core.fingerprint_json(group)
         semantic_fingerprint = _semantic_fingerprint(decision)
-        open_orders = copy.deepcopy(decision.get("open_orders", []))
-        carry_messages = _open_order_carry_messages(group, open_orders)
+        open_field = _open_field_for_decision(decision)
+        open_records = copy.deepcopy(decision.get(open_field, []))
+        carry_messages = _open_order_carry_messages(group, open_records)
 
         def build_page(end: int) -> dict[str, Any]:
             return _review_page_result(
@@ -2869,7 +3571,8 @@ def review_command(args: argparse.Namespace) -> dict[str, Any]:
                 end=end,
                 group_fingerprint=group_fingerprint,
                 semantic_fingerprint=semantic_fingerprint,
-                open_orders=open_orders,
+                open_field=open_field,
+                open_records=open_records,
                 carry_messages=carry_messages,
             )
 
@@ -3105,6 +3808,8 @@ def _compile_decisions_v3(
                 "direction",
             ):
                 order[field] = copy.deepcopy(raw.get(field))
+            if raw.get("fund_type") not in (None, ""):
+                order["fund_type"] = copy.deepcopy(raw.get("fund_type"))
             for field in ("note",):
                 if raw.get(field) not in (None, ""):
                     order[field] = copy.deepcopy(raw[field])
@@ -3215,6 +3920,108 @@ def finish_run(args: argparse.Namespace) -> dict[str, Any]:
             }
         )
 
+    group_mode = core.clean_text(run.get("group_mode")).casefold()
+    finance_run = group_mode == finance_materials.GROUP_MODE
+    large_run = group_mode == "large"
+    decision_contracts = {
+        core.clean_text(decision.get("contract_version"))
+        for decision in decisions.values()
+    }
+    if finance_run:
+        core.require(
+            decision_contracts == {finance_materials.DECISION_CONTRACT},
+            "finance-material decisions must all use the supported finance contract",
+        )
+        ledger, ledger_statistics = finance_materials.compile_ledger(normalized, decisions)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="finish-", dir=work) as temporary_name:
+            temporary = Path(temporary_name)
+            ledger_path = temporary / "finance_materials.json"
+            workbook_path = temporary / "workbook.xlsx"
+            core.atomic_json(ledger_path, ledger)
+            workbook = finance_materials.build_workbook(ledger)
+            workbook.save(workbook_path)
+            workbook.close()
+            errors = finance_materials.check_workbook(workbook_path, ledger)
+            core.require(
+                not errors,
+                "finance-material workbook verification failed: " + "; ".join(errors[:10]),
+            )
+            workbook_path.replace(output)
+        run["status"] = "finished"
+        run["finished_at"] = datetime.now(timezone.utc).isoformat()
+        run["output"] = str(output)
+        core.atomic_json(_run_path(work), run)
+        return {
+            "output": str(output),
+            **ledger_statistics,
+            "material_images": sum(
+                int(item.get("document_media") or 0)
+                + int(item.get("profile_media") or 0)
+                for item in review_statistics.values()
+            ),
+            "missing_media": sum(
+                int(item.get("missing_media") or 0)
+                for item in review_statistics.values()
+            ),
+            "risk_report": _review_risk_summary(finish_risk_reports),
+        }
+    if large_run:
+        core.require(
+            len(decision_contracts) == 1
+            and decision_contracts
+            <= {
+                large_daily.DECISION_CONTRACT,
+                large_daily.LEGACY_DECISION_CONTRACT,
+            },
+            "large-group decisions must all use the same supported contract",
+        )
+
+    if large_run and decision_contracts == {large_daily.LEGACY_DECISION_CONTRACT}:
+        accounting_date = core.clean_text(run.get("accounting_date"))
+        core.require(
+            bool(accounting_date),
+            "large-group runs require one accounting date",
+        )
+        ledger, ledger_statistics = large_daily.compile_daily_ledger(
+            normalized,
+            decisions,
+            accounting_date=accounting_date,
+        )
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="finish-", dir=work) as temporary_name:
+            temporary = Path(temporary_name)
+            ledger_path = temporary / "large_daily.json"
+            workbook_path = temporary / "workbook.xlsx"
+            core.atomic_json(ledger_path, ledger)
+            workbook = build_workbook.build_large_workbook(
+                build_workbook.validate_large_daily(ledger),
+                args.template.resolve(),
+            )
+            workbook.save(workbook_path)
+            workbook.close()
+            errors = check_workbook.check(workbook_path, ledger_path)
+            core.require(
+                not errors,
+                "workbook verification failed: " + "; ".join(errors[:10]),
+            )
+            workbook_path.replace(output)
+        run["status"] = "finished"
+        run["finished_at"] = datetime.now(timezone.utc).isoformat()
+        run["output"] = str(output)
+        core.atomic_json(_run_path(work), run)
+        return {
+            "output": str(output),
+            "groups": ledger_statistics["groups"],
+            "exchanges": ledger_statistics["exchanges"],
+            "summary_rows": ledger_statistics["summary_rows"],
+            "fund_entries": sum(
+                int(item.get("fund_entries") or 0)
+                for item in review_statistics.values()
+            ),
+            "risk_report": _review_risk_summary(finish_risk_reports),
+        }
+
     events, plan = _compile_decisions_v3(normalized, decisions)
     events_fingerprint = core.fingerprint_json(events)
     core.require(plan["events_fingerprint"] == events_fingerprint, "internal events fingerprint mismatch")
@@ -3224,15 +4031,31 @@ def finish_run(args: argparse.Namespace) -> dict[str, Any]:
         events_fingerprint,
         plan,
     )
+    large_daily_statistics: dict[str, int] | None = None
+    if large_run:
+        accounting_date = core.clean_text(run.get("accounting_date"))
+        core.require(bool(accounting_date), "large-group runs require one accounting date")
+        orders, large_daily_statistics = large_daily.compile_order_daily_ledger(
+            orders,
+            accounting_date=accounting_date,
+        )
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="finish-", dir=work) as temporary_name:
         temporary = Path(temporary_name)
         orders_path = temporary / "orders.json"
         workbook_path = temporary / "workbook.xlsx"
         core.atomic_json(orders_path, orders)
-        workbook = build_workbook.build_workbook(
-            build_workbook.validate_orders(orders),
-            args.template.resolve(),
+        validated_groups = build_workbook.validate_orders(orders)
+        workbook = (
+            build_workbook.build_large_order_workbook(
+                validated_groups,
+                args.template.resolve(),
+            )
+            if large_run
+            else build_workbook.build_workbook(
+                validated_groups,
+                args.template.resolve(),
+            )
         )
         workbook.save(workbook_path)
         workbook.close()
@@ -3244,7 +4067,7 @@ def finish_run(args: argparse.Namespace) -> dict[str, Any]:
     run["finished_at"] = datetime.now(timezone.utc).isoformat()
     run["output"] = str(output)
     core.atomic_json(_run_path(work), run)
-    return {
+    result = {
         "output": str(output),
         "groups": ledger_statistics["groups"],
         "orders": ledger_statistics["orders"],
@@ -3253,6 +4076,12 @@ def finish_run(args: argparse.Namespace) -> dict[str, Any]:
         "warnings": ledger_statistics["warnings"],
         "risk_report": _review_risk_summary(finish_risk_reports),
     }
+    if large_run:
+        assert large_daily_statistics is not None
+        result["groups"] = large_daily_statistics["groups"]
+        result["orders"] = large_daily_statistics["orders"]
+        result["summary_rows"] = large_daily_statistics["summary_rows"]
+    return result
 
 
 def main(argv: list[str] | None = None) -> int:

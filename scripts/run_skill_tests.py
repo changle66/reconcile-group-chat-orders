@@ -13,6 +13,7 @@ from collections.abc import Iterable
 TEST_MODULES = (
     "test_reconcile",
     "test_line_android_miui",
+    "test_finance_materials",
     "test_simple_ledger",
 )
 
@@ -25,6 +26,9 @@ CURRENT_TEST_IDS = frozenset(
         "test_reconcile.ReconcileWorkflowTests.test_apply_batch_atomically_updates_a_controlled_decision",
         "test_reconcile.ReconcileWorkflowTests.test_controlled_decision_rejects_direct_semantic_overwrite",
         "test_reconcile.ReconcileWorkflowTests.test_invalid_apply_batch_does_not_partially_write_the_decision",
+        "test_reconcile.ReconcileWorkflowTests.test_large_group_finish_writes_daily_records_and_rate_grouped_totals",
+        "test_reconcile.ReconcileWorkflowTests.test_large_group_multiple_fund_images_compile_to_one_full_order",
+        "test_reconcile.ReconcileWorkflowTests.test_large_group_review_uses_full_order_contract",
         "test_reconcile.ReconcileWorkflowTests.test_order_continuity_risk_flags_split_without_mutating_or_blocking",
         "test_reconcile.ReconcileWorkflowTests.test_order_continuity_risk_ignores_correctly_merged_order",
         "test_reconcile.ReconcileWorkflowTests.test_order_continuity_risk_ignores_two_complete_independent_orders",
@@ -34,6 +38,8 @@ CURRENT_TEST_IDS = frozenset(
         "test_reconcile.ReconcileWorkflowTests.test_review_next_default_returns_largest_complete_page_within_budget",
         "test_reconcile.ReconcileWorkflowTests.test_review_next_is_read_only_until_page_commit",
         "test_reconcile.ReconcileWorkflowTests.test_start_date_filters_messages_by_bangkok_calendar_day",
+        "test_reconcile.ReconcileWorkflowTests.test_start_large_mode_requires_one_accounting_date",
+        "test_reconcile.ReconcileWorkflowTests.test_start_large_mode_selects_every_group_except_small_and_finance",
         "test_reconcile.ReconcileWorkflowTests.test_start_rejects_invalid_date_before_creating_work_directory",
         "test_reconcile.ReconcileWorkflowTests.test_start_rejects_invalid_time_window_before_creating_work_directory",
         "test_reconcile.ReconcileWorkflowTests.test_start_seal_and_finish_publish_only_the_workbook",
@@ -41,17 +47,23 @@ CURRENT_TEST_IDS = frozenset(
         "test_reconcile.ReconcileWorkflowTests.test_upgrade_checkpoints_preserves_legacy_decisions_but_resets_read_progress",
         "test_line_android_miui.LineAndroidMiuiTests.test_compressed_backup_is_rejected_clearly",
         "test_line_android_miui.LineAndroidMiuiTests.test_start_discovers_and_normalizes_miui_backup",
+        "test_line_android_miui.LineAndroidMiuiTests.test_start_finance_mode_selects_finance_miui_group",
+        "test_line_android_miui.LineAndroidMiuiTests.test_start_large_mode_selects_nonexcluded_miui_groups",
     }
 )
 
-CURRENT_TEST_PREFIXES = ("test_simple_ledger.SimpleLedgerTests.",)
+CURRENT_TEST_PREFIXES = (
+    "test_finance_materials.FinanceMaterialsTests.",
+    "test_simple_ledger.SimpleLedgerTests.",
+)
 COMPATIBILITY_TEST_IDS = frozenset(
     {
+        "test_reconcile.ReconcileWorkflowTests.test_legacy_large_exchange_contract_still_finishes",
         "test_simple_ledger.SimpleLedgerTests.test_legacy_simple_plan_contract_remains_supported",
     }
 )
 
-EXPECTED_ALL_TESTS = 102
+EXPECTED_ALL_TESTS = 115
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

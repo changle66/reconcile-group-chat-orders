@@ -12,6 +12,20 @@
 python scripts/reconcile.py start <原始导出根目录> --line-backup <LINE备份目录> --work <全新工作目录> --contains 小额
 ```
 
+大额群单日任务改用：
+
+```powershell
+python scripts/reconcile.py start <原始导出根目录> --line-backup <LINE备份目录> --work <全新工作目录> --mode large --date YYYY-MM-DD
+```
+
+财务资料模式继续使用同一个 `Manifest.db` 读取器，只筛选实际群名包含 `财务资料群` 的群：
+
+```powershell
+python scripts/reconcile.py start <原始导出根目录> --line-backup <LINE备份目录> --work <全新工作目录> --mode finance
+```
+
+大额模式从备份读取全部群，再统一排除群名包含 `小额出` 或 `财务资料群` 的群。
+
 统一流程按 LINE 数据库中解析出的实际群名筛选，不把显示名相同的 Telegram、WhatsApp 或 LINE 群混在
 一起。新任务不要先运行旧提取脚本再拼接 normalized 文件，也不要使用 `--force` 覆盖历史输出。
 
@@ -38,6 +52,7 @@ python scripts/extract_line_ios.py <backup> --list-groups
 - 优先使用完整 attachment；只有缩略图时保留缩略图；两者都没有则标记 `availability=missing`。
 - `start` 可以把 LINE 媒体复制到本次工作目录，以保证路径稳定，但提取时不逐张计算媒体 SHA-256。
 - LINE 数据库、`Manifest.db` 等来源文件在 `start` 时计入本次来源指纹。
-- 只有审阅后判为 `fund` 的原图在 `review check/seal` 时计算证据哈希，`finish` 再核对；参考图片不哈希。
+- 订单模式只有审阅后判为 `fund` 的原图在 `review check/seal` 时计算证据哈希；财务资料模式对判为
+  `document` 或 `chat_profile` 的原图采用相同保护。`finish` 再核对；参考图片不哈希。
 - 语音、视频、贴纸、表情包和动图不作为资金证据，不需要 OCR 或转录。
 - 缺失图片不能用相邻聊天金额、公式或旧表格反推。脚本会把它保留为可见的待确认记录。

@@ -18,6 +18,20 @@ python scripts/reconcile.py start <MIUI备份目录> --work <全新工作目录>
 python scripts/reconcile.py start <原始导出根目录> --line-android-backup <目录或.bak> --work <全新工作目录> --contains 小额
 ```
 
+大额群单日任务改用：
+
+```powershell
+python scripts/reconcile.py start <原始导出根目录> --line-android-backup <目录或.bak> --work <全新工作目录> --mode large --date YYYY-MM-DD
+```
+
+财务资料模式直接使用同一 MIUI 备份，只筛选实际群名包含 `财务资料群` 的群：
+
+```powershell
+python scripts/reconcile.py start <原始导出根目录> --line-android-backup <目录或.bak> --work <全新工作目录> --mode finance
+```
+
+大额模式从备份读取全部群，再统一排除群名包含 `小额出` 或 `财务资料群` 的群。
+
 需要诊断备份内容时，只读列群：
 
 ```powershell

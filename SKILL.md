@@ -2,18 +2,33 @@
 name: reconcile-group-chat-orders
 description: >-
   从 Telegram、WhatsApp 或 LINE 群聊及备份核对换汇订单：客户发出的资金图默认是付款，内部人员发出的资金图
-  默认是回款；模型判断订单边界、客户、换汇方向、群聊采用的汇率和少量异常，脚本生成每群一张分表的 Excel。
+  默认是回款；小额群和大额群都按完整订单记录客户、资金流水、收款方、方向、汇率、应回依据和异常，
+  大额群另按单日汇总资金类型、方向、精确汇率和金额；独立财务资料模式从名称含“财务资料群”的群聊提取
+  护照等身份证件及聊天平台账号资料，按人去重合并并保留原图。脚本按实际群生成每群一张分表的 Excel。
   适用于全新处理、继续同一次中断任务或从已封存判定重新生成工作簿；不从旧台账反推聊天事实。
 ---
 
 # 群聊订单核对
 
-开始前完整读取 [references/simple-mode.md](references/simple-mode.md)。只有出现拆分、多单合并回款、退款、追回、
-重复凭证或跨单补抵时，才读取 [references/advanced-relations.md](references/advanced-relations.md)。涉及 LINE 原始
-iOS 备份时读取 [references/line-ios.md](references/line-ios.md)；涉及小米/MIUI LINE Android 应用备份时读取
-[references/line-android-miui.md](references/line-android-miui.md)。
+处理小额群前完整读取 [references/simple-mode.md](references/simple-mode.md)；处理大额群前依次完整读取
+[references/simple-mode.md](references/simple-mode.md)和[references/large-mode.md](references/large-mode.md)；处理
+财务资料群前完整读取 [references/finance-materials.md](references/finance-materials.md)。订单模式出现拆分、多单合并
+回款、退款、追回、重复凭证或跨单补抵时，才读取 [references/advanced-relations.md](references/advanced-relations.md)。
+涉及 LINE 原始 iOS 备份时读取 [references/line-ios.md](references/line-ios.md)；涉及小米/MIUI LINE Android 应用备份
+时读取 [references/line-android-miui.md](references/line-android-miui.md)。
 
-## 核心口径
+## 群模式
+
+- 默认小额模式保持原流程；`--mode large --date YYYY-MM-DD` 启动大额群日换汇模式。
+- `--mode finance` 启动独立财务资料模式，只选择实际群名包含 `财务资料群` 的群。它不建立换汇订单，也不把
+  `客户登记（曼谷/芭提雅）`、编号代码或金额写入人员资料；每个实际财务资料群仍各自生成一张分表。
+- 大额群采用排除式选群：群名包含 `小额出` 或 `财务资料群` 时排除，其余群全部自动处理。大额不是按金额判断，
+  而是固定参与人员、换汇关系较稳定的群。
+- 大额群采用与小额群相同的 `orders`、`open_orders`、资金明细和复杂关系格式；每个大额订单另填 `fund_type`。
+  工作表明细使用小额群相同的 14 列，底部再按资金类型、方向和精确汇率统计。统计区使用深色分区标题、蓝底白字
+  表头、交替浅色数据行、醒目边框和加粗金额，不能与普通明细混在一起难以辨认。
+
+## 订单模式共同口径
 
 - 模型从头到尾阅读每个选中群，判断客户、订单开始与结束、换汇方向、群聊最终采用的汇率、应回依据以及真正需要
   写入订单备注的异常。分页、时间间隔、图片数量、币种和金额接近度都不能代替订单语义。
@@ -52,13 +67,26 @@ iOS 备份时读取 [references/line-ios.md](references/line-ios.md)；涉及小
 python scripts/reconcile.py start <原始导出文件或根目录...> --work <全新且不存在的工作目录> --contains 小额
 ```
 
+大额群只允许单日任务：
+
+```powershell
+python scripts/reconcile.py start <原始导出文件或根目录...> --work <全新且不存在的工作目录> --mode large --date YYYY-MM-DD
+```
+
+财务资料模式默认读取全部日期；可直接输入 Telegram/WhatsApp 导出、含 `Manifest.db` 的未加密 Finder/iTunes
+LINE 备份，或小米/MIUI LINE Android 备份：
+
+```powershell
+python scripts/reconcile.py start <原始导出文件或备份根目录...> --work <全新且不存在的工作目录> --mode finance
+```
+
 只处理一个曼谷会计日时，在新任务的 `start` 命令末尾增加 `--date YYYY-MM-DD`，例如
 `--date 2026-08-31`。未提供时保持原有的全日期行为；日期不同必须建立新的工作目录。
 需要精确时间段时，改用 `--from "YYYY-MM-DD HH:MM" --to "YYYY-MM-DD HH:MM"`；两者都按曼谷时间解释，
 开始时间包含、结束时间不包含，且不能与 `--date` 同时使用。
 
-新任务使用全新工作目录；同一次任务中断后继续原工作目录。固定快照、已确认页面、`open_orders`、群判定、语义
-指纹和批次记录是跨轮次检查点，不得复制到另一项新任务复用。
+新任务使用全新工作目录；同一次任务中断后继续原工作目录。固定快照、已确认页面、订单模式的 `open_orders`、
+财务资料模式的 `open_people`、群判定、语义指纹和批次记录是跨轮次检查点，不得复制到另一项新任务复用。
 
 ### 2. 逐群阅读和提交
 
@@ -69,46 +97,56 @@ python scripts/reconcile.py review <work> apply-batch --group <群> --input <批
 python scripts/reconcile.py review <work> seal --group <群>
 ```
 
-- `review next` 默认按实际消息、回复、媒体路径、`open_orders` 和 `carry_messages` 的总输出长度，自适应选择预算内
+- `review next` 默认按实际消息、回复、媒体路径、当前模式的 `open_orders`/`open_people` 和 `carry_messages` 的
+  总输出长度，自适应选择预算内
   最大的完整页，并以紧凑 JSON 一次返回；页长不是固定值。它只读且绝不推进阅读进度。完成该页的语义判断后，
-  在同一个 JSON 批次中提交 `page_commit` 和完整的 `open_orders`；只有 `apply-batch` 成功才推进
+  在同一个 JSON 批次中提交 `page_commit` 和完整的 `open_orders` 或 `open_people`；只有 `apply-batch` 成功才推进
   `reviewed_through`。中断前未提交的页面下次会原样返回，不能形成“没看却已读”。
 - 新任务不传 `--limit`，也不在 PowerShell 或工具层把一页拆段显示。显式 `--limit` 只用于继续已经按固定页长启动的
   旧任务或诊断环境异常。只要界面提示截断、JSON 不完整或末尾字段缺失，该页就无效，不能提交。
-- 一个群内连续阅读和维护订单。跨页未结束订单写入 `open_orders`，至少保存起始消息、关键消息、媒体、客户、方向、
-  已知汇率、简短事实摘要和仍待确认内容；下一页会同时返回这些状态和对应原消息。没有未结束订单也必须提交空列表。
-- `apply-batch` 已执行完整的字段、角色、资金、收款方、计价和关系校验，成功后原子写入。日常不再在每批后重复
-  运行 `review check`。
-- 群尾只复核订单摘要、相邻订单边界、告警订单和复杂关系；不重新打开已经清楚且无告警的普通资金图。随后直接
+- 订单模式在一个群内连续阅读和维护订单，跨页未结束订单写入 `open_orders`。财务资料模式按人维护证件和聊天账号，
+  跨页尚未完成的人写入 `open_people`；同一本证件或同一账号后来重发时合并回原人。两种模式都要保存起始消息、
+  关键消息、媒体、简短事实摘要和仍待确认内容；没有未结束对象也必须提交空列表。
+- `apply-batch` 按当前模式执行完整字段和关系校验，成功后原子写入。订单模式另校验角色、资金、收款方和计价；
+  财务资料模式另校验证件/账号去重、原图归属和必填字段。日常不再在每批后重复运行 `review check`。
+- 群尾只定向复核当前模式的摘要、边界、告警和复杂关系；不重新打开已经清楚且无告警的普通图片。随后直接
   `seal`，它会执行最终完整校验。
 - `review check` 和 `review audit` 只在批次报错、排查告警或用户要求审计时使用。批量退化指标只提示定向复核，
   不因比例本身永久阻止真实订单封存。
-- 不直接修改判定文件，不创建任务专用脚本批量猜订单、金额、收款方、汇率或备注；通过 `apply-batch` 保留可恢复的
-  进度和写入保护。
+- 不直接修改判定文件，不创建任务专用脚本批量猜订单、金额、收款方、汇率、证件字段或账号归属；通过
+  `apply-batch` 保留可恢复的进度和写入保护。
 
 ### 3. 发布工作簿
 
 ```powershell
 python scripts/reconcile.py finish <work> -o <新的群聊订单核对.xlsx>
+# 财务资料模式可改用：-o <新的财务资料.xlsx>
 ```
 
-`finish` 重新核对快照、已采用的资金图哈希和封存指纹，生成临时工作簿并逐格回读，通过后才发布。最终只有一个
-工作簿，每个实际群一张可见分表，不创建汇总表。
+`finish` 重新核对快照、已采用的原图哈希和封存指纹，生成临时工作簿并逐格回读，通过后才发布。小额模式每个
+实际群一张可见分表；大额模式只为当天存在订单的群建分表，并在相同明细格式下方追加日终统计；财务资料模式每个
+实际财务资料群一张可见分表，一人一行，在同一行嵌入证件原图和资料页原图。最终工作簿只包含实际群分表，不创建
+“期间说明”、封面、来源说明、跨群汇总或其他辅助分表；来源和时间范围写在交付说明中，不占用工作簿标签页。
 
 ## 必须阻止与允许待确认
 
-- 必须阻止：群未读完、仍有 `open_orders`、媒体漏分类、资金图未确认、图片中可见的收款方未完整记录、正常订单
-  缺少明确汇率、资金重复归单、合并金额不守恒、角色方向与无依据例外冲突、快照或封存判定被改写、工作簿回读
-  不一致。
-- 可以封存为待确认：聊天本身无法确认客户、订单方向、应回依据或资金关系。待确认必须显示具体原因；未知不能按零
-  处理。
+- 必须阻止：群未读完、仍有 `open_orders` 或 `open_people`、媒体漏分类、资金图或财务资料原图未确认、图片中
+  可见的收款方未完整记录、正常订单
+  缺少明确汇率、大额订单缺少资金类型、资金重复归单、合并金额不守恒、角色方向与无依据例外冲突、快照或封存
+  判定被改写、财务资料图片未归人、相同证件或账号被归给多人、工作簿回读不一致。
+- 可以封存为待确认：聊天本身无法确认客户、订单方向、应回依据、资金关系，或无法可靠确认资料页属于哪一本证件。
+  待确认必须显示具体原因；未知不能按零处理，账号资料也不能因紧邻某张证件图而强行归人。
 - 订单备注只写取消、失败、少转、多转、关系不清或其他确实需要读表人知道的问题。正常成功、页面状态、普通费用、
   舍入和处理过程不写备注。
 
 ## 修改本技能后的验证
 
-新增或修改业务规则时，测试必须通过当前公开路径：判定使用 `group-chat-decision/3.2`，语义修改通过
-`review apply-batch`，核算使用 `small-group-simple-plan/2.0`。所有 `simple_ledger` 业务回归测试都使用 plan 2.0；
+新增或修改业务规则时，测试必须通过当前公开路径：小额判定使用 `group-chat-decision/3.2`，新建大额任务使用
+`group-chat-large-daily-decision/2.0`，两者都以 `orders/open_orders` 通过 `review apply-batch` 提交，并使用
+`small-group-simple-plan/2.0` 核算；财务资料模式使用 `group-chat-finance-materials-decision/1.0`，以
+`people/open_people` 和 `media_decisions` 通过同一 `review apply-batch` 提交。大额 `1.0` 的
+`exchanges/open_exchanges` 只保留旧工作目录兼容测试。
+所有 `simple_ledger` 业务回归测试都使用 plan 2.0；
 plan 1.0 只保留一个明确命名的兼容测试。直接修改判定文件的测试仍属于兼容/迁移队列；兼容测试通过不能代替当前
 测试通过，也不要继续向该队列增加新业务回归用例。
 

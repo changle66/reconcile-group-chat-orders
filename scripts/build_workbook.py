@@ -14,10 +14,11 @@ from typing import Any, Iterable, Mapping
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.formatting.rule import FormulaRule
-from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 import core
+import large_daily
 import simple_ledger
 
 
@@ -28,6 +29,12 @@ PLATFORM_SHEET_PREFIXES = {
     "line": "LINE",
 }
 SUMMARY_FILL_RGB = "D9EAF7"
+LARGE_SUMMARY_TITLE_FILL_RGB = "17365D"
+LARGE_SUMMARY_HEADER_FILL_RGB = "2F75B5"
+LARGE_SUMMARY_BODY_FILL_RGB = "D9EAF7"
+LARGE_SUMMARY_BODY_ALT_FILL_RGB = "EFF6FB"
+LARGE_SUMMARY_WHITE_FONT_RGB = "FFFFFF"
+LARGE_SUMMARY_GRID_RGB = "9FBAD0"
 REVIEW_SHORT_FONT_RGB = "008000"
 REVIEW_OVER_FONT_RGB = "C00000"
 
@@ -88,12 +95,23 @@ def _validate_reconciliation(value: object, *, field: str) -> bool:
 
 def validate_orders(data: object) -> list[dict[str, Any]]:
     core.require(isinstance(data, dict), "orders top level must be an object")
+    large_order_mode = data.get("contract_version") == large_daily.OUTPUT_CONTRACT
     core.require(
-        data.get("contract_version") == core.ORDERS_CONTRACT,
+        data.get("contract_version")
+        in {core.ORDERS_CONTRACT, large_daily.OUTPUT_CONTRACT},
         "unsupported orders contract_version",
     )
     core.require(data.get("rule_version") == core.RULE_VERSION, "orders rule_version mismatch")
-    core.require(data.get("accounting_mode") == "simple", "orders must use simple mode")
+    core.require(
+        data.get("accounting_mode")
+        == ("large_daily" if large_order_mode else "simple"),
+        "orders accounting_mode does not match its contract",
+    )
+    if large_order_mode:
+        core.require(
+            bool(core.clean_text(data.get("accounting_date"))),
+            "large daily orders require accounting_date",
+        )
     core.require(data.get("timezone") == "Asia/Bangkok", "orders timezone must be Asia/Bangkok")
     groups = data.get("groups")
     core.require(isinstance(groups, list) and groups, "orders groups must be a nonempty list")
@@ -105,6 +123,49 @@ def validate_orders(data: object) -> list[dict[str, Any]]:
     for group_index, group in enumerate(groups):
         orders = group.get("orders")
         core.require(isinstance(orders, list), f"groups[{group_index}].orders must be a list")
+        if large_order_mode:
+            core.require(
+                bool(orders),
+                f"groups[{group_index}].orders must be nonempty in large daily output",
+            )
+            summaries = group.get("daily_summaries")
+            core.require(
+                isinstance(summaries, list),
+                f"groups[{group_index}].daily_summaries must be a list",
+            )
+            for summary_index, summary in enumerate(summaries):
+                field = f"groups[{group_index}].daily_summaries[{summary_index}]"
+                core.require(isinstance(summary, Mapping), f"{field} must be an object")
+                fund_type = large_daily.normalize_fund_type(
+                    summary.get("fund_type"), field=f"{field}.fund_type"
+                )
+                core.require(
+                    summary.get("fund_type_label")
+                    == large_daily.FUND_TYPE_LABELS[fund_type],
+                    f"{field}.fund_type_label does not match fund_type",
+                )
+                core.canonical_direction(
+                    summary.get("direction"), field=f"{field}.direction"
+                )
+                operator = core.clean_text(summary.get("operator")).casefold()
+                core.require(
+                    operator in large_daily.RATE_OPERATORS,
+                    f"{field}.operator is unsupported",
+                )
+                rate = core.parse_decimal(summary.get("rate"), field=f"{field}.rate")
+                core.require(rate is not None and rate > 0, f"{field}.rate must be positive")
+                core.require(
+                    isinstance(summary.get("count"), int) and summary.get("count") > 0,
+                    f"{field}.count must be a positive integer",
+                )
+                for amount_field in ("source_total", "target_total"):
+                    amount = core.parse_decimal(
+                        summary.get(amount_field), field=f"{field}.{amount_field}"
+                    )
+                    core.require(
+                        amount is not None and amount >= 0,
+                        f"{field}.{amount_field} cannot be negative",
+                    )
         for order_index, order in enumerate(orders):
             core.require(
                 isinstance(order, Mapping),
@@ -536,6 +597,299 @@ def build_workbook(
         last_column = get_column_letter(len(core.HEADERS))
         worksheet.auto_filter.ref = f"A1:{last_column}{max(1, output_row - 1)}"
     core.require(bool(workbook.sheetnames), "workbook must contain at least one group sheet")
+    return workbook
+
+
+def large_summary_rows(group: Mapping[str, Any]) -> list[list[Any]]:
+    return [
+        [
+            summary.get("fund_type_label"),
+            summary.get("direction"),
+            summary.get("operator_label"),
+            summary.get("rate_display"),
+            int(summary.get("count") or 0),
+            excel_number(summary.get("source_total")),
+            excel_number(summary.get("target_total")),
+        ]
+        for summary in group.get("daily_summaries", [])
+    ]
+
+
+def build_large_order_workbook(
+    groups: Iterable[Mapping[str, Any]],
+    template_path: Path,
+) -> Workbook:
+    """Build group-only detail sheets with a high-contrast daily summary block."""
+
+    group_list = list(groups)
+    workbook = build_workbook(group_list, template_path)
+    header_styles, body_styles, _, _ = template_styles(template_path)
+    used: set[str] = set()
+    summary_column_count = len(large_daily.SUMMARY_HEADERS)
+    thin_grid = Side(style="thin", color=LARGE_SUMMARY_GRID_RGB)
+    medium_navy = Side(style="medium", color=LARGE_SUMMARY_TITLE_FILL_RGB)
+    white_grid = Side(style="thin", color=LARGE_SUMMARY_WHITE_FONT_RGB)
+    for group in group_list:
+        worksheet = workbook[group_sheet_name(group, used)]
+        detail_rows = sum(
+            len(order_rows(order)) for order in group.get("orders", [])
+        )
+        title_row = detail_rows + 2
+        header_row = title_row + 1
+        summary_rows = large_summary_rows(group)
+        for row_index in (title_row, header_row):
+            for column in range(1, len(core.HEADERS) + 1):
+                worksheet.cell(row_index, column).alignment = Alignment(
+                    horizontal="center",
+                    vertical="center",
+                    wrap_text=True,
+                )
+
+        worksheet.merge_cells(
+            start_row=title_row,
+            start_column=1,
+            end_row=title_row,
+            end_column=summary_column_count,
+        )
+        title_cell = worksheet.cell(title_row, 1)
+        title_cell.value = (
+            "资金汇总（已确认订单）"
+            if summary_rows
+            else "资金汇总（暂无已确认项目；待确认订单请查看上方）"
+        )
+        for column in range(1, summary_column_count + 1):
+            cell = worksheet.cell(title_row, column)
+            cell.fill = PatternFill("solid", fgColor=LARGE_SUMMARY_TITLE_FILL_RGB)
+            cell.font = Font(
+                name="Arial",
+                size=13,
+                bold=True,
+                color=LARGE_SUMMARY_WHITE_FONT_RGB,
+            )
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border = Border(
+                left=medium_navy if column == 1 else Side(style=None),
+                right=medium_navy if column == summary_column_count else Side(style=None),
+                top=medium_navy,
+                bottom=medium_navy,
+            )
+        worksheet.row_dimensions[title_row].height = 29
+
+        for column, value in enumerate(large_daily.SUMMARY_HEADERS, start=1):
+            cell = worksheet.cell(header_row, column, value=value)
+            apply_cell_style(cell, header_styles[column - 1])
+            cell.alignment = Alignment(
+                horizontal="center",
+                vertical="center",
+                wrap_text=True,
+            )
+            cell.fill = PatternFill("solid", fgColor=LARGE_SUMMARY_HEADER_FILL_RGB)
+            cell.font = Font(
+                name="Arial",
+                size=11,
+                bold=True,
+                color=LARGE_SUMMARY_WHITE_FONT_RGB,
+            )
+            cell.border = Border(
+                left=medium_navy if column == 1 else white_grid,
+                right=medium_navy if column == summary_column_count else white_grid,
+                top=medium_navy,
+                bottom=medium_navy,
+            )
+        worksheet.row_dimensions[header_row].height = 27
+
+        for offset, values in enumerate(summary_rows, start=1):
+            row_index = header_row + offset
+            for column in range(1, len(core.HEADERS) + 1):
+                value = values[column - 1] if column <= len(values) else None
+                cell = worksheet.cell(row_index, column, value=value)
+                if column <= summary_column_count:
+                    apply_cell_style(cell, body_styles[column - 1])
+                cell.alignment = Alignment(
+                    horizontal="center",
+                    vertical="center",
+                    wrap_text=column <= 3,
+                )
+                if column <= summary_column_count:
+                    fill_rgb = (
+                        LARGE_SUMMARY_BODY_FILL_RGB
+                        if offset % 2 == 1
+                        else LARGE_SUMMARY_BODY_ALT_FILL_RGB
+                    )
+                    cell.fill = PatternFill("solid", fgColor=fill_rgb)
+                    cell.font = Font(
+                        name="Arial",
+                        size=11,
+                        bold=column in {5, 6, 7},
+                        color=(
+                            LARGE_SUMMARY_TITLE_FILL_RGB
+                            if column in {5, 6, 7}
+                            else "1F1F1F"
+                        ),
+                    )
+                    cell.border = Border(
+                        left=medium_navy if column == 1 else thin_grid,
+                        right=(
+                            medium_navy
+                            if column == summary_column_count
+                            else thin_grid
+                        ),
+                        top=thin_grid,
+                        bottom=(
+                            medium_navy
+                            if offset == len(summary_rows)
+                            else thin_grid
+                        ),
+                    )
+            worksheet.cell(row_index, 5).number_format = "0"
+            worksheet.cell(row_index, 6).number_format = "#,##0.00"
+            worksheet.cell(row_index, 7).number_format = "#,##0.00"
+            worksheet.row_dimensions[row_index].height = 25
+
+        minimum_widths = {
+            "A": 18,
+            "B": 23,
+            "C": 16,
+            "D": 13,
+            "E": 11,
+            "F": 18,
+            "G": 18,
+        }
+        for column_letter, minimum_width in minimum_widths.items():
+            current_width = worksheet.column_dimensions[column_letter].width or 0
+            if current_width < minimum_width:
+                worksheet.column_dimensions[column_letter].width = minimum_width
+        worksheet.sheet_view.showGridLines = False
+    return workbook
+
+
+def validate_large_daily(data: object) -> list[dict[str, Any]]:
+    core.require(isinstance(data, dict), "large daily ledger top level must be an object")
+    core.require(
+        data.get("contract_version") == large_daily.LEGACY_OUTPUT_CONTRACT,
+        "unsupported large daily ledger contract_version",
+    )
+    core.require(
+        data.get("accounting_mode") == "large_daily",
+        "large daily ledger accounting_mode mismatch",
+    )
+    core.require(
+        data.get("timezone") == "Asia/Bangkok",
+        "large daily ledger timezone must be Asia/Bangkok",
+    )
+    core.require(bool(core.clean_text(data.get("accounting_date"))), "accounting_date is required")
+    groups = data.get("groups")
+    core.require(isinstance(groups, list) and groups, "large daily groups must be nonempty")
+    keys: list[str] = []
+    for position, group in enumerate(groups):
+        field = f"groups[{position}]"
+        core.require(isinstance(group, dict), f"{field} must be an object")
+        group_key = core.clean_text(group.get("group_key"))
+        core.require(bool(group_key), f"{field}.group_key is required")
+        keys.append(group_key)
+        exchanges = group.get("exchanges")
+        summaries = group.get("summaries")
+        core.require(isinstance(exchanges, list) and exchanges, f"{field}.exchanges must be nonempty")
+        core.require(isinstance(summaries, list) and summaries, f"{field}.summaries must be nonempty")
+    core.require(len(keys) == len(set(keys)), "large daily group keys must be unique")
+    return groups
+
+
+def large_group_rows(group: Mapping[str, Any]) -> list[list[Any]]:
+    rows: list[list[Any]] = []
+    for exchange in group.get("exchanges", []):
+        rows.append(
+            [
+                "换汇记录",
+                excel_datetime(exchange.get("exchange_time")),
+                exchange.get("fund_type_label"),
+                exchange.get("direction"),
+                excel_number(exchange.get("source_amount")),
+                exchange.get("rate_display"),
+                excel_number(exchange.get("target_amount")),
+                core.clean_text(exchange.get("note")) or None,
+            ]
+        )
+    for summary in group.get("summaries", []):
+        rows.append(
+            [
+                "日终统计",
+                None,
+                summary.get("fund_type_label"),
+                summary.get("direction"),
+                excel_number(summary.get("source_total")),
+                summary.get("rate_display"),
+                excel_number(summary.get("target_total")),
+                f"共{int(summary.get('count') or 0)}笔",
+            ]
+        )
+    return rows
+
+
+def build_large_workbook(
+    groups: Iterable[Mapping[str, Any]],
+    template_path: Path,
+) -> Workbook:
+    group_list = list(groups)
+    header_styles, body_styles, widths, header_height = template_styles(template_path)
+    workbook = Workbook()
+    workbook.remove(workbook.active)
+    used: set[str] = set()
+    time_column = large_daily.HEADERS.index("时间") + 1
+    amount_columns = {
+        large_daily.HEADERS.index("换出金额") + 1,
+        large_daily.HEADERS.index("换入金额") + 1,
+    }
+    wrapped_columns = {
+        large_daily.HEADERS.index("换汇方向") + 1,
+        large_daily.HEADERS.index("汇率") + 1,
+        large_daily.HEADERS.index("备注") + 1,
+    }
+    for group in group_list:
+        worksheet = workbook.create_sheet(group_sheet_name(group, used))
+        worksheet.sheet_state = "visible"
+        worksheet.freeze_panes = "A2"
+        if header_height:
+            worksheet.row_dimensions[1].height = header_height
+        for column, (value, style) in enumerate(
+            zip(large_daily.HEADERS, header_styles), start=1
+        ):
+            cell = worksheet.cell(row=1, column=column, value=value)
+            apply_cell_style(cell, style)
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            width = widths.get(column)
+            if width is not None:
+                worksheet.column_dimensions[get_column_letter(column)].width = width
+        output_row = 2
+        for values in large_group_rows(group):
+            core.require(
+                len(values) == len(large_daily.HEADERS),
+                "large daily workbook row width mismatch",
+            )
+            for column, (value, style) in enumerate(zip(values, body_styles), start=1):
+                cell = worksheet.cell(row=output_row, column=column, value=value)
+                apply_cell_style(cell, style)
+                cell.alignment = Alignment(
+                    horizontal="center",
+                    vertical="center",
+                    wrap_text=column in wrapped_columns,
+                )
+                if column in amount_columns:
+                    cell.number_format = "0.###############"
+            worksheet.cell(output_row, time_column).number_format = "yyyy-mm-dd hh:mm:ss"
+            if values[0] == "日终统计":
+                for cell in worksheet[output_row]:
+                    cell.fill = PatternFill("solid", fgColor=SUMMARY_FILL_RGB)
+                    bold_font = copy(cell.font)
+                    bold_font.bold = True
+                    cell.font = bold_font
+            else:
+                for cell in worksheet[output_row]:
+                    cell.fill = PatternFill()
+            output_row += 1
+        last_column = get_column_letter(len(large_daily.HEADERS))
+        worksheet.auto_filter.ref = f"A1:{last_column}{max(1, output_row - 1)}"
+    core.require(bool(workbook.sheetnames), "workbook must contain at least one large group sheet")
     return workbook
 
 

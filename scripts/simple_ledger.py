@@ -1759,38 +1759,38 @@ def _compile_order(
         order_status = "completed"
 
     case_id = core.clean_text(raw_order.get("case_id")) or f"{group_key}:simple:{position:03d}"
-    return (
-        {
-            "case_id": case_id,
-            "order_id": None,
-            "start_time": start_message.get("timestamp"),
-            "start_message_id": start_message_id,
-            "customer_nickname": customer_nickname,
-            "direction": direction,
-            "payment_currency": payment_currency,
-            "payment_total": core.decimal_text(payment_total),
-            "actual_rate": core.decimal_text(rate),
-            "actual_rate_display": rate_display,
-            "rate_operator": rate_operator,
-            "payout_currency": payout_currency,
-            "expected_payout": core.decimal_text(expected),
-            "balance_adjustment": "0",
-            "actual_payout_total": core.decimal_text(payout_total),
-            "reconciliation": reconciliation,
-            "review_result": result,
-            "anomaly_note": anomaly_note,
-            "note": order_note,
-            "order_status": order_status,
-            "pricing_basis": pricing_basis,
-            "pricing_source_message_ids": pricing_source_message_ids,
-            "pricing_diagnostics": pricing_diagnostics,
-            "fee_adjustments": fee_adjustments,
-            "rounding": rounding,
-            "legs": compiled_legs,
-            "flows": flows,
-        },
-        issues,
-    )
+    compiled_order = {
+        "case_id": case_id,
+        "order_id": None,
+        "start_time": start_message.get("timestamp"),
+        "start_message_id": start_message_id,
+        "customer_nickname": customer_nickname,
+        "direction": direction,
+        "payment_currency": payment_currency,
+        "payment_total": core.decimal_text(payment_total),
+        "actual_rate": core.decimal_text(rate),
+        "actual_rate_display": rate_display,
+        "rate_operator": rate_operator,
+        "payout_currency": payout_currency,
+        "expected_payout": core.decimal_text(expected),
+        "balance_adjustment": "0",
+        "actual_payout_total": core.decimal_text(payout_total),
+        "reconciliation": reconciliation,
+        "review_result": result,
+        "anomaly_note": anomaly_note,
+        "note": order_note,
+        "order_status": order_status,
+        "pricing_basis": pricing_basis,
+        "pricing_source_message_ids": pricing_source_message_ids,
+        "pricing_diagnostics": pricing_diagnostics,
+        "fee_adjustments": fee_adjustments,
+        "rounding": rounding,
+        "legs": compiled_legs,
+        "flows": flows,
+    }
+    if raw_order.get("fund_type") not in (None, ""):
+        compiled_order["fund_type"] = core.clean_text(raw_order.get("fund_type")).casefold()
+    return compiled_order, issues
 
 
 def _mark_relationship_pending(order: dict[str, Any], note: str) -> None:

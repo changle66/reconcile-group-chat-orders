@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import subprocess
 import sys
@@ -143,6 +144,703 @@ class ReconcileWorkflowTests(unittest.TestCase):
             core.atomic_json(decision_path, decision)
             core.atomic_json(reconcile._run_path(work), run)
         return work, run, normalized
+
+    def _start_large_order_fixture(
+        self,
+        root: Path,
+        specs: list[tuple[str, str, str, str, str, str, str]],
+        *,
+        group_name: str = "曼谷固定换汇群",
+        include_empty_group: bool = False,
+    ) -> tuple[Path, dict[str, dict], list[dict]]:
+        source_root = root / "source"
+        export = source_root / "large"
+        photos = export / "photos"
+        photos.mkdir(parents=True)
+        timestamp = int(
+            datetime.fromisoformat("2026-08-31T09:00:00+07:00").timestamp()
+        )
+        messages: list[dict] = []
+        media_decisions: dict[str, dict] = {}
+        orders: list[dict] = []
+        for position, spec in enumerate(specs, start=1):
+            text, fund_type, direction, source_amount, rate, operator, target_amount = spec
+            source_currency, target_currency = direction.split("->", maxsplit=1)
+            payment_file = f"payment-{position}.jpg"
+            payout_file = f"payout-{position}.jpg"
+            (photos / payment_file).write_bytes(f"payment-{position}".encode())
+            (photos / payout_file).write_bytes(f"payout-{position}".encode())
+            payment_message_id = position * 2 - 1
+            payout_message_id = position * 2
+            messages.extend(
+                [
+                    {
+                        "id": payment_message_id,
+                        "type": "message",
+                        "date_unixtime": str(timestamp + payment_message_id * 60),
+                        "from": "Alice",
+                        "from_id": "user:alice",
+                        "text": text,
+                        "photo": f"photos/{payment_file}",
+                    },
+                    {
+                        "id": payout_message_id,
+                        "type": "message",
+                        "date_unixtime": str(timestamp + payout_message_id * 60),
+                        "from": "QQ财务3",
+                        "from_id": "user:staff",
+                        "text": f"已回款 {target_amount} {target_currency}",
+                        "photo": f"photos/{payout_file}",
+                    },
+                ]
+            )
+            payment_label = f"M{payment_message_id:04d}"
+            payout_label = f"M{payout_message_id:04d}"
+            payment_source = f"S{payment_message_id:05d}"
+            payout_source = f"S{payout_message_id:05d}"
+            media_decisions[payment_label] = {
+                "classification": "fund",
+                "viewed_original": True,
+                "entries": [
+                    {
+                        "amount": source_amount,
+                        "currency": source_currency,
+                        "payee": (
+                            f"100-0-XXX{position:03d}"
+                            if source_currency == "THB"
+                            else f"customer-payee-{position}"
+                        ),
+                    }
+                ],
+            }
+            media_decisions[payout_label] = {
+                "classification": "fund",
+                "viewed_original": True,
+                "entries": [
+                    {
+                        "amount": target_amount,
+                        "currency": target_currency,
+                        "payee": (
+                            f"200-0-XXX{position:03d}"
+                            if target_currency == "THB"
+                            else f"staff-payee-{position}"
+                        ),
+                    }
+                ],
+            }
+            orders.append(
+                {
+                    "id": f"L{position:03d}",
+                    "entry_ids": [f"{payment_label}.1", f"{payout_label}.1"],
+                    "source_messages": [payment_source, payout_source],
+                    "fund_type": fund_type,
+                    "customer_nickname": "Alice",
+                    "direction": direction,
+                    "pricing": {
+                        "source_messages": [payment_source],
+                        "terms": {"rate": rate, "operator": operator},
+                        "expected": {"kind": "explicit", "amount": target_amount},
+                    },
+                }
+            )
+        (export / "result.json").write_text(
+            json.dumps(
+                {"id": "large-orders", "name": group_name, "messages": messages},
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        if include_empty_group:
+            empty_export = source_root / "empty"
+            empty_export.mkdir(parents=True)
+            (empty_export / "result.json").write_text(
+                json.dumps(
+                    {
+                        "id": "large-empty",
+                        "name": "当天无换汇群",
+                        "messages": [
+                            {
+                                "id": 1,
+                                "type": "message",
+                                "date_unixtime": str(timestamp),
+                                "from": "Alice",
+                                "from_id": "user:alice",
+                                "text": "早上好",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+        work = root / "run"
+        reconcile.start_run(
+            reconcile.parse_args(
+                [
+                    "start",
+                    str(source_root),
+                    "--work",
+                    str(work),
+                    "--mode",
+                    "large",
+                    "--date",
+                    "2026-08-31",
+                ]
+            )
+        )
+        return work, media_decisions, orders
+
+    def _apply_and_seal_large_group(
+        self,
+        root: Path,
+        work: Path,
+        *,
+        group_name: str,
+        media_decisions: dict[str, dict],
+        orders: list[dict],
+        batch_id: str,
+    ) -> tuple[dict, dict]:
+        page = reconcile.review_command(
+            Namespace(work=work, review_action="next", group=group_name, limit=500)
+        )
+        batch_path = root / f"{batch_id}.json"
+        core.atomic_json(
+            batch_path,
+            {
+                "contract_version": reconcile.REVIEW_BATCH_CONTRACT,
+                "batch_id": batch_id,
+                "base_fingerprint": page["semantic_fingerprint"],
+                "page_commit": {
+                    "page_start": page["page_start"],
+                    "page_end": page["page_end"],
+                    "page_token": page["page_token"],
+                },
+                "open_orders": [],
+                "media_decisions": media_decisions,
+                "orders": orders,
+            },
+        )
+        applied = reconcile.review_command(
+            Namespace(
+                work=work,
+                review_action="apply-batch",
+                group=group_name,
+                input=batch_path,
+            )
+        )
+        sealed = reconcile.review_command(
+            Namespace(work=work, review_action="seal", group=group_name)
+        )
+        return applied, sealed
+
+    def test_start_large_mode_selects_every_group_except_small_and_finance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            timestamp = str(
+                int(datetime.fromisoformat("2026-08-31T08:00:00+07:00").timestamp())
+            )
+            groups = [
+                ("large-a", "曼谷固定换汇一群"),
+                ("small", "QQ小额出🐱群"),
+                ("finance", "财务资料群"),
+                ("large-b", "长期合作换汇群"),
+            ]
+            for group_id, group_name in groups:
+                export = source / group_id
+                export.mkdir(parents=True)
+                (export / "result.json").write_text(
+                    json.dumps(
+                        {
+                            "id": group_id,
+                            "name": group_name,
+                            "messages": [
+                                {
+                                    "id": 1,
+                                    "type": "message",
+                                    "date_unixtime": timestamp,
+                                    "from": "Alice",
+                                    "from_id": "user:alice",
+                                    "text": "今日换汇记录",
+                                }
+                            ],
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+
+            work = root / "run"
+            args = reconcile.parse_args(
+                [
+                    "start",
+                    str(source),
+                    "--work",
+                    str(work),
+                    "--mode",
+                    "large",
+                    "--date",
+                    "2026-08-31",
+                ]
+            )
+            report = reconcile.start_run(args)
+            run = reconcile._load_run(work)
+            normalized = reconcile._load_snapshot(work, run)
+
+            expected_names = ["曼谷固定换汇一群", "长期合作换汇群"]
+            self.assertEqual(
+                sorted(item["group_name"] for item in report["selected_groups"]),
+                sorted(expected_names),
+            )
+            self.assertEqual(
+                sorted(group["group_name"] for group in normalized["groups"]),
+                sorted(expected_names),
+            )
+            self.assertEqual(run["group_mode"], "large")
+
+    def test_start_large_mode_requires_one_accounting_date(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            work = root / "run"
+            args = reconcile.parse_args(
+                [
+                    "start",
+                    str(source),
+                    "--work",
+                    str(work),
+                    "--mode",
+                    "large",
+                ]
+            )
+            with self.assertRaisesRegex(ValueError, "large.*--date"):
+                reconcile.start_run(args)
+            self.assertFalse(work.exists())
+
+    def test_large_group_review_uses_full_order_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            specs = [
+                (
+                    "微信付款10000人民币，按4.72换47200泰铢",
+                    "wechat",
+                    "CNY->THB",
+                    "10000",
+                    "4.72",
+                    "multiply",
+                    "47200",
+                )
+            ]
+            work, media_decisions, orders = self._start_large_order_fixture(
+                root, specs
+            )
+            run = reconcile._load_run(work)
+            decision = reconcile._load_json(
+                reconcile._decision_path(work, run["groups"][0])
+            )
+            self.assertEqual(
+                decision["contract_version"],
+                reconcile.large_daily.DECISION_CONTRACT,
+            )
+            self.assertEqual(decision["orders"], [])
+            self.assertEqual(decision["open_orders"], [])
+            self.assertNotIn("exchanges", decision)
+
+            page = reconcile.review_command(
+                Namespace(
+                    work=work,
+                    review_action="next",
+                    group="曼谷固定换汇群",
+                    limit=500,
+                )
+            )
+            self.assertEqual(page["open_orders"], [])
+            self.assertNotIn("open_exchanges", page)
+            missing_type_orders = copy.deepcopy(orders)
+            missing_type_orders[0].pop("fund_type")
+            invalid_batch_path = root / "large-missing-fund-type.json"
+            core.atomic_json(
+                invalid_batch_path,
+                {
+                    "contract_version": reconcile.REVIEW_BATCH_CONTRACT,
+                    "batch_id": "large-missing-fund-type",
+                    "base_fingerprint": page["semantic_fingerprint"],
+                    "page_commit": {
+                        "page_start": page["page_start"],
+                        "page_end": page["page_end"],
+                        "page_token": page["page_token"],
+                    },
+                    "open_orders": [],
+                    "media_decisions": media_decisions,
+                    "orders": missing_type_orders,
+                },
+            )
+            with self.assertRaisesRegex(ValueError, "fund_type"):
+                reconcile.review_command(
+                    Namespace(
+                        work=work,
+                        review_action="apply-batch",
+                        group="曼谷固定换汇群",
+                        input=invalid_batch_path,
+                    )
+                )
+            applied, sealed = self._apply_and_seal_large_group(
+                root,
+                work,
+                group_name="曼谷固定换汇群",
+                media_decisions=media_decisions,
+                orders=orders,
+                batch_id="large-orders-001",
+            )
+            self.assertEqual(applied["orders"], 1)
+            self.assertEqual(applied["open_orders"], 0)
+            self.assertEqual(applied["fund_entries"], 2)
+            self.assertTrue(sealed["sealed"])
+            self.assertEqual(sealed["orders"], 1)
+
+    def test_large_group_multiple_fund_images_compile_to_one_full_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            specs = [
+                (
+                    "微信付款10000人民币，按4.72换47200泰铢",
+                    "wechat",
+                    "CNY->THB",
+                    "10000",
+                    "4.72",
+                    "multiply",
+                    "47200",
+                )
+            ]
+            work, media_decisions, orders = self._start_large_order_fixture(
+                root,
+                specs,
+                group_name="固定合作换汇群",
+            )
+            self._apply_and_seal_large_group(
+                root,
+                work,
+                group_name="固定合作换汇群",
+                media_decisions=media_decisions,
+                orders=orders,
+                batch_id="large-detail-001",
+            )
+            output = root / "single-full-order.xlsx"
+            result = reconcile.finish_run(
+                Namespace(
+                    work=work,
+                    output=output,
+                    template=Path(__file__).resolve().parent.parent
+                    / "assets"
+                    / "模版.xlsx",
+                )
+            )
+            self.assertEqual(result["orders"], 1)
+            self.assertEqual(result["summary_rows"], 1)
+            workbook = load_workbook(output, read_only=False, data_only=False)
+            try:
+                worksheet = workbook.worksheets[0]
+                headers = [
+                    worksheet.cell(1, column).value
+                    for column in range(1, len(core.HEADERS) + 1)
+                ]
+                self.assertEqual(headers, core.HEADERS)
+                row_types = [
+                    row[0]
+                    for row in worksheet.iter_rows(min_row=2, values_only=True)
+                ]
+                self.assertEqual(row_types[:3], ["订单汇总", "客户付款", "内部回款"])
+                payee_column = core.HEADERS.index("收款方")
+                detail_rows = list(
+                    worksheet.iter_rows(min_row=2, max_row=4, values_only=True)
+                )
+                self.assertEqual(detail_rows[1][payee_column], "customer-payee-1")
+                self.assertEqual(detail_rows[2][payee_column], "200-0-XXX001")
+            finally:
+                workbook.close()
+
+    def test_legacy_large_exchange_contract_still_finishes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            specs = [
+                (
+                    "微信付款10000人民币，按4.72换47200泰铢",
+                    "wechat",
+                    "CNY->THB",
+                    "10000",
+                    "4.72",
+                    "multiply",
+                    "47200",
+                )
+            ]
+            work, media_decisions, _ = self._start_large_order_fixture(root, specs)
+            run = reconcile._load_run(work)
+            run_group = run["groups"][0]
+            decision_path = reconcile._decision_path(work, run_group)
+            decision = reconcile._load_json(decision_path)
+            decision["contract_version"] = (
+                reconcile.large_daily.LEGACY_DECISION_CONTRACT
+            )
+            for field in (
+                "orders",
+                "open_orders",
+                "balance_links",
+                "settlement_allocations",
+            ):
+                decision.pop(field, None)
+            decision["exchanges"] = []
+            decision["open_exchanges"] = []
+            decision["edit_control"] = reconcile._new_edit_control(
+                reconcile._semantic_fingerprint(decision)
+            )
+            core.atomic_json(decision_path, decision)
+
+            page = reconcile.review_command(
+                Namespace(work=work, review_action="next", group=None, limit=500)
+            )
+            batch_path = root / "legacy-large.json"
+            core.atomic_json(
+                batch_path,
+                {
+                    "contract_version": reconcile.REVIEW_BATCH_CONTRACT,
+                    "batch_id": "legacy-large-001",
+                    "base_fingerprint": page["semantic_fingerprint"],
+                    "page_commit": {
+                        "page_start": page["page_start"],
+                        "page_end": page["page_end"],
+                        "page_token": page["page_token"],
+                    },
+                    "open_exchanges": [],
+                    "media_decisions": media_decisions,
+                    "exchanges": [
+                        {
+                            "id": "L001",
+                            "source_messages": ["S00001", "S00002"],
+                            "entry_ids": ["M0001.1", "M0002.1"],
+                            "fund_type": "wechat",
+                            "direction": "CNY->THB",
+                            "source_amount": "10000",
+                            "rate": "4.72",
+                            "operator": "multiply",
+                            "target_amount": "47200",
+                        }
+                    ],
+                },
+            )
+            reconcile.review_command(
+                Namespace(
+                    work=work,
+                    review_action="apply-batch",
+                    group="曼谷固定换汇群",
+                    input=batch_path,
+                )
+            )
+            reconcile.review_command(
+                Namespace(
+                    work=work,
+                    review_action="seal",
+                    group="曼谷固定换汇群",
+                )
+            )
+            output = root / "legacy-large.xlsx"
+            result = reconcile.finish_run(
+                Namespace(
+                    work=work,
+                    output=output,
+                    template=Path(__file__).resolve().parent.parent
+                    / "assets"
+                    / "模版.xlsx",
+                )
+            )
+            self.assertEqual(result["exchanges"], 1)
+            workbook = load_workbook(output, read_only=True, data_only=False)
+            try:
+                headers = [
+                    workbook.worksheets[0].cell(1, column).value
+                    for column in range(
+                        1, len(reconcile.large_daily.LEGACY_HEADERS) + 1
+                    )
+                ]
+                self.assertEqual(headers, reconcile.large_daily.LEGACY_HEADERS)
+            finally:
+                workbook.close()
+
+    def test_large_group_finish_writes_daily_records_and_rate_grouped_totals(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            exchange_specs = [
+                ("微信10000人民币按4.72换47200泰铢", "wechat", "CNY->THB", "10000", "4.72", "multiply", "47200"),
+                ("微信5000人民币按4.72换23600泰铢", "wechat", "CNY->THB", "5000", "4.72", "multiply", "23600"),
+                ("微信1000人民币按4.70换4700泰铢", "wechat", "CNY->THB", "1000", "4.70", "multiply", "4700"),
+                ("支付宝2000人民币按4.70换9400泰铢", "alipay", "CNY->THB", "2000", "4.70", "multiply", "9400"),
+                ("银行卡47000泰铢按4.70反向换10000人民币", "bank_card", "THB->CNY", "47000", "4.70", "divide", "10000"),
+                ("32600泰铢按32.60换1000USDT", "usdt", "THB->USDT", "32600", "32.60", "divide", "1000"),
+                ("银行卡付款100人民币，群聊未说明最终汇率", "bank_card", "CNY->THB", "100", "1", "multiply", "500"),
+            ]
+            work, media_decisions, orders = self._start_large_order_fixture(
+                root,
+                exchange_specs,
+                include_empty_group=True,
+            )
+            orders[-1]["pricing"] = {
+                "source_messages": ["S00013"],
+                "expected": {"kind": "unknown", "reason": "not_stated"},
+            }
+            self._apply_and_seal_large_group(
+                root,
+                work,
+                group_name="曼谷固定换汇群",
+                media_decisions=media_decisions,
+                orders=orders,
+                batch_id="large-summary-001",
+            )
+
+            empty_page = reconcile.review_command(
+                Namespace(
+                    work=work,
+                    review_action="next",
+                    group="当天无换汇群",
+                    limit=500,
+                )
+            )
+            empty_batch_path = root / "large-empty.json"
+            core.atomic_json(
+                empty_batch_path,
+                {
+                    "contract_version": reconcile.REVIEW_BATCH_CONTRACT,
+                    "batch_id": "large-empty-001",
+                    "base_fingerprint": empty_page["semantic_fingerprint"],
+                    "page_commit": {
+                        "page_start": empty_page["page_start"],
+                        "page_end": empty_page["page_end"],
+                        "page_token": empty_page["page_token"],
+                    },
+                    "open_orders": [],
+                },
+            )
+            reconcile.review_command(
+                Namespace(
+                    work=work,
+                    review_action="apply-batch",
+                    group="当天无换汇群",
+                    input=empty_batch_path,
+                )
+            )
+            reconcile.review_command(
+                Namespace(
+                    work=work,
+                    review_action="seal",
+                    group="当天无换汇群",
+                )
+            )
+
+            output = root / "大额群日换汇.xlsx"
+            result = reconcile.finish_run(
+                Namespace(
+                    work=work,
+                    output=output,
+                    template=Path(__file__).resolve().parent.parent / "assets" / "模版.xlsx",
+                )
+            )
+            self.assertEqual(result["orders"], 7)
+            self.assertEqual(result["pending_orders"], 1)
+            self.assertEqual(result["summary_rows"], 5)
+            self.assertEqual(result["groups"], 1)
+            workbook = load_workbook(output, read_only=False, data_only=False)
+            try:
+                self.assertEqual(len(workbook.worksheets), 1)
+                self.assertNotIn("期间说明", workbook.sheetnames)
+                worksheet = workbook.worksheets[0]
+                headers = [
+                    worksheet.cell(1, column).value
+                    for column in range(1, len(core.HEADERS) + 1)
+                ]
+                self.assertEqual(headers, core.HEADERS)
+                summary_rows = [
+                    tuple(row[: len(reconcile.large_daily.SUMMARY_HEADERS)])
+                    for row in worksheet.iter_rows(values_only=True)
+                    if row[0] in {"微信", "支付宝", "银行卡", "USDT"}
+                ]
+                self.assertEqual(
+                    summary_rows,
+                    [
+                        ("微信", "CNY->THB", "乘", "×4.72", 2, 15000, 70800),
+                        ("微信", "CNY->THB", "乘", "×4.7", 1, 1000, 4700),
+                        ("支付宝", "CNY->THB", "乘", "×4.7", 1, 2000, 9400),
+                        ("银行卡", "THB->CNY", "除", "÷4.7", 1, 47000, 10000),
+                        ("USDT", "THB->USDT", "除", "÷32.6", 1, 32600, 1000),
+                    ],
+                )
+                summary_header_row = next(
+                    row
+                    for row in range(1, worksheet.max_row + 1)
+                    if worksheet.cell(row, 1).value == "资金类型"
+                )
+                summary_title_row = summary_header_row - 1
+                self.assertEqual(
+                    worksheet.cell(summary_title_row, 1).value,
+                    "资金汇总（已确认订单）",
+                )
+                self.assertIn(
+                    f"A{summary_title_row}:G{summary_title_row}",
+                    {str(item) for item in worksheet.merged_cells.ranges},
+                )
+                self.assertTrue(
+                    str(worksheet.cell(summary_title_row, 1).fill.fgColor.rgb)
+                    .upper()
+                    .endswith(build_workbook.LARGE_SUMMARY_TITLE_FILL_RGB)
+                )
+                for column in range(1, len(reconcile.large_daily.SUMMARY_HEADERS) + 1):
+                    header_cell = worksheet.cell(summary_header_row, column)
+                    self.assertTrue(header_cell.font.bold)
+                    self.assertTrue(
+                        str(header_cell.font.color.rgb)
+                        .upper()
+                        .endswith(build_workbook.LARGE_SUMMARY_WHITE_FONT_RGB)
+                    )
+                    self.assertTrue(
+                        str(header_cell.fill.fgColor.rgb)
+                        .upper()
+                        .endswith(build_workbook.LARGE_SUMMARY_HEADER_FILL_RGB)
+                    )
+                for offset in range(1, len(summary_rows) + 1):
+                    expected_fill = (
+                        build_workbook.LARGE_SUMMARY_BODY_FILL_RGB
+                        if offset % 2 == 1
+                        else build_workbook.LARGE_SUMMARY_BODY_ALT_FILL_RGB
+                    )
+                    for column in range(1, len(reconcile.large_daily.SUMMARY_HEADERS) + 1):
+                        self.assertTrue(
+                            str(
+                                worksheet.cell(
+                                    summary_header_row + offset,
+                                    column,
+                                ).fill.fgColor.rgb
+                            )
+                            .upper()
+                            .endswith(expected_fill)
+                        )
+                    for column in (5, 6, 7):
+                        self.assertTrue(
+                            worksheet.cell(summary_header_row + offset, column).font.bold
+                        )
+                for column_letter, minimum_width in {
+                    "A": 18,
+                    "B": 23,
+                    "C": 16,
+                    "D": 13,
+                    "E": 11,
+                    "F": 18,
+                    "G": 18,
+                }.items():
+                    self.assertGreaterEqual(
+                        worksheet.column_dimensions[column_letter].width,
+                        minimum_width,
+                    )
+                self.assertFalse(worksheet.sheet_view.showGridLines)
+            finally:
+                workbook.close()
 
     def test_start_date_filters_messages_by_bangkok_calendar_day(self) -> None:
         def unix_time(value: str) -> str:
