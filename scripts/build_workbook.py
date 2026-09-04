@@ -515,6 +515,7 @@ def build_workbook(
             core.HEADERS.index(header) + 1 for header in wrapped_headers
         }
         payee_column = core.HEADERS.index("收款方") + 1
+        actual_received_column = core.HEADERS.index("收款方实际到账金额") + 1
         review_column = core.HEADERS.index("核对结果") + 1
         review_column_letter = get_column_letter(review_column)
         for column, (value, style) in enumerate(zip(core.HEADERS, header_styles), start=1):
@@ -533,6 +534,8 @@ def build_workbook(
                     color=cell.font.color,
                 )
             width = widths.get(column)
+            if column == actual_received_column:
+                width = max(width or 0, 18)
             if width is not None:
                 worksheet.column_dimensions[get_column_letter(column)].width = width
         output_row = 2

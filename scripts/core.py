@@ -30,7 +30,7 @@ HEADERS = [
     "换汇方向",
     "付款合计",
     "汇率",
-    "流水金额",
+    "收款方实际到账金额",
     "流水币种",
     "应回金额",
     "内部实际回款合计",
@@ -144,6 +144,24 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def validate_cached_file_hash(
+    path: Path,
+    recorded_hash: object,
+    *,
+    verify: bool,
+    changed_message: str,
+) -> tuple[str, bool]:
+    """Return a trusted prior hash or verify the file and return a fresh hash."""
+
+    recorded = clean_text(recorded_hash)
+    if not verify:
+        return recorded, False
+    actual = sha256_file(path)
+    if recorded:
+        require(recorded == actual, changed_message)
+    return actual, True
 
 
 def fingerprint_files(paths: Iterable[Path], *, context: object) -> str:

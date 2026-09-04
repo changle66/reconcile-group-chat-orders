@@ -31,6 +31,11 @@ python scripts/reconcile.py start <原始导出文件或备份根目录...> --wo
 判为 `document` 或 `chat_profile` 前必须打开原图。OCR 只可帮助定位文字，不能代替视觉确认；模糊、裁切或被遮挡的
 字段不得猜测。按图片原样记录完整值，不掩码、不补零、不翻译或自行转写：
 
+查看图片前完整读取 [media-viewing.md](media-viewing.md)。`review next` 会把尚未分类的可用图片放入
+`media_queue`，财务资料模式默认每个并行批次 4 张并在 2–6 张内按真实指标自适应；当前主代理一次打开一批，不开
+子代理。来源只有缩略图时脚本单独成批，缩略图不足以确认字段就保留待确认。相同内容只打开一个代表图，缓存命中
+不重开；哈希和 OCR 候选只能复用或提示逐图可见字段，不能决定资料属于谁。
+
 - 人员：`name`（证件显示的姓名）、`surname`、`given_names`、`nationality`、`birth_date`；
 - 证件：`type`、`country_code`、`number`、`media_labels`；
 - 聊天账号：`platform`、`account_id`、`phone`、`media_labels`。
@@ -81,6 +86,34 @@ python scripts/reconcile.py start <原始导出文件或备份根目录...> --wo
     "M0002": {"classification": "chat_profile", "viewed_original": true},
     "M0003": {"classification": "reference", "note": "无关聊天截图"}
   },
+  "media_observations": {
+    "M0001": {
+      "contract_version": "group-chat-media-observation/1.0",
+      "classification": "document",
+      "review_status": "clear",
+      "viewed_original": true,
+      "recheck_reasons": [],
+      "facts": {
+        "holder": {"name": "示例姓名"},
+        "document": {"type": "passport", "country_code": "XXX", "number": "EXAMPLE0001"}
+      }
+    },
+    "M0002": {
+      "contract_version": "group-chat-media-observation/1.0",
+      "classification": "chat_profile",
+      "review_status": "clear",
+      "viewed_original": true,
+      "recheck_reasons": [],
+      "facts": {"account": {"platform": "LINE", "account_id": "example-id"}}
+    },
+    "M0003": {
+      "contract_version": "group-chat-media-observation/1.0",
+      "classification": "reference",
+      "review_status": "clear",
+      "viewed_original": true,
+      "recheck_reasons": []
+    }
+  },
   "people": [
     {
       "id": "P001",
@@ -116,6 +149,14 @@ python scripts/reconcile.py start <原始导出文件或备份根目录...> --wo
 同一 `id` 在后续批次再次提交会更新原人，不会新增一行；确需删除错误人员时使用 `remove_person_ids`。跨页尚未完成
 的对象放在 `open_people`，其中包含 `id`、`source_messages`、`summary` 和 `unresolved`。群读完时必须清空
 `open_people`，分类并归属所有材料图片后才能 `seal`。
+
+每个更新的媒体标签同时提交一个 `media_observations`。一本证件有多张图时，`facts` 只写当前图片实际显示的字段；
+同批相同图用 `reuse_from`，跨页 `cache_hits` 用 `reuse_sha256`。模糊、裁切或映射不确定时先标
+`recheck_required`，脚本会生成单图复核队列并阻止封存；复核后改为 `clear` 或 `rechecked_unreadable`。看图耗时和
+失败数写入 `media_view_metrics`，详见 [media-viewing.md](media-viewing.md)。
+
+`apply-batch` 只重新读取本批新增或修改的 `document`/`chat_profile` 图片并保存哈希；未改图片复用已有
+`evidence_sha256`。观察缓存按内容哈希保存可见字段；`check`、`seal` 和 `finish` 仍全量读取原文件复核。
 
 ## 工作簿
 

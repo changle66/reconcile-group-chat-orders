@@ -345,6 +345,7 @@ def _flow_from_event(
             "side": side,
             "flow_type": FLOW_LABEL.get(side, side),
             "amount": core.decimal_text(amount),
+            "amount_basis": core.clean_text(ocr.get("amount_basis")) or None,
             "currency": currency,
             "payee": payee,
             "payee_state": core.clean_text(ocr.get("payee_state")).casefold() or None,

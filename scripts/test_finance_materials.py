@@ -27,7 +27,9 @@ class FinanceMaterialsTests(unittest.TestCase):
         photos = finance_export / "photos"
         photos.mkdir(parents=True)
         for name in ("passport-a.png", "wechat.png", "passport-repeat.png", "line.png"):
-            (photos / name).write_bytes(PNG_1X1)
+            # PNG readers ignore bytes after IEND; the suffix keeps each
+            # synthetic image valid while giving it a distinct content hash.
+            (photos / name).write_bytes(PNG_1X1 + name.encode("utf-8"))
         (finance_export / "result.json").write_text(
             json.dumps(
                 {
@@ -108,6 +110,7 @@ class FinanceMaterialsTests(unittest.TestCase):
                     str(work),
                     "--mode",
                     "finance",
+                    "--no-ocr-candidates",
                 ]
             )
         )
@@ -172,24 +175,28 @@ class FinanceMaterialsTests(unittest.TestCase):
         people: list[dict],
         media_decisions: dict[str, dict],
         batch_id: str,
+        media_observations: dict[str, dict] | None = None,
+        media_view_metrics: dict[str, int] | None = None,
     ) -> dict:
         batch_path = root / f"{batch_id}.json"
-        core.atomic_json(
-            batch_path,
-            {
-                "contract_version": reconcile.REVIEW_BATCH_CONTRACT,
-                "batch_id": batch_id,
-                "base_fingerprint": page["semantic_fingerprint"],
-                "page_commit": {
-                    "page_start": page["page_start"],
-                    "page_end": page["page_end"],
-                    "page_token": page["page_token"],
-                },
-                "open_people": [],
-                "media_decisions": media_decisions,
-                "people": people,
+        payload = {
+            "contract_version": reconcile.REVIEW_BATCH_CONTRACT,
+            "batch_id": batch_id,
+            "base_fingerprint": page["semantic_fingerprint"],
+            "page_commit": {
+                "page_start": page["page_start"],
+                "page_end": page["page_end"],
+                "page_token": page["page_token"],
             },
-        )
+            "open_people": [],
+            "media_decisions": media_decisions,
+            "people": people,
+        }
+        if media_observations is not None:
+            payload["media_observations"] = media_observations
+        if media_view_metrics is not None:
+            payload["media_view_metrics"] = media_view_metrics
+        core.atomic_json(batch_path, payload)
         return reconcile.review_command(
             Namespace(
                 work=work,
@@ -204,6 +211,20 @@ class FinanceMaterialsTests(unittest.TestCase):
             root = Path(temporary)
             work = self._start_fixture(root)
             page = self._page(work)
+            self.assertEqual(page["media_queue"]["mode"], "finance_materials")
+            self.assertEqual(
+                page["media_queue"]["recommended_parallel_limit"],
+                reconcile.FINANCE_MEDIA_BATCH_LIMIT,
+            )
+            self.assertEqual(page["media_queue"]["queued_images"], 4)
+            self.assertEqual(len(page["media_queue"]["batches"]), 1)
+            self.assertEqual(
+                [
+                    item["label"]
+                    for item in page["media_queue"]["batches"][0]["items"]
+                ],
+                ["M0001", "M0002", "M0003", "M0004"],
+            )
             media_decisions = {
                 "M0001": {"classification": "document", "viewed_original": True},
                 "M0002": {"classification": "chat_profile", "viewed_original": True},
@@ -217,14 +238,57 @@ class FinanceMaterialsTests(unittest.TestCase):
                 people=[self._confirmed_person()],
                 media_decisions=media_decisions,
                 batch_id="finance-confirmed-001",
+                media_observations={
+                    label: {
+                        "contract_version": reconcile.MEDIA_OBSERVATION_CONTRACT,
+                        "classification": media_decisions[label]["classification"],
+                        "review_status": "clear",
+                        "viewed_original": True,
+                        "recheck_reasons": [],
+                        **(
+                            {
+                                "facts": {
+                                    "holder": {
+                                        "name": "张三",
+                                        "surname": "ZHANG",
+                                        "given_names": "SAN",
+                                        "nationality": "CHINESE",
+                                        "birth_date": "1990-01-02",
+                                    },
+                                    "document": {
+                                        "type": "passport",
+                                        "country_code": "CHN",
+                                        "number": "E01234567",
+                                    },
+                                }
+                            }
+                            if label in {"M0001", "M0003"}
+                            else {}
+                        ),
+                    }
+                    for label in media_decisions
+                },
+                media_view_metrics={
+                    "view_batches": 1,
+                    "opened_images": 4,
+                    "failed_images": 0,
+                    "single_image_rechecks": 0,
+                    "elapsed_ms": 400,
+                },
             )
             self.assertEqual(applied["people"], 1)
             self.assertEqual(applied["documents"], 1)
             self.assertEqual(applied["accounts"], 2)
             self.assertEqual(applied["pending_people"], 0)
-            reconcile.review_command(
+            self.assertEqual(applied["evidence_hashes_computed"], 4)
+            self.assertEqual(applied["evidence_hashes_reused"], 0)
+            self.assertEqual(applied["observation_cache_entries"], 4)
+            self.assertEqual(applied["media_recheck_required"], 0)
+            sealed = reconcile.review_command(
                 Namespace(work=work, review_action="seal", group="财务资料群")
             )
+            self.assertEqual(sealed["evidence_hashes_computed"], 4)
+            self.assertEqual(sealed["evidence_hashes_reused"], 0)
             output = root / "财务资料.xlsx"
             result = reconcile.finish_run(
                 Namespace(

@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import platform as host_platform
 import re
+import subprocess
 import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -27,9 +29,20 @@ import simple_ledger
 
 
 RUN_CONTRACT = "group-chat-reconcile-run/1.0"
+RUNTIME_CONTRACT = "reconcile-current-runtime/1.0"
+AMOUNT_POLICY = "receiver-actual-received/1.0"
+WORKBOOK_COMPATIBILITY = "wps-xlsx-static-values/1.0"
 DECISION_CONTRACT = "group-chat-decision/3.2"
 REVIEW_PAGE_CONTRACT = "group-chat-review-page/2.0"
 REVIEW_BATCH_CONTRACT = "group-chat-review-batch/1.1"
+MEDIA_QUEUE_CONTRACT = "group-chat-media-queue/2.1"
+MEDIA_OBSERVATION_CONTRACT = "group-chat-media-observation/1.0"
+MEDIA_OBSERVATION_CACHE_CONTRACT = "group-chat-media-observation-cache/1.0"
+MEDIA_BATCH_POLICY_CONTRACT = "group-chat-media-batch-policy/1.0"
+OCR_CANDIDATE_CONFIG_CONTRACT = "group-chat-ocr-candidate-config/1.0"
+OCR_CANDIDATE_CONTRACT = "group-chat-ocr-candidate/1.0"
+OCR_CANDIDATE_CACHE_CONTRACT = "group-chat-ocr-candidate-cache/1.0"
+OCR_WORKER_CONTRACT = "group-chat-ocr-worker/1.0"
 EDIT_CONTROL_MODE = "review-apply-batch/1.1"
 LEGACY_DECISION_CONTRACT = "group-chat-decision/3.1"
 LEGACY_EDIT_CONTROL_MODE = "review-apply-batch/1.0"
@@ -37,6 +50,44 @@ NORMALIZER_VERSION = "reconcile-start/1.0"
 DEFAULT_PAGE_SIZE = 200
 MAX_PAGE_SIZE = 500
 DEFAULT_REVIEW_PAGE_OUTPUT_CHAR_BUDGET = 14_000
+ORDER_MEDIA_BATCH_LIMIT = 9
+FINANCE_MEDIA_BATCH_LIMIT = 4
+ORDER_MEDIA_BATCH_MIN = 4
+ORDER_MEDIA_BATCH_MAX = 12
+FINANCE_MEDIA_BATCH_MIN = 2
+FINANCE_MEDIA_BATCH_MAX = 6
+MEDIA_RECHECK_QUEUE_LIMIT = 20
+OCR_CANDIDATE_TEXT_LIMIT = 800
+OCR_CANDIDATE_PAGE_LIMIT = 20
+OCR_WORKER_TIMEOUT_SECONDS = 60
+MEDIA_REVIEW_STATUSES = frozenset(
+    {"clear", "recheck_required", "rechecked_unreadable"}
+)
+MEDIA_RECHECK_REASONS = frozenset(
+    {
+        "small_text",
+        "blurred",
+        "cropped",
+        "obscured",
+        "label_mapping_uncertain",
+        "conflicting_visible_fields",
+        "thumbnail_only",
+        "read_failure",
+        "amount_unreadable",
+        "payee_unreadable",
+        "document_field_unreadable",
+        "account_field_unreadable",
+        "other",
+    }
+)
+MEDIA_VIEW_METRIC_FIELDS = (
+    "view_batches",
+    "opened_images",
+    "failed_images",
+    "single_image_rechecks",
+    "elapsed_ms",
+    "observation_cache_reuses",
+)
 UNKNOWN_PAYEE_WARNING_MIN_TRANSFERS = 10
 FLOW_SIDES = frozenset({"payment", "payment_refund", "payout", "recovery", "unknown"})
 SIDE_EXCEPTION_SIDES = {
@@ -48,6 +99,9 @@ SIDE_EXCEPTION_SIDES = {
 ENTRY_KINDS = frozenset({"transfer", "cash"})
 ENTRY_RESULTS = frozenset({"completed", "failed", "pending", "not_shown", "unknown"})
 AMOUNT_STATES = frozenset({"clear", "partial", "unreadable"})
+AMOUNT_BASES = frozenset(
+    {"receiver_received", "cash_face_value", "attempted_not_received"}
+)
 NORMAL_PROCESSING_STATUS_MARKERS = (
     "确认中",
     "处理中",
@@ -144,6 +198,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     start.add_argument("--line-backup", action="append", default=[], type=Path)
     start.add_argument("--line-android-backup", action="append", default=[], type=Path)
     start.add_argument("--line-self-name", default="LINE_SELF")
+    start.add_argument(
+        "--ocr-candidates",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "enable or disable local OCR hints; default is disabled on all platforms"
+        ),
+    )
 
     review = commands.add_parser("review", help="read, validate, or seal one group review")
     review.add_argument("work", type=Path)
@@ -191,6 +253,121 @@ def _run_path(work: Path) -> Path:
     return work / "run.json"
 
 
+def _ocr_cache_path(work: Path) -> Path:
+    return work / "cache" / "ocr_candidates.json"
+
+
+def _host_platform_key(system_name: object | None = None) -> str:
+    value = core.clean_text(
+        host_platform.system() if system_name is None else system_name
+    ).casefold()
+    if value.startswith("win"):
+        return "windows"
+    if value in {"darwin", "mac", "macos", "osx"}:
+        return "macos"
+    if value == "linux":
+        return "linux"
+    return value or "other"
+
+
+def _resolve_ocr_candidate_config(
+    requested_value: object,
+    *,
+    system_name: object | None = None,
+) -> dict[str, Any]:
+    core.require(
+        requested_value is None or isinstance(requested_value, bool),
+        "OCR candidate setting must be automatic, enabled, or disabled",
+    )
+    platform_key = _host_platform_key(system_name)
+    requested = (
+        "auto"
+        if requested_value is None
+        else "enabled"
+        if requested_value
+        else "disabled"
+    )
+    default_enabled = False
+    enabled = default_enabled if requested == "auto" else requested == "enabled"
+    return {
+        "contract_version": OCR_CANDIDATE_CONFIG_CONTRACT,
+        "requested": requested,
+        "host_platform": platform_key,
+        "default_enabled": default_enabled,
+        "enabled": enabled,
+        "resolved_by": "platform_default" if requested == "auto" else "explicit",
+    }
+
+
+def _normalize_ocr_candidate_config(value: object, *, field: str) -> dict[str, Any]:
+    core.require(isinstance(value, Mapping), f"{field} must be an object")
+    allowed = {
+        "contract_version",
+        "requested",
+        "host_platform",
+        "default_enabled",
+        "enabled",
+        "resolved_by",
+    }
+    unknown = sorted(set(value) - allowed)
+    core.require(not unknown, f"{field} has unsupported fields: {', '.join(unknown)}")
+    core.require(
+        value.get("contract_version") == OCR_CANDIDATE_CONFIG_CONTRACT,
+        f"{field} has an unsupported contract",
+    )
+    requested = core.clean_text(value.get("requested"))
+    core.require(
+        requested in {"auto", "enabled", "disabled"},
+        f"{field}.requested must be auto, enabled, or disabled",
+    )
+    platform_key = core.clean_text(value.get("host_platform")).casefold()
+    core.require(bool(platform_key), f"{field}.host_platform is required")
+    default_enabled = value.get("default_enabled")
+    enabled = value.get("enabled")
+    core.require(
+        isinstance(default_enabled, bool) and isinstance(enabled, bool),
+        f"{field}.default_enabled and enabled must be booleans",
+    )
+    resolved_by = core.clean_text(value.get("resolved_by"))
+    core.require(
+        resolved_by in {"platform_default", "explicit", "legacy_safe_default"},
+        f"{field}.resolved_by is invalid",
+    )
+    if resolved_by == "platform_default":
+        core.require(requested == "auto", f"{field} platform default must use auto")
+        core.require(enabled == default_enabled, f"{field} platform default is inconsistent")
+    elif resolved_by == "explicit":
+        core.require(requested != "auto", f"{field} explicit setting cannot use auto")
+        core.require(
+            enabled == (requested == "enabled"),
+            f"{field} explicit setting is inconsistent",
+        )
+    return {
+        "contract_version": OCR_CANDIDATE_CONFIG_CONTRACT,
+        "requested": requested,
+        "host_platform": platform_key,
+        "default_enabled": default_enabled,
+        "enabled": enabled,
+        "resolved_by": resolved_by,
+    }
+
+
+def _ocr_candidate_config_for_run(run: Mapping[str, Any]) -> dict[str, Any]:
+    value = run.get("ocr_candidates")
+    if value is None:
+        # Old work directories must never begin loading OCR merely because they
+        # are resumed on a different host.
+        return {
+            "contract_version": OCR_CANDIDATE_CONFIG_CONTRACT,
+            "requested": "disabled",
+            "host_platform": "legacy",
+            "default_enabled": False,
+            "enabled": False,
+            "resolved_by": "legacy_safe_default",
+        }
+    return _normalize_ocr_candidate_config(value, field="run.ocr_candidates")
+
+
 def _snapshot_path(work: Path) -> Path:
     return work / "snapshot" / "normalized.json"
 
@@ -207,6 +384,17 @@ def _load_run(work: Path) -> dict[str, Any]:
     run = _load_json(path)
     core.require(run.get("contract_version") == RUN_CONTRACT, "unsupported run contract")
     core.require(isinstance(run.get("groups"), list), "run groups must be a list")
+    for field, expected in (
+        ("runtime_contract", RUNTIME_CONTRACT),
+        ("amount_policy", AMOUNT_POLICY),
+        ("workbook_compatibility", WORKBOOK_COMPATIBILITY),
+    ):
+        if field in run:
+            core.require(run.get(field) == expected, f"run {field} is unsupported")
+    if "ocr_candidates" in run:
+        run["ocr_candidates"] = _normalize_ocr_candidate_config(
+            run["ocr_candidates"], field="run.ocr_candidates"
+        )
     return run
 
 
@@ -534,6 +722,18 @@ def _decision_filename(group_key: str) -> str:
     return f"decision_{group_key.replace(':', '-')}.json"
 
 
+def _empty_media_observation_cache() -> dict[str, Any]:
+    return {
+        "contract_version": MEDIA_OBSERVATION_CACHE_CONTRACT,
+        "observation_contract": MEDIA_OBSERVATION_CONTRACT,
+        "entries": {},
+    }
+
+
+def _empty_media_view_metrics() -> dict[str, int]:
+    return {field: 0 for field in MEDIA_VIEW_METRIC_FIELDS}
+
+
 def _decision_template(
     normalized: Mapping[str, Any],
     group: Mapping[str, Any],
@@ -562,6 +762,8 @@ def _decision_template(
         "sealed": False,
         "sealed_decision_fingerprint": None,
         "media_decisions": {},
+        "media_observation_cache": _empty_media_observation_cache(),
+        "media_view_metrics": _empty_media_view_metrics(),
     }
     if group_mode == finance_materials.GROUP_MODE:
         decision.update(
@@ -706,9 +908,54 @@ def _filter_normalized_time_range(
     )
 
 
+def _capture_normalized_media_hashes(normalized: dict[str, Any]) -> dict[str, int]:
+    """Capture immutable content hashes once for selected evidence media."""
+
+    by_path: dict[str, str] = {}
+    computed = 0
+    reused = 0
+    for group in normalized.get("groups", []):
+        for message in group.get("messages", []):
+            for media in message.get("media", []):
+                if (
+                    not isinstance(media, dict)
+                    or not core.media_is_evidence(media)
+                    or media.get("availability") != "available"
+                ):
+                    continue
+                kind = core.clean_text(media.get("kind")).casefold()
+                mime_type = core.clean_text(media.get("mime_type")).casefold()
+                if kind != "image" and not mime_type.startswith("image/"):
+                    continue
+                path = Path(str(media.get("path") or "")).resolve()
+                core.require(path.is_file(), f"available media file is unavailable: {path}")
+                expected_size = media.get("byte_size")
+                actual_size = path.stat().st_size
+                core.require(
+                    expected_size == actual_size,
+                    f"media size changed while creating the snapshot: {path}",
+                )
+                path_key = str(path).casefold()
+                digest = by_path.get(path_key)
+                if digest is None:
+                    digest = core.sha256_file(path)
+                    by_path[path_key] = digest
+                    computed += 1
+                else:
+                    reused += 1
+                media["blob_sha256"] = digest
+    return {
+        "media_content_hashes_computed": computed,
+        "media_content_hashes_reused": reused,
+    }
+
+
 def start_run(args: argparse.Namespace) -> dict[str, Any]:
     work = args.work.resolve()
     core.require(not work.exists(), f"work directory already exists; start requires a new path: {work}")
+    ocr_candidate_config = _resolve_ocr_candidate_config(
+        getattr(args, "ocr_candidates", None)
+    )
     inputs = [path.resolve() for path in args.inputs]
     for path in inputs:
         core.require(path.exists(), f"input does not exist: {path}")
@@ -736,16 +983,15 @@ def start_run(args: argparse.Namespace) -> dict[str, Any]:
         (accounting_from is None) == (accounting_to is None),
         "--from and --to must be provided together",
     )
-    core.require(
-        accounting_date is None or accounting_from is None,
-        "--date cannot be combined with --from or --to",
-    )
+    if group_mode != "large":
+        core.require(
+            accounting_date is None or accounting_from is None,
+            "--date cannot be combined with --from or --to outside large mode",
+        )
     if group_mode == "large":
         core.require(
-            accounting_date is not None
-            and accounting_from is None
-            and accounting_to is None,
-            "--mode large requires exactly one accounting day via --date",
+            accounting_date is not None,
+            "--mode large requires one accounting date label via --date",
         )
     if accounting_from is not None and accounting_to is not None:
         core.require(
@@ -794,19 +1040,20 @@ def start_run(args: argparse.Namespace) -> dict[str, Any]:
         group_mode=group_mode,
         timezone_name=args.timezone,
     )
-    if accounting_date is not None:
-        normalized = _filter_normalized_date(
-            normalized,
-            accounting_date=accounting_date,
-            timezone_name=args.timezone,
-        )
-    elif accounting_from is not None and accounting_to is not None:
+    if accounting_from is not None and accounting_to is not None:
         normalized = _filter_normalized_time_range(
             normalized,
             accounting_from=accounting_from,
             accounting_to=accounting_to,
             timezone_name=args.timezone,
         )
+    elif accounting_date is not None:
+        normalized = _filter_normalized_date(
+            normalized,
+            accounting_date=accounting_date,
+            timezone_name=args.timezone,
+        )
+    media_hash_statistics = _capture_normalized_media_hashes(normalized)
     snapshot_path = _snapshot_path(work)
     core.atomic_json(snapshot_path, normalized)
     core.load_normalized(snapshot_path)
@@ -839,6 +1086,9 @@ def start_run(args: argparse.Namespace) -> dict[str, Any]:
         )
     run = {
         "contract_version": RUN_CONTRACT,
+        "runtime_contract": RUNTIME_CONTRACT,
+        "amount_policy": AMOUNT_POLICY,
+        "workbook_compatibility": WORKBOOK_COMPATIBILITY,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "accounting_timezone": args.timezone,
         "group_mode": group_mode,
@@ -848,6 +1098,7 @@ def start_run(args: argparse.Namespace) -> dict[str, Any]:
         "input_roots": [str(path) for path in inputs],
         "line_backups": [str(path) for path in line_backups],
         "line_android_backups": [str(path) for path in line_android_backups],
+        "ocr_candidates": ocr_candidate_config,
         "groups": group_reports,
     }
     if group_mode == "large":
@@ -856,20 +1107,25 @@ def start_run(args: argparse.Namespace) -> dict[str, Any]:
         run["group_name_contains"] = contains
     if accounting_date is not None:
         run["accounting_date"] = accounting_date
-    elif accounting_from is not None and accounting_to is not None:
+    if accounting_from is not None and accounting_to is not None:
         run["accounting_from"] = accounting_from
         run["accounting_to"] = accounting_to
     core.atomic_json(_run_path(work), run)
     result = {
         "work": str(work),
+        "runtime_contract": RUNTIME_CONTRACT,
+        "amount_policy": AMOUNT_POLICY,
+        "workbook_compatibility": WORKBOOK_COMPATIBILITY,
         "groups": len(group_reports),
         "messages": normalized["statistics"]["messages"],
         "evidence_media": sum(item["evidence_media"] for item in group_reports),
         "selected_groups": group_reports,
+        "ocr_candidates": ocr_candidate_config,
+        **media_hash_statistics,
     }
     if accounting_date is not None:
         result["accounting_date"] = accounting_date
-    elif accounting_from is not None and accounting_to is not None:
+    if accounting_from is not None and accounting_to is not None:
         result["accounting_from"] = accounting_from
         result["accounting_to"] = accounting_to
     return result
@@ -926,19 +1182,27 @@ def _decision_path(work: Path, run_group: Mapping[str, Any]) -> Path:
 
 
 def _semantic_fingerprint(decision: Mapping[str, Any]) -> str:
+    def with_media_review_state(material: dict[str, Any]) -> dict[str, Any]:
+        # Older controlled work directories did not contain these fields. Keep
+        # their approved fingerprints valid until a new batch adds the state.
+        for field in ("media_observation_cache", "media_view_metrics"):
+            if field in decision:
+                material[field] = decision.get(field)
+        return material
+
     if decision.get("contract_version") == finance_materials.DECISION_CONTRACT:
         return core.fingerprint_json(
-            {
+            with_media_review_state({
                 "reviewed_through": decision.get("reviewed_through"),
                 "read_complete": decision.get("read_complete"),
                 "media_decisions": decision.get("media_decisions"),
                 "people": decision.get("people"),
                 "open_people": decision.get("open_people"),
-            }
+            })
         )
     if decision.get("contract_version") == large_daily.LEGACY_DECISION_CONTRACT:
         return core.fingerprint_json(
-            {
+            with_media_review_state({
                 "reviewed_through": decision.get("reviewed_through"),
                 "read_complete": decision.get("read_complete"),
                 "media_decisions": decision.get("media_decisions"),
@@ -947,10 +1211,10 @@ def _semantic_fingerprint(decision: Mapping[str, Any]) -> str:
                 "unknown_payee_reviewed_entry_ids": decision.get(
                     "unknown_payee_reviewed_entry_ids"
                 ),
-            }
+            })
         )
     return core.fingerprint_json(
-        {
+        with_media_review_state({
             "reviewed_through": decision.get("reviewed_through"),
             "read_complete": decision.get("read_complete"),
             "media_decisions": decision.get("media_decisions"),
@@ -961,7 +1225,7 @@ def _semantic_fingerprint(decision: Mapping[str, Any]) -> str:
             "unknown_payee_reviewed_entry_ids": decision.get(
                 "unknown_payee_reviewed_entry_ids"
             ),
-        }
+        })
     )
 
 
@@ -1072,6 +1336,78 @@ def _require_controlled_semantics(
     return True
 
 
+def _normalize_media_view_metrics(value: object, *, field: str) -> dict[str, int]:
+    core.require(isinstance(value, Mapping), f"{field} must be an object")
+    unknown = sorted(set(value) - set(MEDIA_VIEW_METRIC_FIELDS))
+    core.require(not unknown, f"{field} has unsupported fields: {', '.join(unknown)}")
+    normalized: dict[str, int] = {}
+    for name in MEDIA_VIEW_METRIC_FIELDS:
+        raw = value.get(name, 0)
+        core.require(
+            isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0,
+            f"{field}.{name} must be a non-negative integer",
+        )
+        normalized[name] = raw
+    core.require(
+        normalized["failed_images"] <= normalized["opened_images"],
+        f"{field}.failed_images cannot exceed opened_images",
+    )
+    core.require(
+        normalized["single_image_rechecks"] <= normalized["opened_images"],
+        f"{field}.single_image_rechecks cannot exceed opened_images",
+    )
+    core.require(
+        normalized["opened_images"] == 0 or normalized["view_batches"] > 0,
+        f"{field}.view_batches is required when images were opened",
+    )
+    return normalized
+
+
+def _merge_media_view_metrics(
+    decision: dict[str, Any],
+    batch_metrics: object,
+) -> None:
+    if batch_metrics is None:
+        return
+    current = _normalize_media_view_metrics(
+        decision.get("media_view_metrics", _empty_media_view_metrics()),
+        field="decision.media_view_metrics",
+    )
+    update = _normalize_media_view_metrics(
+        batch_metrics,
+        field="review batch media_view_metrics",
+    )
+    decision["media_view_metrics"] = {
+        field: current[field] + update[field]
+        for field in MEDIA_VIEW_METRIC_FIELDS
+    }
+
+
+def _prune_media_observation_sources(
+    decision: dict[str, Any],
+    labels: set[str],
+) -> None:
+    if not labels or "media_observation_cache" not in decision:
+        return
+    cache = decision.get("media_observation_cache")
+    core.require(isinstance(cache, dict), "media_observation_cache must be an object")
+    entries = cache.get("entries")
+    core.require(isinstance(entries, dict), "media_observation_cache.entries must be an object")
+    for digest in list(entries):
+        entry = entries[digest]
+        core.require(isinstance(entry, dict), f"media_observation_cache.entries.{digest} must be an object")
+        source_labels = entry.get("source_labels")
+        core.require(
+            isinstance(source_labels, list),
+            f"media_observation_cache.entries.{digest}.source_labels must be a list",
+        )
+        remaining = [str(label) for label in source_labels if str(label) not in labels]
+        if remaining:
+            entry["source_labels"] = remaining
+        else:
+            del entries[digest]
+
+
 def _load_review_batch(path: Path) -> dict[str, Any]:
     core.require(path.is_file(), f"review batch does not exist: {path}")
     batch = _load_json(path)
@@ -1080,6 +1416,8 @@ def _load_review_batch(path: Path) -> dict[str, Any]:
         "batch_id",
         "base_fingerprint",
         "media_decisions",
+        "media_observations",
+        "media_view_metrics",
         "remove_media_labels",
         "orders",
         "remove_order_ids",
@@ -1152,6 +1490,33 @@ def _load_review_batch(path: Path) -> dict[str, Any]:
         )
     if "open_people" in batch:
         core.require(isinstance(batch["open_people"], list), "review batch open_people must be a list")
+    if "media_observations" in batch:
+        core.require(
+            isinstance(batch["media_observations"], Mapping),
+            "review batch media_observations must be an object keyed by M labels",
+        )
+        media_updates = batch.get("media_decisions", {})
+        core.require(
+            isinstance(media_updates, Mapping),
+            "review batch media_decisions must be an object when media_observations are supplied",
+        )
+        core.require(
+            set(batch["media_observations"]) == set(media_updates),
+            "review batch media_observations must contain exactly one result for every updated media label",
+        )
+    if "media_view_metrics" in batch:
+        core.require(
+            isinstance(batch["media_view_metrics"], Mapping),
+            "review batch media_view_metrics must be an object",
+        )
+        core.require(
+            "observation_cache_reuses" not in batch["media_view_metrics"],
+            "review batch media_view_metrics.observation_cache_reuses is maintained by the script",
+        )
+        batch["media_view_metrics"] = _normalize_media_view_metrics(
+            batch["media_view_metrics"],
+            field="review batch media_view_metrics",
+        )
     return batch
 
 
@@ -1181,6 +1546,12 @@ def _merge_review_batch(
         del candidate_media[label]
     for label, value in media_updates.items():
         candidate_media[str(label)] = copy.deepcopy(value)
+
+    _prune_media_observation_sources(
+        candidate,
+        {str(label) for label in media_updates} | set(remove_media),
+    )
+    _merge_media_view_metrics(candidate, batch.get("media_view_metrics"))
 
     if candidate.get("contract_version") == finance_materials.DECISION_CONTRACT:
         incompatible = (
@@ -1372,6 +1743,723 @@ def _merge_review_batch(
     return candidate
 
 
+def _media_content_hash_for_label(
+    group: Mapping[str, Any],
+    decision: Mapping[str, Any],
+    label: str,
+    *,
+    inventory: Mapping[str, tuple[Mapping[str, Any], Mapping[str, Any]]] | None = None,
+    verify_file: bool,
+) -> tuple[str, bool]:
+    if inventory is None:
+        inventory = _media_inventory(group)
+    core.require(label in inventory, f"unknown media label for content hash: {label}")
+    _, media = inventory[label]
+    core.require(media.get("availability") == "available", f"media is unavailable: {label}")
+    snapshot_hash = core.clean_text(media.get("blob_sha256"))
+    core.require(
+        not snapshot_hash or re.fullmatch(r"[0-9a-f]{64}", snapshot_hash) is not None,
+        f"{label}: snapshot media hash is invalid",
+    )
+    media_decisions = decision.get("media_decisions", {})
+    recorded_hash = ""
+    if isinstance(media_decisions, Mapping):
+        media_decision = media_decisions.get(label)
+        if isinstance(media_decision, Mapping):
+            recorded_hash = core.clean_text(media_decision.get("evidence_sha256"))
+    core.require(
+        not recorded_hash or re.fullmatch(r"[0-9a-f]{64}", recorded_hash) is not None,
+        f"{label}: recorded evidence hash is invalid",
+    )
+    if snapshot_hash and recorded_hash:
+        core.require(
+            snapshot_hash == recorded_hash,
+            f"{label}: evidence hash disagrees with the fixed media snapshot",
+        )
+    trusted = recorded_hash or snapshot_hash
+    if trusted and not verify_file:
+        return trusted, False
+    path = Path(str(media.get("path") or ""))
+    core.require(path.is_file(), f"{label}: original media file is unavailable: {path}")
+    actual = core.sha256_file(path)
+    if snapshot_hash:
+        core.require(
+            actual == snapshot_hash,
+            f"{label}: original media changed after the run snapshot was created",
+        )
+    if recorded_hash:
+        core.require(
+            actual == recorded_hash,
+            f"{label}: original media changed after review",
+        )
+    return actual, True
+
+
+def _order_observation_facts(media_decision: Mapping[str, Any]) -> dict[str, Any]:
+    if core.clean_text(media_decision.get("classification")).casefold() != "fund":
+        return {}
+    result: list[dict[str, Any]] = []
+    for raw_entry in media_decision.get("entries", []):
+        core.require(isinstance(raw_entry, Mapping), "fund observation entries must be objects")
+        entry: dict[str, Any] = {}
+        for field in (
+            "amount",
+            "amount_text",
+            "amount_basis",
+            "currency",
+            "payee",
+            "payee_state",
+            "kind",
+            "status_text",
+            "amount_state",
+        ):
+            if field in raw_entry and raw_entry.get(field) not in (None, ""):
+                entry[field] = copy.deepcopy(raw_entry.get(field))
+        result.append(entry)
+    return {"entries": result}
+
+
+def _finance_observation_target(
+    decision: Mapping[str, Any],
+    label: str,
+    classification: str,
+) -> tuple[dict[str, Any], int] | None:
+    matches: list[tuple[dict[str, Any], int]] = []
+    for person in decision.get("people", []):
+        if not isinstance(person, Mapping):
+            continue
+        if classification == "document":
+            for document in person.get("documents", []):
+                if not isinstance(document, Mapping):
+                    continue
+                labels = document.get("media_labels", [])
+                if isinstance(labels, list) and label in labels:
+                    holder = {
+                        field: core.clean_text(person.get(field))
+                        for field in (
+                            "name",
+                            "surname",
+                            "given_names",
+                            "nationality",
+                            "birth_date",
+                        )
+                        if core.clean_text(person.get(field))
+                    }
+                    document_facts = {
+                        field: core.clean_text(document.get(field))
+                        for field in ("type", "country_code", "number")
+                        if core.clean_text(document.get(field))
+                    }
+                    matches.append(
+                        ({"holder": holder, "document": document_facts}, len(labels))
+                    )
+        elif classification == "chat_profile":
+            for account in person.get("accounts", []):
+                if not isinstance(account, Mapping):
+                    continue
+                labels = account.get("media_labels", [])
+                if isinstance(labels, list) and label in labels:
+                    account_facts = {
+                        field: core.clean_text(account.get(field))
+                        for field in ("platform", "account_id", "phone")
+                        if core.clean_text(account.get(field))
+                    }
+                    matches.append(({"account": account_facts}, len(labels)))
+    core.require(
+        len(matches) <= 1,
+        f"{label}: finance material is assigned to multiple observation targets",
+    )
+    return matches[0] if matches else None
+
+
+def _normalize_finance_observation_facts(
+    value: object,
+    *,
+    classification: str,
+    canonical: dict[str, Any],
+    default_to_canonical: bool,
+    field: str,
+) -> dict[str, Any]:
+    if value is None:
+        if not default_to_canonical:
+            return {}
+        if classification == "document":
+            return (
+                {"document": copy.deepcopy(canonical["document"])}
+                if canonical.get("document")
+                else {}
+            )
+        return copy.deepcopy(canonical)
+    core.require(isinstance(value, Mapping), f"{field} must be an object")
+    allowed_sections = {
+        "document": {"holder", "document"},
+        "chat_profile": {"account"},
+        "reference": set(),
+    }[classification]
+    unknown_sections = sorted(set(value) - allowed_sections)
+    core.require(
+        not unknown_sections,
+        f"{field} has unsupported sections: {', '.join(unknown_sections)}",
+    )
+    allowed_fields = {
+        "holder": {"name", "surname", "given_names", "nationality", "birth_date"},
+        "document": {"type", "country_code", "number"},
+        "account": {"platform", "account_id", "phone"},
+    }
+    normalized: dict[str, Any] = {}
+    for section, raw_section in value.items():
+        core.require(isinstance(raw_section, Mapping), f"{field}.{section} must be an object")
+        unknown_fields = sorted(set(raw_section) - allowed_fields[section])
+        core.require(
+            not unknown_fields,
+            f"{field}.{section} has unsupported fields: {', '.join(unknown_fields)}",
+        )
+        section_values = {
+            name: core.clean_text(raw)
+            for name, raw in raw_section.items()
+            if core.clean_text(raw)
+        }
+        if section == "document" and "type" in section_values:
+            section_values["type"] = finance_materials.normalize_document_type(
+                section_values["type"], field=f"{field}.document.type"
+            )
+        if section == "document" and "country_code" in section_values:
+            section_values["country_code"] = section_values["country_code"].upper()
+        if section == "account" and "platform" in section_values:
+            section_values["platform"] = finance_materials.normalize_platform(
+                section_values["platform"], field=f"{field}.account.platform"
+            )
+        canonical_section = canonical.get(section, {})
+        if canonical_section:
+            for name, item in section_values.items():
+                core.require(
+                    canonical_section.get(name) == item,
+                    f"{field}.{section}.{name} disagrees with the submitted finance record",
+                )
+        if section_values:
+            normalized[section] = section_values
+    return normalized
+
+
+def _normalize_full_media_observation(
+    value: object,
+    *,
+    label: str,
+    decision: Mapping[str, Any],
+    field: str,
+) -> dict[str, Any]:
+    core.require(isinstance(value, Mapping), f"{field} must be an object")
+    unknown = sorted(
+        set(value)
+        - {
+            "contract_version",
+            "classification",
+            "review_status",
+            "viewed_original",
+            "recheck_reasons",
+            "facts",
+            "note",
+        }
+    )
+    core.require(not unknown, f"{field} has unsupported fields: {', '.join(unknown)}")
+    core.require(
+        value.get("contract_version") == MEDIA_OBSERVATION_CONTRACT,
+        f"{field}.contract_version must be {MEDIA_OBSERVATION_CONTRACT}",
+    )
+    media_decisions = decision.get("media_decisions")
+    core.require(isinstance(media_decisions, Mapping), "media_decisions must be an object")
+    media_decision = media_decisions.get(label)
+    core.require(isinstance(media_decision, Mapping), f"{field} cites an unclassified media label")
+    classification = core.clean_text(value.get("classification")).casefold()
+    decision_classification = core.clean_text(media_decision.get("classification")).casefold()
+    core.require(
+        classification == decision_classification,
+        f"{field}.classification must match media_decisions.{label}",
+    )
+    finance_mode = decision.get("contract_version") == finance_materials.DECISION_CONTRACT
+    allowed_classifications = (
+        finance_materials.MEDIA_CLASSIFICATIONS
+        if finance_mode
+        else {"fund", "reference"}
+    )
+    core.require(
+        classification in allowed_classifications,
+        f"{field}.classification is unsupported for this group mode",
+    )
+    review_status = core.clean_text(value.get("review_status")).casefold()
+    core.require(
+        review_status in MEDIA_REVIEW_STATUSES,
+        f"{field}.review_status must be clear, recheck_required, or rechecked_unreadable",
+    )
+    viewed_original = value.get("viewed_original")
+    core.require(isinstance(viewed_original, bool), f"{field}.viewed_original must be boolean")
+    if classification not in {"reference"}:
+        core.require(
+            viewed_original is True,
+            f"{field}.viewed_original must be true for {classification}",
+        )
+    reasons_value = value.get("recheck_reasons", [])
+    core.require(isinstance(reasons_value, list), f"{field}.recheck_reasons must be a list")
+    reasons = [core.clean_text(reason).casefold() for reason in reasons_value]
+    core.require(all(reasons), f"{field}.recheck_reasons cannot contain blanks")
+    core.require(len(reasons) == len(set(reasons)), f"{field}.recheck_reasons repeats a reason")
+    unsupported_reasons = sorted(set(reasons) - MEDIA_RECHECK_REASONS)
+    core.require(
+        not unsupported_reasons,
+        f"{field}.recheck_reasons has unsupported values: {', '.join(unsupported_reasons)}",
+    )
+    if review_status == "clear":
+        core.require(not reasons, f"{field}.recheck_reasons must be empty when review_status is clear")
+    else:
+        core.require(bool(reasons), f"{field}.recheck_reasons is required for {review_status}")
+
+    if finance_mode:
+        target = _finance_observation_target(decision, label, classification)
+        canonical = target[0] if target is not None else {}
+        facts = _normalize_finance_observation_facts(
+            value.get("facts"),
+            classification=classification,
+            canonical=canonical,
+            default_to_canonical=target is not None and target[1] == 1,
+            field=f"{field}.facts",
+        )
+        if classification != "reference" and review_status == "clear":
+            core.require(
+                bool(facts),
+                f"{field}.facts must include at least one visible document or account field",
+            )
+    else:
+        canonical = _order_observation_facts(media_decision)
+        supplied_facts = value.get("facts")
+        if supplied_facts is not None:
+            core.require(isinstance(supplied_facts, Mapping), f"{field}.facts must be an object")
+            core.require(
+                dict(supplied_facts) == canonical,
+                f"{field}.facts must match the normalized visible fields in media_decisions.{label}",
+            )
+        facts = canonical
+        derived_recheck_reasons: list[str] = []
+        if classification == "fund":
+            fact_entries = facts.get("entries", [])
+            if any(
+                entry.get("amount_state") in {"partial", "unreadable"}
+                for entry in fact_entries
+                if isinstance(entry, Mapping)
+            ):
+                derived_recheck_reasons.append("amount_unreadable")
+            if any(
+                entry.get("payee_state") == "unreadable"
+                for entry in fact_entries
+                if isinstance(entry, Mapping)
+            ):
+                derived_recheck_reasons.append("payee_unreadable")
+        if derived_recheck_reasons:
+            core.require(
+                review_status != "clear",
+                f"{field}.review_status cannot be clear while visible fund fields are unreadable",
+            )
+            for reason in derived_recheck_reasons:
+                if reason not in reasons:
+                    reasons.append(reason)
+
+    observation = {
+        "contract_version": MEDIA_OBSERVATION_CONTRACT,
+        "classification": classification,
+        "review_status": review_status,
+        "viewed_original": viewed_original,
+        "recheck_reasons": reasons,
+        "facts": facts,
+    }
+    note = core.clean_text(value.get("note"))
+    if note:
+        observation["note"] = note
+    return observation
+
+
+def _apply_media_observations(
+    decision: dict[str, Any],
+    batch: Mapping[str, Any],
+    group: Mapping[str, Any],
+) -> dict[str, int]:
+    updates = batch.get("media_observations")
+    if updates is None:
+        return {
+            "media_observations_recorded": 0,
+            "observation_cache_reuses": 0,
+            "observation_hashes_computed": 0,
+            "observation_hashes_reused": 0,
+        }
+    assert isinstance(updates, Mapping)
+    inventory = _media_inventory(group)
+    label_hashes: dict[str, str] = {}
+    hashes_computed = 0
+    hashes_reused = 0
+    for label in updates:
+        digest, computed = _media_content_hash_for_label(
+            group,
+            decision,
+            str(label),
+            inventory=inventory,
+            verify_file=False,
+        )
+        label_hashes[str(label)] = digest
+        if computed:
+            hashes_computed += 1
+        else:
+            hashes_reused += 1
+
+    cache = decision.setdefault("media_observation_cache", _empty_media_observation_cache())
+    core.require(isinstance(cache, dict), "media_observation_cache must be an object")
+    core.require(
+        cache.get("contract_version") == MEDIA_OBSERVATION_CACHE_CONTRACT,
+        "unsupported media_observation_cache contract",
+    )
+    core.require(
+        cache.get("observation_contract") == MEDIA_OBSERVATION_CONTRACT,
+        "unsupported media observation contract in cache",
+    )
+    entries = cache.get("entries")
+    core.require(isinstance(entries, dict), "media_observation_cache.entries must be an object")
+
+    resolved: dict[str, dict[str, Any]] = {}
+    reuse_count = 0
+    for raw_label, raw_observation in updates.items():
+        label = str(raw_label)
+        core.require(isinstance(raw_observation, Mapping), f"media_observations.{label} must be an object")
+        if "reuse_from" in raw_observation:
+            core.require(
+                set(raw_observation) == {"reuse_from"},
+                f"media_observations.{label}.reuse_from cannot be combined with other fields",
+            )
+            source_label = core.clean_text(raw_observation.get("reuse_from"))
+            core.require(
+                source_label in resolved,
+                f"media_observations.{label}.reuse_from must cite an earlier full observation in this batch",
+            )
+            core.require(
+                label_hashes[label] == label_hashes.get(source_label),
+                f"media_observations.{label}.reuse_from is only allowed for byte-identical media",
+            )
+            resolved[label] = copy.deepcopy(resolved[source_label])
+            resolved[label] = _normalize_full_media_observation(
+                resolved[label],
+                label=label,
+                decision=decision,
+                field=f"media_observations.{label}",
+            )
+            reuse_count += 1
+            continue
+        if "reuse_sha256" in raw_observation:
+            core.require(
+                set(raw_observation) == {"reuse_sha256"},
+                f"media_observations.{label}.reuse_sha256 cannot be combined with other fields",
+            )
+            digest = core.clean_text(raw_observation.get("reuse_sha256"))
+            core.require(
+                re.fullmatch(r"[0-9a-f]{64}", digest) is not None,
+                f"media_observations.{label}.reuse_sha256 must be a lowercase SHA-256",
+            )
+            core.require(
+                digest == label_hashes[label],
+                f"media_observations.{label}.reuse_sha256 does not match the current media",
+            )
+            cache_entry = entries.get(digest)
+            core.require(
+                isinstance(cache_entry, Mapping),
+                f"media_observations.{label}.reuse_sha256 is not present in the observation cache",
+            )
+            cached_observation = cache_entry.get("observation")
+            core.require(
+                isinstance(cached_observation, Mapping),
+                f"media_observations.{label}.reuse_sha256 has an invalid cached observation",
+            )
+            core.require(
+                cached_observation.get("review_status") != "recheck_required",
+                f"media_observations.{label} cannot reuse an observation that still requires recheck",
+            )
+            resolved[label] = _normalize_full_media_observation(
+                cached_observation,
+                label=label,
+                decision=decision,
+                field=f"media_observations.{label}",
+            )
+            reuse_count += 1
+            continue
+        resolved[label] = _normalize_full_media_observation(
+            raw_observation,
+            label=label,
+            decision=decision,
+            field=f"media_observations.{label}",
+        )
+
+    for label, observation in resolved.items():
+        digest = label_hashes[label]
+        existing = entries.get(digest)
+        source_labels: list[str] = []
+        if isinstance(existing, Mapping):
+            existing_labels = existing.get("source_labels", [])
+            core.require(
+                isinstance(existing_labels, list),
+                f"media_observation_cache.entries.{digest}.source_labels must be a list",
+            )
+            source_labels = [str(item) for item in existing_labels]
+        source_labels.append(label)
+        entries[digest] = {
+            "observation": copy.deepcopy(observation),
+            "source_labels": sorted(set(source_labels)),
+        }
+    metrics = decision.setdefault("media_view_metrics", _empty_media_view_metrics())
+    normalized_metrics = _normalize_media_view_metrics(
+        metrics,
+        field="decision.media_view_metrics",
+    )
+    normalized_metrics["observation_cache_reuses"] += reuse_count
+    decision["media_view_metrics"] = normalized_metrics
+    return {
+        "media_observations_recorded": len(resolved),
+        "observation_cache_reuses": reuse_count,
+        "observation_hashes_computed": hashes_computed,
+        "observation_hashes_reused": hashes_reused,
+    }
+
+
+def _media_view_performance(decision: Mapping[str, Any]) -> dict[str, Any]:
+    metrics = _normalize_media_view_metrics(
+        decision.get("media_view_metrics", _empty_media_view_metrics()),
+        field="decision.media_view_metrics",
+    )
+    opened = metrics["opened_images"]
+    return {
+        **metrics,
+        "average_ms_per_opened_image": (
+            metrics["elapsed_ms"] / opened if opened else 0.0
+        ),
+        "failed_image_rate": metrics["failed_images"] / opened if opened else 0.0,
+        "single_image_recheck_rate": (
+            metrics["single_image_rechecks"] / opened if opened else 0.0
+        ),
+    }
+
+
+def _adaptive_media_batch_policy(
+    decision: Mapping[str, Any],
+    *,
+    finance_mode: bool,
+) -> dict[str, Any]:
+    default_limit = (
+        FINANCE_MEDIA_BATCH_LIMIT if finance_mode else ORDER_MEDIA_BATCH_LIMIT
+    )
+    minimum_limit = FINANCE_MEDIA_BATCH_MIN if finance_mode else ORDER_MEDIA_BATCH_MIN
+    maximum_limit = FINANCE_MEDIA_BATCH_MAX if finance_mode else ORDER_MEDIA_BATCH_MAX
+    performance = _media_view_performance(decision)
+    opened = int(performance["opened_images"])
+    view_batches = int(performance["view_batches"])
+    failed_rate = float(performance["failed_image_rate"])
+    recheck_rate = float(performance["single_image_recheck_rate"])
+    elapsed_ms = int(performance["elapsed_ms"])
+    average_batch_ms = elapsed_ms / view_batches if view_batches else 0.0
+
+    recommended = default_limit
+    reason = "insufficient_samples"
+    if opened > 0 and (
+        failed_rate >= 0.30
+        or recheck_rate >= 0.40
+        or (average_batch_ms >= 90_000 and elapsed_ms > 0)
+    ):
+        recommended = minimum_limit
+        reason = "severe_failure_recheck_or_latency"
+    elif opened > 0 and (
+        failed_rate >= 0.15
+        or recheck_rate >= 0.25
+        or (average_batch_ms >= 60_000 and elapsed_ms > 0)
+    ):
+        recommended = max(
+            minimum_limit,
+            default_limit - (2 if finance_mode else 3),
+        )
+        reason = "high_failure_recheck_or_latency"
+    elif opened >= default_limit and (
+        failed_rate >= 0.05
+        or recheck_rate >= 0.12
+        or (average_batch_ms >= 35_000 and elapsed_ms > 0)
+    ):
+        recommended = max(
+            minimum_limit,
+            default_limit - (1 if finance_mode else 2),
+        )
+        reason = "moderate_failure_recheck_or_latency"
+    elif (
+        opened >= default_limit * 4
+        and elapsed_ms > 0
+        and failed_rate == 0
+        and recheck_rate <= 0.02
+        and average_batch_ms <= 10_000
+    ):
+        recommended = maximum_limit
+        reason = "long_sustained_fast_clear_batches"
+    elif (
+        opened >= default_limit * 2
+        and elapsed_ms > 0
+        and failed_rate == 0
+        and recheck_rate <= 0.03
+        and average_batch_ms <= 15_000
+    ):
+        recommended = min(maximum_limit, default_limit + 2)
+        reason = "sustained_fast_clear_batches"
+    elif (
+        opened >= default_limit
+        and elapsed_ms > 0
+        and failed_rate <= 0.02
+        and recheck_rate <= 0.06
+        and average_batch_ms <= 25_000
+    ):
+        recommended = min(maximum_limit, default_limit + 1)
+        reason = "fast_clear_batches"
+    elif opened >= default_limit:
+        reason = "stable_default"
+
+    return {
+        "contract_version": MEDIA_BATCH_POLICY_CONTRACT,
+        "strategy": "adaptive-v1",
+        "minimum_parallel_limit": minimum_limit,
+        "default_parallel_limit": default_limit,
+        "maximum_parallel_limit": maximum_limit,
+        "recommended_parallel_limit": recommended,
+        "reason": reason,
+        "sample_opened_images": opened,
+        "sample_view_batches": view_batches,
+        "average_batch_elapsed_ms": average_batch_ms,
+        "failed_image_rate": failed_rate,
+        "single_image_recheck_rate": recheck_rate,
+    }
+
+
+def _validate_media_observation_cache(
+    group: Mapping[str, Any],
+    decision: dict[str, Any],
+    *,
+    require_complete: bool,
+    verify_files: bool,
+) -> dict[str, Any]:
+    cache = decision.get("media_observation_cache")
+    if cache is None:
+        return {
+            "observation_cache_entries": 0,
+            "observation_cache_labels": 0,
+            "media_recheck_required": 0,
+            "media_recheck_queue": [],
+            "media_view_performance": _media_view_performance(decision),
+        }
+    core.require(isinstance(cache, dict), "media_observation_cache must be an object")
+    unknown_cache = sorted(
+        set(cache) - {"contract_version", "observation_contract", "entries"}
+    )
+    core.require(
+        not unknown_cache,
+        "media_observation_cache has unsupported fields: " + ", ".join(unknown_cache),
+    )
+    core.require(
+        cache.get("contract_version") == MEDIA_OBSERVATION_CACHE_CONTRACT,
+        "unsupported media_observation_cache contract",
+    )
+    core.require(
+        cache.get("observation_contract") == MEDIA_OBSERVATION_CONTRACT,
+        "unsupported media observation contract in cache",
+    )
+    entries = cache.get("entries")
+    core.require(isinstance(entries, dict), "media_observation_cache.entries must be an object")
+    inventory = _media_inventory(group)
+    pending: list[dict[str, Any]] = []
+    label_count = 0
+    verified_paths: set[str] = set()
+    for digest, raw_entry in entries.items():
+        field = f"media_observation_cache.entries.{digest}"
+        core.require(
+            re.fullmatch(r"[0-9a-f]{64}", str(digest)) is not None,
+            f"{field}: key must be a lowercase SHA-256",
+        )
+        core.require(isinstance(raw_entry, dict), f"{field} must be an object")
+        unknown_entry = sorted(set(raw_entry) - {"observation", "source_labels"})
+        core.require(not unknown_entry, f"{field} has unsupported fields: {', '.join(unknown_entry)}")
+        source_value = raw_entry.get("source_labels")
+        core.require(isinstance(source_value, list) and source_value, f"{field}.source_labels is required")
+        source_labels = [str(label) for label in source_value]
+        core.require(
+            len(source_labels) == len(set(source_labels)),
+            f"{field}.source_labels repeats a label",
+        )
+        core.require(
+            source_labels == sorted(source_labels),
+            f"{field}.source_labels must be sorted",
+        )
+        normalized_observation: dict[str, Any] | None = None
+        for label in source_labels:
+            core.require(label in inventory, f"{field}.source_labels contains unknown media: {label}")
+            _, source_media = inventory[label]
+            source_path_key = str(Path(str(source_media.get("path") or "")).resolve()).casefold()
+            media_decision = decision.get("media_decisions", {}).get(label, {})
+            evidence_was_verified = bool(
+                isinstance(media_decision, Mapping)
+                and core.clean_text(media_decision.get("evidence_sha256"))
+            )
+            should_verify = (
+                verify_files
+                and not evidence_was_verified
+                and source_path_key not in verified_paths
+            )
+            current_hash, _ = _media_content_hash_for_label(
+                group,
+                decision,
+                label,
+                inventory=inventory,
+                verify_file=should_verify,
+            )
+            core.require(current_hash == digest, f"{field} is indexed under the wrong media hash")
+            if verify_files and (should_verify or evidence_was_verified):
+                verified_paths.add(source_path_key)
+            normalized = _normalize_full_media_observation(
+                raw_entry.get("observation"),
+                label=label,
+                decision=decision,
+                field=f"{field}.observation",
+            )
+            if normalized_observation is None:
+                normalized_observation = normalized
+            else:
+                core.require(
+                    normalized == normalized_observation,
+                    f"{field}.observation is not compatible with all source labels",
+                )
+        assert normalized_observation is not None
+        raw_entry["observation"] = normalized_observation
+        raw_entry["source_labels"] = source_labels
+        label_count += len(source_labels)
+        if normalized_observation["review_status"] == "recheck_required":
+            representative = source_labels[0]
+            _, media = inventory[representative]
+            pending.append(
+                {
+                    "content_sha256": digest,
+                    "representative_label": representative,
+                    "covered_labels": source_labels,
+                    "path": media.get("path"),
+                    "recheck_reasons": normalized_observation["recheck_reasons"],
+                }
+            )
+    core.require(
+        not require_complete or not pending,
+        "media observation recheck is still required: "
+        + ", ".join(item["representative_label"] for item in pending[:20]),
+    )
+    return {
+        "observation_cache_entries": len(entries),
+        "observation_cache_labels": label_count,
+        "media_recheck_required": len(pending),
+        "media_recheck_queue": pending[:MEDIA_RECHECK_QUEUE_LIMIT],
+        "media_view_performance": _media_view_performance(decision),
+    }
+
+
 def _validate_entry(
     entry: dict[str, Any],
     *,
@@ -1383,6 +2471,7 @@ def _validate_entry(
     allowed = {
         "amount",
         "amount_text",
+        "amount_basis",
         "currency",
         "payee",
         "payee_state",
@@ -1546,6 +2635,32 @@ def _validate_entry(
     if amount_state == "clear":
         core.require(entry.get("amount") not in (None, ""), f"{field}.amount is required when amount_state is clear")
         core.require(entry.get("currency") not in (None, ""), f"{field}.currency is required when amount_state is clear")
+        expected_amount_basis = (
+            "cash_face_value"
+            if kind == "cash"
+            else "receiver_received"
+            if result == "completed"
+            else "attempted_not_received"
+        )
+        amount_basis = core.clean_text(entry.get("amount_basis")).casefold()
+        if not amount_basis:
+            amount_basis = expected_amount_basis
+        core.require(
+            amount_basis in AMOUNT_BASES,
+            f"{field}.amount_basis is unsupported",
+        )
+        core.require(
+            amount_basis == expected_amount_basis,
+            f"{field}.amount_basis must be {expected_amount_basis}",
+        )
+        entry["amount_basis"] = amount_basis
+    elif entry.get("amount_basis") not in (None, ""):
+        amount_basis = core.clean_text(entry.get("amount_basis")).casefold()
+        core.require(
+            amount_basis in AMOUNT_BASES,
+            f"{field}.amount_basis is unsupported",
+        )
+        entry["amount_basis"] = amount_basis
     if entry.get("payee_state") in (None, ""):
         payee_text = core.clean_text(entry.get("payee"))
         entry["payee_state"] = (
@@ -2020,6 +3135,7 @@ def _validate_large_media_decisions(
     *,
     require_complete: bool,
     capture_hashes: bool,
+    rehash_labels: set[str] | None,
 ) -> tuple[dict[str, Any], set[str], set[str]]:
     inventory = _media_inventory(group)
     label_by_message_id, message_by_label = _message_labels(group)
@@ -2051,6 +3167,8 @@ def _validate_large_media_decisions(
     unreadable_payees: set[str] = set()
     reference_count = 0
     fund_media_count = 0
+    evidence_hashes_computed = 0
+    evidence_hashes_reused = 0
     for label, raw in media_decisions.items():
         field = f"{group.get('group_key')}.media_decisions.{label}"
         core.require(isinstance(raw, dict), f"{field} must be an object")
@@ -2081,14 +3199,35 @@ def _validate_large_media_decisions(
         message, media = inventory[label]
         media_path = Path(str(media.get("path") or ""))
         core.require(media_path.is_file(), f"{field}: original media file is unavailable: {media_path}")
-        actual_hash = core.sha256_file(media_path)
         recorded_hash = core.clean_text(raw.get("evidence_sha256"))
-        if recorded_hash:
-            core.require(recorded_hash == actual_hash, f"{field}: original fund evidence changed after review")
-        elif capture_hashes:
-            raw["evidence_sha256"] = actual_hash
+        verify_hash = (
+            rehash_labels is None
+            or label in rehash_labels
+            or (capture_hashes and not recorded_hash)
+        )
+        resolved_hash, computed = core.validate_cached_file_hash(
+            media_path,
+            recorded_hash,
+            verify=verify_hash,
+            changed_message=f"{field}: original fund evidence changed after review",
+        )
+        snapshot_hash = core.clean_text(media.get("blob_sha256"))
+        if computed and snapshot_hash:
+            core.require(
+                resolved_hash == snapshot_hash,
+                f"{field}: original fund evidence changed after the run snapshot was created",
+            )
+        if computed:
+            evidence_hashes_computed += 1
+        elif recorded_hash:
+            evidence_hashes_reused += 1
+        if not recorded_hash and capture_hashes:
+            raw["evidence_sha256"] = resolved_hash
         elif require_complete:
-            raise ValueError(f"{field}: evidence hash has not been captured; run review seal")
+            core.require(
+                bool(recorded_hash),
+                f"{field}: evidence hash has not been captured; run review seal",
+            )
         source_message_label = label_by_message_id[str(message.get("message_id") or "")]
         for entry_position, entry in enumerate(entries, start=1):
             core.require(
@@ -2154,6 +3293,8 @@ def _validate_large_media_decisions(
             "unknown_payee_warning": int(warning),
             "unknown_payee_review_required": int(bool(unreadable_payees)),
             "unreviewed_unknown_payees": len(unreviewed),
+            "evidence_hashes_computed": evidence_hashes_computed,
+            "evidence_hashes_reused": evidence_hashes_reused,
         },
         entry_ids,
         completed_entry_ids,
@@ -2167,6 +3308,7 @@ def _validate_large_decision(
     *,
     require_complete: bool,
     capture_hashes: bool,
+    rehash_labels: set[str] | None,
 ) -> dict[str, Any]:
     expected = _decision_template(normalized, group, group_mode="large")
     core.require(
@@ -2215,6 +3357,7 @@ def _validate_large_decision(
         decision,
         require_complete=require_complete,
         capture_hashes=capture_hashes,
+        rehash_labels=rehash_labels,
     )
     _, message_by_label = _message_labels(group)
     exchange_statistics = large_daily.validate_exchanges(
@@ -2243,6 +3386,7 @@ def _validate_decision(
     *,
     require_complete: bool,
     capture_hashes: bool,
+    rehash_labels: set[str] | None = None,
 ) -> dict[str, Any]:
     if decision.get("contract_version") == finance_materials.DECISION_CONTRACT:
         expected = _decision_template(
@@ -2250,22 +3394,42 @@ def _validate_decision(
             group,
             group_mode=finance_materials.GROUP_MODE,
         )
-        return finance_materials.validate_decision(
+        statistics = finance_materials.validate_decision(
             normalized,
             group,
             decision,
             expected,
             require_complete=require_complete,
             capture_hashes=capture_hashes,
+            rehash_labels=rehash_labels,
         )
+        return {
+            **statistics,
+            **_validate_media_observation_cache(
+                group,
+                decision,
+                require_complete=require_complete,
+                verify_files=rehash_labels is None,
+            ),
+        }
     if decision.get("contract_version") == large_daily.LEGACY_DECISION_CONTRACT:
-        return _validate_large_decision(
+        statistics = _validate_large_decision(
             normalized,
             group,
             decision,
             require_complete=require_complete,
             capture_hashes=capture_hashes,
+            rehash_labels=rehash_labels,
         )
+        return {
+            **statistics,
+            **_validate_media_observation_cache(
+                group,
+                decision,
+                require_complete=require_complete,
+                verify_files=rehash_labels is None,
+            ),
+        }
     decision_contract = core.clean_text(decision.get("contract_version"))
     large_order_mode = decision_contract == large_daily.DECISION_CONTRACT
     expected_contract = large_daily.DECISION_CONTRACT if large_order_mode else DECISION_CONTRACT
@@ -2331,6 +3495,8 @@ def _validate_decision(
     unreadable_payee_entry_ids: set[str] = set()
     reference_count = 0
     fund_media_count = 0
+    evidence_hashes_computed = 0
+    evidence_hashes_reused = 0
     for label, raw in media_decisions.items():
         field = f"{group.get('group_key')}.media_decisions.{label}"
         core.require(isinstance(raw, dict), f"{field} must be an object")
@@ -2349,14 +3515,35 @@ def _validate_decision(
         message, media = inventory[label]
         media_path = Path(str(media.get("path") or ""))
         core.require(media_path.is_file(), f"{field}: original media file is unavailable: {media_path}")
-        actual_hash = core.sha256_file(media_path)
         recorded_hash = core.clean_text(raw.get("evidence_sha256"))
-        if recorded_hash:
-            core.require(recorded_hash == actual_hash, f"{field}: original fund evidence changed after review")
-        elif capture_hashes:
-            raw["evidence_sha256"] = actual_hash
+        verify_hash = (
+            rehash_labels is None
+            or label in rehash_labels
+            or (capture_hashes and not recorded_hash)
+        )
+        resolved_hash, computed = core.validate_cached_file_hash(
+            media_path,
+            recorded_hash,
+            verify=verify_hash,
+            changed_message=f"{field}: original fund evidence changed after review",
+        )
+        snapshot_hash = core.clean_text(media.get("blob_sha256"))
+        if computed and snapshot_hash:
+            core.require(
+                resolved_hash == snapshot_hash,
+                f"{field}: original fund evidence changed after the run snapshot was created",
+            )
+        if computed:
+            evidence_hashes_computed += 1
+        elif recorded_hash:
+            evidence_hashes_reused += 1
+        if not recorded_hash and capture_hashes:
+            raw["evidence_sha256"] = resolved_hash
         elif require_complete:
-            raise ValueError(f"{field}: evidence hash has not been captured; run review seal")
+            core.require(
+                bool(recorded_hash),
+                f"{field}: evidence hash has not been captured; run review seal",
+            )
         for position, entry in enumerate(entries, start=1):
             core.require(isinstance(entry, dict), f"{field}.entries[{position - 1}] must be an object")
             source_message_label = label_by_message_id[
@@ -3010,20 +4197,624 @@ def _validate_decision(
         "unknown_payee_warning": int(unknown_payee_warning),
         "unknown_payee_review_required": int(unknown_payee_review_required),
         "unreviewed_unknown_payees": len(unreviewed_unknown_payees),
+        "evidence_hashes_computed": evidence_hashes_computed,
+        "evidence_hashes_reused": evidence_hashes_reused,
+        **_validate_media_observation_cache(
+            group,
+            decision,
+            require_complete=require_complete,
+            verify_files=rehash_labels is None,
+        ),
     }
 
 
-def _compact_page(group: Mapping[str, Any], start: int, end: int) -> tuple[list[dict[str, Any]], int]:
+def _review_media_queue(
+    group: Mapping[str, Any],
+    decision: Mapping[str, Any],
+    start: int,
+    end: int,
+    *,
+    media_labels: Mapping[str, str] | None = None,
+    inventory: Mapping[str, tuple[Mapping[str, Any], Mapping[str, Any]]] | None = None,
+    media_hashes: Mapping[str, str] | None = None,
+    content_hashes_computed: int = 0,
+    content_hashes_reused: int = 0,
+) -> dict[str, Any]:
+    if inventory is None:
+        inventory = _media_inventory(group)
+    if media_labels is None:
+        media_labels = {
+            str(media.get("media_id") or ""): label
+            for label, (_, media) in inventory.items()
+        }
+    finance_mode = decision.get("contract_version") == finance_materials.DECISION_CONTRACT
+    batch_policy = _adaptive_media_batch_policy(
+        decision,
+        finance_mode=finance_mode,
+    )
+    parallel_limit = int(batch_policy["recommended_parallel_limit"])
+    classified = set(decision.get("media_decisions", {}))
+    cache = decision.get("media_observation_cache", {})
+    cache_entries = (
+        cache.get("entries", {})
+        if isinstance(cache, Mapping) and isinstance(cache.get("entries", {}), Mapping)
+        else {}
+    )
+    batches: list[dict[str, Any]] = []
+    non_parallel_items: list[dict[str, Any]] = []
+    missing_labels: list[str] = []
+    current_items: list[dict[str, Any]] = []
+    representative_items: dict[str, dict[str, Any]] = {}
+    duplicate_aliases: list[dict[str, Any]] = []
+    cache_hits_by_hash: dict[str, dict[str, Any]] = {}
+
+    def flush_current() -> None:
+        nonlocal current_items
+        if not current_items:
+            return
+        batches.append(
+            {
+                "batch_id": f"V{start + 1:05d}-{len(batches) + 1:03d}",
+                "view_detail": "original",
+                "parallel": len(current_items) > 1,
+                "items": current_items,
+            }
+        )
+        current_items = []
+
     messages = list(group.get("messages", []))
-    label_by_id, _ = _message_labels(group)
-    message_by_id = {
-        str(message.get("message_id") or ""): message
-        for message in messages
+    already_classified = 0
+    for message_position in range(start, end):
+        message = messages[message_position]
+        message_label = f"S{message_position + 1:05d}"
+        for media in message.get("media", []):
+            if not isinstance(media, Mapping) or not core.media_is_evidence(media):
+                continue
+            label = media_labels.get(str(media.get("media_id") or ""))
+            if not label:
+                continue
+            if label in classified:
+                already_classified += 1
+                continue
+            if media.get("availability") != "available":
+                missing_labels.append(label)
+                continue
+            source_variant = core.clean_text(media.get("variant")) or core.clean_text(
+                media.get("source_field")
+            )
+            quality_warning = (
+                "thumbnail_only"
+                if "thumbnail" in source_variant.casefold()
+                else None
+            )
+            item = {
+                "label": label,
+                "message_label": message_label,
+                "path": media.get("path"),
+                "kind": media.get("kind"),
+                "mime_type": media.get("mime_type"),
+                "byte_size": media.get("byte_size"),
+                "source_variant": source_variant or None,
+                "sender": message.get("sender_name") or message.get("sender_id"),
+                "role": message.get("role"),
+            }
+            if quality_warning:
+                item["quality_warning"] = quality_warning
+            mime_type = core.clean_text(media.get("mime_type")).casefold()
+            kind = core.clean_text(media.get("kind")).casefold()
+            path = core.clean_text(media.get("path"))
+            parallel_viewable = bool(path) and (
+                kind == "image" or mime_type.startswith("image/")
+            )
+            if not parallel_viewable:
+                flush_current()
+                non_parallel_items.append(
+                    {
+                        **item,
+                        "reason": "not_a_directly_viewable_image" if path else "missing_path",
+                    }
+                )
+                continue
+            digest = core.clean_text((media_hashes or {}).get(label))
+            if not digest:
+                digest, computed = _media_content_hash_for_label(
+                    group,
+                    decision,
+                    label,
+                    inventory=inventory,
+                    verify_file=False,
+                )
+                if computed:
+                    content_hashes_computed += 1
+                else:
+                    content_hashes_reused += 1
+            item["content_sha256"] = digest
+            cached_entry = cache_entries.get(digest)
+            cached_observation = (
+                cached_entry.get("observation")
+                if isinstance(cached_entry, Mapping)
+                and isinstance(cached_entry.get("observation"), Mapping)
+                else None
+            )
+            if (
+                cached_observation is not None
+                and cached_observation.get("review_status") != "recheck_required"
+            ):
+                cache_group = cache_hits_by_hash.setdefault(
+                    digest,
+                    {
+                        "content_sha256": digest,
+                        "labels": [],
+                        "observation": copy.deepcopy(cached_observation),
+                    },
+                )
+                cache_group["labels"].append(
+                    {
+                        "label": label,
+                        "message_label": message_label,
+                        "sender": item["sender"],
+                        "role": item["role"],
+                    }
+                )
+                continue
+            representative = representative_items.get(digest)
+            if representative is not None:
+                representative.setdefault("same_content_labels", []).append(label)
+                duplicate_aliases.append(
+                    {
+                        "label": label,
+                        "message_label": message_label,
+                        "representative_label": representative["label"],
+                        "content_sha256": digest,
+                        "sender": item["sender"],
+                        "role": item["role"],
+                    }
+                )
+                continue
+            representative_items[digest] = item
+            if cached_observation is not None:
+                item["quality_warning"] = "cached_recheck_required"
+                item["recheck_reasons"] = list(
+                    cached_observation.get("recheck_reasons", [])
+                )
+                flush_current()
+                current_items = [item]
+                flush_current()
+                continue
+            if quality_warning:
+                flush_current()
+                current_items = [item]
+                flush_current()
+                continue
+            current_items.append(item)
+            if len(current_items) == parallel_limit:
+                flush_current()
+    flush_current()
+    queued_images = sum(len(batch["items"]) for batch in batches)
+    cache_hits = list(cache_hits_by_hash.values())
+    cache_hit_labels = sum(len(item["labels"]) for item in cache_hits)
+    pending_recheck_batches: list[dict[str, Any]] = []
+    pending_recheck_count = 0
+    for digest, raw_entry in cache_entries.items():
+        if not isinstance(raw_entry, Mapping):
+            continue
+        observation = raw_entry.get("observation")
+        source_labels = raw_entry.get("source_labels")
+        if (
+            not isinstance(observation, Mapping)
+            or observation.get("review_status") != "recheck_required"
+            or not isinstance(source_labels, list)
+        ):
+            continue
+        covered = [
+            str(label)
+            for label in source_labels
+            if str(label) in classified and str(label) in inventory
+        ]
+        if not covered:
+            continue
+        pending_recheck_count += 1
+        if (
+            digest in representative_items
+            or len(pending_recheck_batches) == MEDIA_RECHECK_QUEUE_LIMIT
+        ):
+            continue
+        representative_label = covered[0]
+        _, representative_media = inventory[representative_label]
+        pending_recheck_batches.append(
+            {
+                "batch_id": f"R{len(pending_recheck_batches) + 1:04d}",
+                "view_detail": "original",
+                "parallel": False,
+                "items": [
+                    {
+                        "label": representative_label,
+                        "path": representative_media.get("path"),
+                        "content_sha256": digest,
+                        "same_content_labels": covered[1:],
+                        "quality_warning": "recheck_required",
+                        "recheck_reasons": list(observation.get("recheck_reasons", [])),
+                    }
+                ],
+            }
+        )
+    return {
+        "contract_version": MEDIA_QUEUE_CONTRACT,
+        "mode": "finance_materials" if finance_mode else "orders",
+        "recommended_parallel_limit": parallel_limit,
+        "batch_policy": batch_policy,
+        "queued_images": queued_images,
+        "covered_unclassified_images": (
+            queued_images + len(duplicate_aliases) + cache_hit_labels
+        ),
+        "content_hashes_computed": content_hashes_computed,
+        "content_hashes_reused": content_hashes_reused,
+        "cache_hit_groups": len(cache_hits),
+        "cache_hit_labels": cache_hit_labels,
+        "cache_hits": cache_hits,
+        "duplicate_hash_groups": len(
+            {item["content_sha256"] for item in duplicate_aliases}
+        ),
+        "duplicate_alias_labels": len(duplicate_aliases),
+        "duplicate_aliases": duplicate_aliases,
+        "pending_recheck_count": pending_recheck_count,
+        "pending_recheck_batches": pending_recheck_batches,
+        "non_parallel_items": non_parallel_items,
+        "missing_labels": missing_labels,
+        "already_classified_in_page": already_classified,
+        "batches": batches,
     }
-    media_labels = {
-        str(media.get("media_id") or ""): label
-        for label, (_, media) in _media_inventory(group).items()
+
+
+def _empty_ocr_candidate_cache() -> dict[str, Any]:
+    return {
+        "contract_version": OCR_CANDIDATE_CACHE_CONTRACT,
+        "candidate_contract": OCR_CANDIDATE_CONTRACT,
+        "entries": {},
     }
+
+
+def _normalize_ocr_candidate(
+    value: object,
+    *,
+    digest: str,
+) -> dict[str, Any]:
+    core.require(isinstance(value, Mapping), "OCR candidate must be an object")
+    allowed = {
+        "contract_version",
+        "content_sha256",
+        "status",
+        "backend",
+        "backend_version",
+        "authoritative",
+        "text",
+        "average_confidence",
+        "line_count",
+        "elapsed_ms",
+        "truncated",
+        "error",
+    }
+    unknown = sorted(set(value) - allowed)
+    core.require(not unknown, "OCR candidate has unsupported fields: " + ", ".join(unknown))
+    core.require(
+        value.get("contract_version") == OCR_CANDIDATE_CONTRACT,
+        "OCR candidate has an unsupported contract",
+    )
+    core.require(
+        core.clean_text(value.get("content_sha256")) == digest,
+        "OCR candidate content hash does not match its cache key",
+    )
+    status = core.clean_text(value.get("status")).casefold()
+    core.require(status in {"ok", "empty", "error"}, "OCR candidate status is invalid")
+    backend = core.clean_text(value.get("backend"))
+    core.require(bool(backend), "OCR candidate backend is required")
+    backend_version = core.clean_text(value.get("backend_version")) or None
+    core.require(
+        value.get("authoritative") is False,
+        "OCR candidates must be explicitly non-authoritative",
+    )
+    text_value = str(value.get("text") or "").replace("\x00", "").strip()
+    truncated = bool(value.get("truncated"))
+    if len(text_value) > OCR_CANDIDATE_TEXT_LIMIT:
+        text_value = text_value[:OCR_CANDIDATE_TEXT_LIMIT].rstrip()
+        truncated = True
+    confidence = value.get("average_confidence")
+    core.require(
+        confidence is None
+        or (
+            isinstance(confidence, (int, float))
+            and not isinstance(confidence, bool)
+            and 0 <= float(confidence) <= 1
+        ),
+        "OCR candidate average_confidence must be null or 0..1",
+    )
+    line_count = value.get("line_count", 0)
+    elapsed_ms = value.get("elapsed_ms", 0)
+    core.require(
+        isinstance(line_count, int) and not isinstance(line_count, bool) and line_count >= 0,
+        "OCR candidate line_count must be a non-negative integer",
+    )
+    core.require(
+        isinstance(elapsed_ms, int) and not isinstance(elapsed_ms, bool) and elapsed_ms >= 0,
+        "OCR candidate elapsed_ms must be a non-negative integer",
+    )
+    error = core.clean_text(value.get("error"))[:300] or None
+    core.require(status == "error" or error is None, "successful OCR candidate cannot contain an error")
+    return {
+        "contract_version": OCR_CANDIDATE_CONTRACT,
+        "content_sha256": digest,
+        "status": status,
+        "backend": backend,
+        "backend_version": backend_version,
+        "authoritative": False,
+        "text": text_value,
+        "average_confidence": float(confidence) if confidence is not None else None,
+        "line_count": line_count,
+        "elapsed_ms": elapsed_ms,
+        "truncated": truncated,
+        **({"error": error} if error is not None else {}),
+    }
+
+
+def _load_ocr_candidate_cache(work: Path) -> dict[str, Any]:
+    path = _ocr_cache_path(work)
+    if not path.is_file():
+        return _empty_ocr_candidate_cache()
+    try:
+        raw = _load_json(path)
+        if (
+            raw.get("contract_version") != OCR_CANDIDATE_CACHE_CONTRACT
+            or raw.get("candidate_contract") != OCR_CANDIDATE_CONTRACT
+            or not isinstance(raw.get("entries"), Mapping)
+        ):
+            return _empty_ocr_candidate_cache()
+        entries: dict[str, Any] = {}
+        for raw_digest, raw_candidate in raw["entries"].items():
+            digest = str(raw_digest)
+            if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                continue
+            try:
+                entries[digest] = _normalize_ocr_candidate(
+                    raw_candidate,
+                    digest=digest,
+                )
+            except (TypeError, ValueError):
+                continue
+        return {
+            "contract_version": OCR_CANDIDATE_CACHE_CONTRACT,
+            "candidate_contract": OCR_CANDIDATE_CONTRACT,
+            "entries": entries,
+        }
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        # This cache is derived and non-authoritative. Corruption must never
+        # block direct visual review.
+        return _empty_ocr_candidate_cache()
+
+
+def _invoke_ocr_worker(requests: list[dict[str, str]]) -> dict[str, Any]:
+    worker = Path(__file__).resolve().parent / "ocr_candidates.py"
+    if not worker.is_file():
+        return {"status": "unavailable", "reason": "ocr_worker_missing", "results": {}}
+    payload = {
+        "contract_version": OCR_WORKER_CONTRACT,
+        "candidate_contract": OCR_CANDIDATE_CONTRACT,
+        "text_limit": OCR_CANDIDATE_TEXT_LIMIT,
+        "requests": requests,
+    }
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(worker)],
+            input=json.dumps(payload, ensure_ascii=False),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=OCR_WORKER_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        reason = "ocr_worker_timeout" if isinstance(exc, subprocess.TimeoutExpired) else "ocr_worker_failed"
+        return {"status": "error", "reason": reason, "results": {}}
+    if completed.returncode != 0:
+        return {"status": "error", "reason": "ocr_worker_failed", "results": {}}
+    try:
+        response = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return {"status": "error", "reason": "ocr_worker_invalid_output", "results": {}}
+    if not isinstance(response, Mapping) or response.get("contract_version") != OCR_WORKER_CONTRACT:
+        return {"status": "error", "reason": "ocr_worker_invalid_contract", "results": {}}
+    results = response.get("results", {})
+    if not isinstance(results, Mapping):
+        return {"status": "error", "reason": "ocr_worker_invalid_results", "results": {}}
+    return {
+        "status": core.clean_text(response.get("status")) or "error",
+        "reason": core.clean_text(response.get("reason")) or None,
+        "backend": core.clean_text(response.get("backend")) or None,
+        "backend_version": core.clean_text(response.get("backend_version")) or None,
+        "results": dict(results),
+    }
+
+
+def _queue_ocr_item_references(media_queue: Mapping[str, Any]) -> list[dict[str, Any]]:
+    references: list[dict[str, Any]] = []
+    for field in ("batches", "pending_recheck_batches"):
+        batches = media_queue.get(field, [])
+        if not isinstance(batches, list):
+            continue
+        for batch in batches:
+            if not isinstance(batch, Mapping) or not isinstance(batch.get("items"), list):
+                continue
+            references.extend(item for item in batch["items"] if isinstance(item, dict))
+    return references
+
+
+def _compact_ocr_candidate(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "contract_version": candidate.get("contract_version"),
+        "status": candidate.get("status"),
+        "backend": candidate.get("backend"),
+        "backend_version": candidate.get("backend_version"),
+        "authoritative": False,
+        "text": candidate.get("text"),
+        "average_confidence": candidate.get("average_confidence"),
+        "line_count": candidate.get("line_count"),
+        "elapsed_ms": candidate.get("elapsed_ms"),
+        "truncated": bool(candidate.get("truncated")),
+        **({"error": candidate.get("error")} if candidate.get("error") else {}),
+    }
+
+
+def _attach_ocr_candidates(
+    work: Path,
+    run: Mapping[str, Any],
+    media_queue: dict[str, Any],
+) -> None:
+    config = _ocr_candidate_config_for_run(run)
+    state: dict[str, Any] = {
+        **config,
+        "status": "disabled" if not config["enabled"] else "enabled",
+        "representative_images": 0,
+        "candidate_request_limit": OCR_CANDIDATE_PAGE_LIMIT,
+        "deferred_representatives": 0,
+        "candidate_count": 0,
+        "cache_entry_count": 0,
+        "candidate_elapsed_ms": 0,
+        "average_candidate_ms": 0.0,
+        "error_candidate_count": 0,
+        "backends": [],
+    }
+    media_queue["ocr_candidates"] = state
+    if not config["enabled"]:
+        return
+
+    item_references = _queue_ocr_item_references(media_queue)
+    requests_by_digest: dict[str, dict[str, str]] = {}
+    for item in item_references:
+        digest = core.clean_text(item.get("content_sha256"))
+        path = core.clean_text(item.get("path"))
+        if re.fullmatch(r"[0-9a-f]{64}", digest) is None or not path:
+            continue
+        requests_by_digest.setdefault(digest, {"content_sha256": digest, "path": path})
+    state["representative_images"] = len(requests_by_digest)
+    if not requests_by_digest:
+        state["status"] = "no_representatives"
+        return
+    active_requests = dict(
+        list(requests_by_digest.items())[:OCR_CANDIDATE_PAGE_LIMIT]
+    )
+    state["deferred_representatives"] = len(requests_by_digest) - len(active_requests)
+
+    cache = _load_ocr_candidate_cache(work)
+    entries = cache["entries"]
+    missing = [
+        request
+        for digest, request in active_requests.items()
+        if digest not in entries
+    ]
+    worker_response: dict[str, Any] | None = None
+    changed = False
+    if missing:
+        worker_response = _invoke_ocr_worker(missing)
+        raw_results = worker_response.get("results", {})
+        if isinstance(raw_results, Mapping):
+            for digest, request in active_requests.items():
+                if digest in entries or digest not in raw_results:
+                    continue
+                try:
+                    entries[digest] = _normalize_ocr_candidate(
+                        raw_results[digest],
+                        digest=digest,
+                    )
+                    changed = True
+                except (TypeError, ValueError):
+                    continue
+    if changed:
+        cache_path = _ocr_cache_path(work)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        core.atomic_json(cache_path, cache)
+
+    resolved = {
+        digest: entries[digest]
+        for digest in active_requests
+        if digest in entries
+    }
+    for item in item_references:
+        digest = core.clean_text(item.get("content_sha256"))
+        candidate = resolved.get(digest)
+        if candidate is not None:
+            item["ocr_candidate"] = _compact_ocr_candidate(candidate)
+
+    backends = sorted(
+        {
+            core.clean_text(candidate.get("backend"))
+            for candidate in resolved.values()
+            if core.clean_text(candidate.get("backend"))
+        }
+    )
+    state["candidate_count"] = len(resolved)
+    state["cache_entry_count"] = len(entries)
+    state["candidate_elapsed_ms"] = sum(
+        int(candidate.get("elapsed_ms") or 0) for candidate in resolved.values()
+    )
+    state["average_candidate_ms"] = (
+        state["candidate_elapsed_ms"] / len(resolved) if resolved else 0.0
+    )
+    state["error_candidate_count"] = sum(
+        candidate.get("status") == "error" for candidate in resolved.values()
+    )
+    state["backends"] = backends
+    if len(resolved) == len(active_requests):
+        state["status"] = (
+            "ready_limited"
+            if state["deferred_representatives"]
+            else "ready"
+        )
+    elif resolved:
+        state["status"] = "partial"
+    elif worker_response is not None:
+        worker_status = core.clean_text(worker_response.get("status"))
+        state["status"] = worker_status if worker_status in {"unavailable", "error"} else "unavailable"
+        reason = core.clean_text(worker_response.get("reason"))
+        if reason:
+            state["reason"] = reason
+    else:
+        state["status"] = "unavailable"
+
+
+def _omit_ocr_candidates_for_output_budget(media_queue: dict[str, Any]) -> None:
+    omitted = 0
+    for item in _queue_ocr_item_references(media_queue):
+        if item.pop("ocr_candidate", None) is not None:
+            omitted += 1
+    state = media_queue.get("ocr_candidates")
+    if isinstance(state, dict) and omitted:
+        state["status"] = "omitted_for_output_budget"
+        state["candidate_count"] = 0
+        state["omitted_candidate_count"] = omitted
+
+
+def _compact_page(
+    group: Mapping[str, Any],
+    start: int,
+    end: int,
+    *,
+    label_by_id: Mapping[str, str] | None = None,
+    message_by_id: Mapping[str, Mapping[str, Any]] | None = None,
+    media_labels: Mapping[str, str] | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    messages = list(group.get("messages", []))
+    if label_by_id is None:
+        label_by_id, _ = _message_labels(group)
+    if message_by_id is None:
+        message_by_id = {
+            str(message.get("message_id") or ""): message
+            for message in messages
+        }
+    if media_labels is None:
+        media_labels = {
+            str(media.get("media_id") or ""): label
+            for label, (_, media) in _media_inventory(group).items()
+        }
     result: list[dict[str, Any]] = []
     collapsed = 0
     for index in range(start, end):
@@ -3166,9 +4957,25 @@ def _review_page_result(
     open_field: str,
     open_records: list[Any],
     carry_messages: list[dict[str, Any]],
+    label_by_id: Mapping[str, str] | None = None,
+    message_by_id: Mapping[str, Mapping[str, Any]] | None = None,
+    media_labels: Mapping[str, str] | None = None,
+    media_inventory: Mapping[
+        str, tuple[Mapping[str, Any], Mapping[str, Any]]
+    ] | None = None,
+    media_hashes: Mapping[str, str] | None = None,
+    content_hashes_computed: int = 0,
+    content_hashes_reused: int = 0,
 ) -> dict[str, Any]:
     messages = list(group.get("messages", []))
-    compact, collapsed = _compact_page(group, start, end)
+    compact, collapsed = _compact_page(
+        group,
+        start,
+        end,
+        label_by_id=label_by_id,
+        message_by_id=message_by_id,
+        media_labels=media_labels,
+    )
     page_token = (
         _review_page_token(
             group,
@@ -3195,6 +5002,17 @@ def _review_page_result(
         "done": bool(decision.get("read_complete")),
         "commit_required": start < end,
         "carry_messages": carry_messages,
+        "media_queue": _review_media_queue(
+            group,
+            decision,
+            start,
+            end,
+            media_labels=media_labels,
+            inventory=media_inventory,
+            media_hashes=media_hashes,
+            content_hashes_computed=content_hashes_computed,
+            content_hashes_reused=content_hashes_reused,
+        ),
         "controlled_editing": _controlled_editing(run_group),
         "page_token": page_token,
         "semantic_fingerprint": semantic_fingerprint,
@@ -3217,6 +5035,7 @@ RISK_DIAGNOSTIC_FIELDS = (
     "unknown_payee_warning",
     "pending_people",
     "unassigned_material_media",
+    "media_recheck_required",
 )
 RISK_FLAG_FIELDS = (
     "blank_direction_orders",
@@ -3229,6 +5048,7 @@ RISK_FLAG_FIELDS = (
     "unknown_payee_warning",
     "pending_people",
     "unassigned_material_media",
+    "media_recheck_required",
 )
 
 
@@ -3292,6 +5112,7 @@ def _upgrade_legacy_checkpoints(
         candidate,
         require_complete=False,
         capture_hashes=False,
+        rehash_labels=set(),
     )
     current_fingerprint = _semantic_fingerprint(candidate)
     candidate["edit_control"] = _new_edit_control(current_fingerprint)
@@ -3352,9 +5173,25 @@ def review_command(args: argparse.Namespace) -> dict[str, Any]:
                         and approved_fingerprint != semantic_fingerprint
                     ),
                 }
+            report.update(
+                _validate_media_observation_cache(
+                    groups[str(run_group["group_key"])],
+                    decision,
+                    require_complete=False,
+                    verify_files=False,
+                )
+            )
             report[open_field] = copy.deepcopy(decision.get(open_field, []))
             reports.append(report)
-        return {"groups": reports}
+        return {
+            "runtime_contract": run.get("runtime_contract") or "legacy-unversioned",
+            "amount_policy": run.get("amount_policy") or "legacy-unspecified",
+            "workbook_compatibility": (
+                run.get("workbook_compatibility") or "legacy-unspecified"
+            ),
+            "ocr_candidates": _ocr_candidate_config_for_run(run),
+            "groups": reports,
+        }
 
     if args.review_action == "audit":
         selected = (
@@ -3373,6 +5210,7 @@ def review_command(args: argparse.Namespace) -> dict[str, Any]:
                 copy.deepcopy(decision),
                 require_complete=False,
                 capture_hashes=False,
+                rehash_labels=set(),
             )
             flags = {
                 field: statistics[field]
@@ -3465,6 +5303,7 @@ def review_command(args: argparse.Namespace) -> dict[str, Any]:
                 copy.deepcopy(decision),
                 require_complete=False,
                 capture_hashes=False,
+                rehash_labels=set(),
             )
             return {
                 "group_key": group_key,
@@ -3491,7 +5330,25 @@ def review_command(args: argparse.Namespace) -> dict[str, Any]:
             candidate,
             require_complete=False,
             capture_hashes=True,
+            rehash_labels={
+                str(label)
+                for label in batch.get("media_decisions", {})
+            },
         )
+        observation_apply_statistics = _apply_media_observations(
+            candidate,
+            batch,
+            group,
+        )
+        statistics.update(
+            _validate_media_observation_cache(
+                group,
+                candidate,
+                require_complete=False,
+                verify_files=False,
+            )
+        )
+        statistics.update(observation_apply_statistics)
         result_fingerprint = _semantic_fingerprint(candidate)
         prior_batch_count = (
             control.get("batch_count")
@@ -3560,8 +5417,54 @@ def review_command(args: argparse.Namespace) -> dict[str, Any]:
         open_field = _open_field_for_decision(decision)
         open_records = copy.deepcopy(decision.get(open_field, []))
         carry_messages = _open_order_carry_messages(group, open_records)
+        label_by_id, _ = _message_labels(group)
+        message_by_id = {
+            str(message.get("message_id") or ""): message
+            for message in messages
+        }
+        media_inventory = _media_inventory(group)
+        media_labels = {
+            str(media.get("media_id") or ""): label
+            for label, (_, media) in media_inventory.items()
+        }
+        media_hashes: dict[str, str] = {}
+        media_hash_was_computed: set[str] = set()
+        media_position_by_label: dict[str, int] = {}
+        classified_media_labels = set(decision.get("media_decisions", {}))
+        for message_position in range(start, maximum_end):
+            message = messages[message_position]
+            for media in message.get("media", []):
+                if not isinstance(media, Mapping) or not core.media_is_evidence(media):
+                    continue
+                label = media_labels.get(str(media.get("media_id") or ""))
+                if (
+                    not label
+                    or label in classified_media_labels
+                    or media.get("availability") != "available"
+                ):
+                    continue
+                mime_type = core.clean_text(media.get("mime_type")).casefold()
+                kind = core.clean_text(media.get("kind")).casefold()
+                if kind != "image" and not mime_type.startswith("image/"):
+                    continue
+                digest, computed = _media_content_hash_for_label(
+                    group,
+                    decision,
+                    label,
+                    inventory=media_inventory,
+                    verify_file=False,
+                )
+                media_hashes[label] = digest
+                media_position_by_label[label] = message_position
+                if computed:
+                    media_hash_was_computed.add(label)
 
         def build_page(end: int) -> dict[str, Any]:
+            page_hash_labels = {
+                label
+                for label, position in media_position_by_label.items()
+                if position < end
+            }
             return _review_page_result(
                 group=group,
                 group_key=group_key,
@@ -3574,10 +5477,26 @@ def review_command(args: argparse.Namespace) -> dict[str, Any]:
                 open_field=open_field,
                 open_records=open_records,
                 carry_messages=carry_messages,
+                label_by_id=label_by_id,
+                message_by_id=message_by_id,
+                media_labels=media_labels,
+                media_inventory=media_inventory,
+                media_hashes=media_hashes,
+                content_hashes_computed=len(
+                    page_hash_labels & media_hash_was_computed
+                ),
+                content_hashes_reused=len(
+                    page_hash_labels - media_hash_was_computed
+                ),
             )
 
+        def finalize_page(end: int) -> dict[str, Any]:
+            page = build_page(end)
+            _attach_ocr_candidates(work, run, page["media_queue"])
+            return page
+
         if exact_limit is not None or start == maximum_end:
-            return build_page(maximum_end)
+            return finalize_page(maximum_end)
 
         selected_page: dict[str, Any] | None = None
         first_page_chars: int | None = None
@@ -3594,6 +5513,27 @@ def review_command(args: argparse.Namespace) -> dict[str, Any]:
             "review next cannot return even one complete message within the "
             f"{DEFAULT_REVIEW_PAGE_OUTPUT_CHAR_BUDGET}-character output budget "
             f"(first complete page needs {first_page_chars} characters); "
+            "do not commit a truncated page",
+        )
+        selected_end = int(selected_page["page_end"])
+        selected_page = finalize_page(selected_end)
+        while (
+            len(_render_result_json(selected_page, compact=True))
+            > DEFAULT_REVIEW_PAGE_OUTPUT_CHAR_BUDGET
+            and selected_end > start + 1
+        ):
+            selected_end -= 1
+            selected_page = finalize_page(selected_end)
+        if (
+            len(_render_result_json(selected_page, compact=True))
+            > DEFAULT_REVIEW_PAGE_OUTPUT_CHAR_BUDGET
+        ):
+            _omit_ocr_candidates_for_output_budget(selected_page["media_queue"])
+        core.require(
+            len(_render_result_json(selected_page, compact=True))
+            <= DEFAULT_REVIEW_PAGE_OUTPUT_CHAR_BUDGET,
+            "review next cannot include one complete message and its media queue "
+            f"within the {DEFAULT_REVIEW_PAGE_OUTPUT_CHAR_BUDGET}-character output budget; "
             "do not commit a truncated page",
         )
         return selected_page
@@ -3761,6 +5701,7 @@ def _compile_decisions_v3(
                     "ocr": {
                         "amount": entry.get("amount"),
                         "amount_text": entry.get("amount_text"),
+                        "amount_basis": entry.get("amount_basis"),
                         "currency": entry.get("currency"),
                         "payee": entry["payee"],
                         "payee_state": entry.get("payee_state"),
@@ -3891,7 +5832,7 @@ def finish_run(args: argparse.Namespace) -> dict[str, Any]:
     normalized = _load_snapshot(work, run)
     groups = _group_index(normalized)
     decisions: dict[str, Mapping[str, Any]] = {}
-    review_statistics: dict[str, dict[str, int]] = {}
+    review_statistics: dict[str, dict[str, Any]] = {}
     finish_risk_reports: list[dict[str, Any]] = []
     for run_group in run["groups"]:
         group_key = str(run_group["group_key"])

@@ -216,6 +216,7 @@ def validate_decision(
     *,
     require_complete: bool,
     capture_hashes: bool,
+    rehash_labels: set[str] | None = None,
 ) -> dict[str, Any]:
     del normalized
     core.require(
@@ -283,6 +284,8 @@ def validate_decision(
     labels_by_class: dict[str, set[str]] = {
         classification: set() for classification in MEDIA_CLASSIFICATIONS
     }
+    evidence_hashes_computed = 0
+    evidence_hashes_reused = 0
     for label, raw in decisions.items():
         field = f"{group.get('group_key')}.media_decisions.{label}"
         core.require(isinstance(raw, dict), f"{field} must be an object")
@@ -310,14 +313,35 @@ def validate_decision(
         )
         media_path = Path(str(inventory[label][2].get("path") or ""))
         core.require(media_path.is_file(), f"{field}: original media file is unavailable: {media_path}")
-        actual_hash = core.sha256_file(media_path)
         recorded_hash = core.clean_text(raw.get("evidence_sha256"))
-        if recorded_hash:
-            core.require(recorded_hash == actual_hash, f"{field}: original material image changed after review")
-        elif capture_hashes:
-            raw["evidence_sha256"] = actual_hash
+        verify_hash = (
+            rehash_labels is None
+            or label in rehash_labels
+            or (capture_hashes and not recorded_hash)
+        )
+        resolved_hash, computed = core.validate_cached_file_hash(
+            media_path,
+            recorded_hash,
+            verify=verify_hash,
+            changed_message=f"{field}: original material image changed after review",
+        )
+        snapshot_hash = core.clean_text(inventory[label][2].get("blob_sha256"))
+        if computed and snapshot_hash:
+            core.require(
+                resolved_hash == snapshot_hash,
+                f"{field}: original material image changed after the run snapshot was created",
+            )
+        if computed:
+            evidence_hashes_computed += 1
+        elif recorded_hash:
+            evidence_hashes_reused += 1
+        if not recorded_hash and capture_hashes:
+            raw["evidence_sha256"] = resolved_hash
         elif require_complete:
-            raise ValueError(f"{field}: evidence hash has not been captured; run review seal")
+            core.require(
+                bool(recorded_hash),
+                f"{field}: evidence hash has not been captured; run review seal",
+            )
 
     open_people_value = decision.get("open_people")
     core.require(isinstance(open_people_value, list), "open_people must be a list")
@@ -578,6 +602,8 @@ def validate_decision(
         "documents": document_count,
         "accounts": account_count,
         "unassigned_material_media": len(unassigned_material),
+        "evidence_hashes_computed": evidence_hashes_computed,
+        "evidence_hashes_reused": evidence_hashes_reused,
     }
 
 
@@ -932,6 +958,10 @@ def check_workbook(workbook_path: Path, ledger: object) -> list[str]:
     expected_names = [_group_sheet_name(group, expected_used) for group in groups]
     workbook = load_workbook(workbook_path, read_only=False, data_only=False)
     try:
+        if getattr(workbook, "_external_links", []):
+            errors.append("finance-material workbook contains forbidden external links")
+        if getattr(workbook, "vba_archive", None) is not None:
+            errors.append("finance-material workbook contains forbidden macros")
         if workbook.sheetnames != expected_names:
             errors.append(
                 f"finance-material sheet names mismatch: expected {expected_names!r}, got {workbook.sheetnames!r}"

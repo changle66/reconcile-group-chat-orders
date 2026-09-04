@@ -21,6 +21,12 @@ import core
 import large_daily
 
 
+WPS_CONDITIONAL_FORMULA_RE = re.compile(
+    r'^=?LEFT\(\$[A-Z]{1,3}2,2\)="(?:少转|多转)"$',
+    re.IGNORECASE,
+)
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("workbook", type=Path)
@@ -81,6 +87,27 @@ def review_conditional_colors(worksheet: Any, review_column_letter: str) -> dict
     return colors
 
 
+def wps_compatibility_errors(workbook: Any) -> list[str]:
+    """Reject workbook features outside the deliberately small WPS-safe subset."""
+
+    errors: list[str] = []
+    if getattr(workbook, "_external_links", []):
+        errors.append("workbook contains external links, which are forbidden for WPS output")
+    if getattr(workbook, "vba_archive", None) is not None:
+        errors.append("workbook contains macros, which are forbidden for WPS output")
+    for worksheet in workbook.worksheets:
+        for conditional in worksheet.conditional_formatting:
+            for rule in conditional.rules:
+                for formula in rule.formula or []:
+                    formula_text = str(formula).strip()
+                    if not WPS_CONDITIONAL_FORMULA_RE.fullmatch(formula_text):
+                        errors.append(
+                            f"{worksheet.title}: conditional formula is not WPS-compatible: "
+                            f"{formula_text!r}"
+                        )
+    return errors
+
+
 def canonical_number_format(value: object) -> str:
     """Normalize equivalent Excel literal escapes before semantic comparison."""
     return re.sub(r"\\(.)", r"\1", str(value or "")).strip().casefold()
@@ -96,6 +123,7 @@ def check_large_daily(workbook_path: Path, ledger: object) -> list[str]:
     time_column = large_daily.HEADERS.index("时间") + 1
     workbook = load_workbook(workbook_path, read_only=False, data_only=False)
     try:
+        errors.extend(wps_compatibility_errors(workbook))
         if workbook.sheetnames != expected_names:
             errors.append(
                 f"sheet names mismatch: expected {expected_names!r}, got {workbook.sheetnames!r}"
@@ -202,6 +230,7 @@ def check(workbook_path: Path, orders_path: Path) -> list[str]:
     expected_names = [build_workbook.group_sheet_name(group, used) for group in groups]
     workbook = load_workbook(workbook_path, read_only=False, data_only=False)
     try:
+        errors.extend(wps_compatibility_errors(workbook))
         if workbook.sheetnames != expected_names:
             errors.append(f"sheet names mismatch: expected {expected_names!r}, got {workbook.sheetnames!r}")
         for worksheet in workbook.worksheets:

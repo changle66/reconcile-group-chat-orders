@@ -24,15 +24,21 @@ TEST_MODULES = (
 CURRENT_TEST_IDS = frozenset(
     {
         "test_reconcile.ReconcileWorkflowTests.test_apply_batch_atomically_updates_a_controlled_decision",
+        "test_reconcile.ReconcileWorkflowTests.test_adaptive_media_batch_policy_scales_queue_up_and_down",
         "test_reconcile.ReconcileWorkflowTests.test_controlled_decision_rejects_direct_semantic_overwrite",
+        "test_reconcile.ReconcileWorkflowTests.test_disabled_ocr_does_not_invoke_worker_or_create_cache",
+        "test_reconcile.ReconcileWorkflowTests.test_enabled_ocr_candidates_are_cached_once_per_identical_hash",
         "test_reconcile.ReconcileWorkflowTests.test_invalid_apply_batch_does_not_partially_write_the_decision",
         "test_reconcile.ReconcileWorkflowTests.test_large_group_finish_writes_daily_records_and_rate_grouped_totals",
         "test_reconcile.ReconcileWorkflowTests.test_large_group_multiple_fund_images_compile_to_one_full_order",
         "test_reconcile.ReconcileWorkflowTests.test_large_group_review_uses_full_order_contract",
+        "test_reconcile.ReconcileWorkflowTests.test_media_observation_cache_reuses_identical_images_without_merging_labels",
+        "test_reconcile.ReconcileWorkflowTests.test_media_observation_recheck_queue_blocks_seal_until_resolved",
         "test_reconcile.ReconcileWorkflowTests.test_order_continuity_risk_flags_split_without_mutating_or_blocking",
         "test_reconcile.ReconcileWorkflowTests.test_order_continuity_risk_ignores_correctly_merged_order",
         "test_reconcile.ReconcileWorkflowTests.test_order_continuity_risk_ignores_two_complete_independent_orders",
         "test_reconcile.ReconcileWorkflowTests.test_order_continuity_risk_skips_balance_linked_orders",
+        "test_reconcile.ReconcileWorkflowTests.test_ocr_platform_defaults_and_manual_overrides_are_persisted",
         "test_reconcile.ReconcileWorkflowTests.test_page_commit_advances_and_carries_open_order_context",
         "test_reconcile.ReconcileWorkflowTests.test_page_commit_requires_explicit_open_order_state_and_valid_token",
         "test_reconcile.ReconcileWorkflowTests.test_review_next_default_returns_largest_complete_page_within_budget",
@@ -63,7 +69,7 @@ COMPATIBILITY_TEST_IDS = frozenset(
     }
 )
 
-EXPECTED_ALL_TESTS = 115
+EXPECTED_ALL_TESTS = 121
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

@@ -1067,7 +1067,7 @@ class SimpleLedgerTests(unittest.TestCase):
         self.assertEqual(order["review_result"], "")
         fee_row = build_workbook.pricing_detail_rows(order)[0]
         self.assertEqual(fee_row[0], "配送费")
-        self.assertEqual(fee_row[core.HEADERS.index("流水金额")], 500)
+        self.assertEqual(fee_row[core.HEADERS.index("收款方实际到账金额")], 500)
         self.assertEqual(fee_row[core.HEADERS.index("流水币种")], "THB")
         self.assertIsNone(fee_row[core.HEADERS.index("备注")])
 
@@ -1723,6 +1723,30 @@ class SimpleLedgerTests(unittest.TestCase):
                 ]
                 self.assertTrue(any("少转" in formula for formula in formulas))
                 self.assertTrue(any("多转" in formula for formula in formulas))
+                self.assertTrue(
+                    all(
+                        check_workbook.WPS_CONDITIONAL_FORMULA_RE.fullmatch(formula)
+                        for formula in formulas
+                    )
+                )
+                self.assertFalse(
+                    any(
+                        cell.data_type == "f"
+                        for row in worksheet.iter_rows()
+                        for cell in row
+                    )
+                )
+                actual_received_column = (
+                    core.HEADERS.index("收款方实际到账金额") + 1
+                )
+                actual_received_letter = worksheet.cell(
+                    1,
+                    actual_received_column,
+                ).column_letter
+                self.assertGreaterEqual(
+                    worksheet.column_dimensions[actual_received_letter].width or 0,
+                    18,
+                )
             finally:
                 workbook.close()
 
@@ -1778,6 +1802,8 @@ class SimpleLedgerTests(unittest.TestCase):
                 self.assertNotIn("内部回款币种", headers)
                 self.assertIn("付款合计", headers)
                 self.assertIn("汇率", headers)
+                self.assertIn("收款方实际到账金额", headers)
+                self.assertNotIn("流水金额", headers)
                 self.assertNotIn("异常备注", headers)
                 fee_row = next(row for row in worksheet.iter_rows(values_only=True) if row[0] == "手续费")
                 self.assertEqual(

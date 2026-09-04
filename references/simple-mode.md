@@ -6,6 +6,8 @@
 ## 本次任务与检查点
 
 - 新任务必须使用不存在的 `--work` 目录，不复制旧判定、旧订单或旧工作簿。
+- 只运行本技能目录中的当前 `scripts/reconcile.py`；不得复制或调用任务目录、`task_local_*`、旧兼容目录里的脚本。
+  旧工作目录也由当前脚本读取或升级，不能为了继续处理而切回旧运行时。
 - 同一次任务中断后继续原工作目录。`run.json`、固定快照、已确认页面、`open_orders`、群判定、语义指纹和批次记录
   就是跨轮次进度。
 - 当前判定合同为 `group-chat-decision/3.2`。3.1 工作目录先运行
@@ -58,14 +60,14 @@ JSON 一次返回。因此每页消息数会随内容长度变化，不需要也
 JSON 无法完整解析或末尾字段缺失，就视为整页未读，不得拿其中可见的令牌推进进度；重新执行同一个 `review next`
 应返回同一完整页。显式 `--limit` 保留给已经按固定页长开始的旧任务和环境诊断，不作为新任务的正常流程。
 
-按聊天顺序查看媒体，批量查看是可选的效率优化：
+按聊天顺序查看媒体。先完整读取 [media-viewing.md](media-viewing.md)，再按 `review next` 返回的
+`media_queue.batches` 逐批处理：
 
-- 模型或编排脚本可根据信息密度、清晰度和上下文容量选择单图或批量查看；脚本只组织候选批次，模型仍可按需拆分。
-  单批不得超过 16 张，不设最低数量。
-- 需要精确读取金额、币种、收款方或状态时，优先每批不超过 9 张；10–16 张只用于画面清晰简单或
-  `reference/fund` 粗分类。
-- 批内可以同时打开原图、高清预览或清晰裁图。可用视觉识别或本地 OCR 提供金额、币种、收款方和状态的候选值，
-  但候选值必须由模型对图确认后才能提交，不能因图片已经打开就自动确认。
+- 当前主代理在一次编排调用中并行打开一个批次，不开子代理。订单模式默认 9 张并在 4–12 张内按真实指标自适应；
+  脚本已把缩略图单独成批，把不能由图片工具直接读取的格式放入 `non_parallel_items`。
+- `same_content_labels` 只打开代表图；`cache_hits` 不重开。前者用 `reuse_from`、后者用 `reuse_sha256` 提交观察，
+  但每个标签仍独立分类和归单，哈希不能认定重复交易。
+- 批内同时打开原图或高清图并直接提取金额、币种、收款方和状态；启用时 `ocr_candidate` 只作定位提示，不能代替原图。
 - 批量看清的图片不重复打开；任何字段看不清或无法逐图对应时，必须单图放大复核。准确性优先于批量大小和处理速度。
 - 缩略图足以把普通资料图判为 `reference`；资金事实必须来自原图或足以辨认完整文字的高清图。
 
@@ -91,10 +93,11 @@ JSON 无法完整解析或末尾字段缺失，就视为整页未读，不得拿
       "classification": "fund",
       "viewed_original": true,
       "entries": [
-        {
-          "amount": "100",
-          "currency": "CNY",
-          "payee": "张三"
+          {
+            "amount": "100",
+            "amount_basis": "receiver_received",
+            "currency": "CNY",
+            "payee": "张三"
         }
       ]
     },
@@ -102,10 +105,11 @@ JSON 无法完整解析或末尾字段缺失，就视为整页未读，不得拿
       "classification": "fund",
       "viewed_original": true,
       "entries": [
-        {
-          "amount": "500",
-          "currency": "THB",
-          "payee": "206-4-XXX781"
+          {
+            "amount": "500",
+            "amount_basis": "receiver_received",
+            "currency": "THB",
+            "payee": "206-4-XXX781"
         }
       ]
     }
@@ -136,13 +140,18 @@ JSON 无法完整解析或末尾字段缺失，就视为整页未读，不得拿
 - `result` 默认 `completed`。`status_text` 或 entry `note` 明确出现失败、取消、拒绝、作废、无效或风控未完成时，
   脚本默认 `failed`。处理中、等待确认、待区块确认仍算正常成功过程。
 - 同时有金额和币种时 `amount_state` 默认 `clear`；只清楚一项为 `partial`；都不清楚为 `unreadable`。
+- 已完成转账且金额清楚时，`amount_basis` 固定为 `receiver_received`；现金使用 `cash_face_value`。脚本会补齐正常
+  默认值并拒绝把付款方优惠后实付金额声明为流水金额。
 - 现金 `payee_state` 默认 `cash`；`未显示` 和 `无法辨认` 分别生成 `not_shown`、`unreadable`；其他文字生成
   `visible`。
 - 明确例外才填写 `side`、`result`、`amount_state`、`payee_state` 或 `side_exception`。方向例外、退款和追回见
   [advanced-relations.md](advanced-relations.md)。
 
-金额只抄图片明确显示的标准十进制数，币种按图片记录，TRX 不改成 USDT。图片同时显示订单金额和平台或银行承担的
-优惠时，记录收款方实际获得的完整订单金额；余额、广告和与本单无关的数字不建资金条目。
+`amount` 只抄图片明确显示的收款方实际到账标准十进制数，币种按图片记录，TRX 不改成 USDT。图片同时显示订单
+原价、优惠额、立减额、优惠后实付、付款方实际支出和收款方到账时，只记录收款方实际到账；优惠后实付和优惠额
+不建立资金条目，也不写入备注或辅助字段。图片没有明确展示收款方实收，或多个金额的业务角色无法可靠区分时，
+使用 `amount_state=partial|unreadable` 并单图复核；复核后仍不明确则保留待确认，禁止推算。余额、广告和与本单无关
+的数字同样不建资金条目。
 
 ## 收款方必须完整
 
@@ -225,6 +234,15 @@ JSON 无法完整解析或末尾字段缺失，就视为整页未读，不得拿
   ],
   "media_decisions": {
     "M0003": {"classification": "reference", "note": "收款码资料页"}
+  },
+  "media_observations": {
+    "M0003": {
+      "contract_version": "group-chat-media-observation/1.0",
+      "classification": "reference",
+      "review_status": "clear",
+      "viewed_original": true,
+      "recheck_reasons": []
+    }
   }
 }
 ```
@@ -240,10 +258,17 @@ python scripts/reconcile.py review <work> apply-batch --group <群> --input <批
 - `open_orders` 至少保存 `id`、`start_message`、关键 `source_messages`、关联 `media_labels`、事实 `summary` 和
   `unresolved`；客户、方向、汇率和乘除方向已经知道时一并保存，未知时不要猜。
 - `media_decisions` 按 M 标签新增或替换，`orders` 按订单 ID 新增或替换；未出现的内容保持不变。
+- 正常新批次为每个更新的 `media_decisions` 标签提交一个 `media_observations`。完整观察使用 `clear`、
+  `recheck_required` 或 `rechecked_unreadable`；相同内容的别名和缓存命中按 [media-viewing.md](media-viewing.md)
+  使用 `reuse_from` / `reuse_sha256`。`recheck_required` 未解决时不能封存。
+- 将本批看图调用的 `view_batches`、`opened_images`、`failed_images`、`single_image_rechecks` 和 `elapsed_ms` 汇总到
+  `media_view_metrics`，脚本下一批据此在 4–12 张范围内调整，不参与订单判断。
 - 删除时使用 `remove_media_labels` 或 `remove_order_ids`。
 - `balance_links`、`settlement_allocations`、`unknown_payee_reviewed_entry_ids` 出现在批次中时完整替换；省略则保持。
 - 脚本在内存合并、补齐普通默认值和证据标签、校验并捕获资金图哈希；失败不写文件，成功后把页面进度、未结束
   订单和判定一起原子替换。
+- `apply-batch` 只重新读取本批新增或修改的资金图；未改图片复用已有 `evidence_sha256`。`check`、`seal` 和
+  `finish` 仍重新读取全部已采用资金图，缓存不能绕过最终完整性检查。
 - `apply-batch` 已完成常规校验，不再机械追加一次 `review check`。一个批次覆盖一个读懂的连续片段或若干完整订单，
   不需要按单张图片切批。
 
@@ -277,6 +302,7 @@ python scripts/reconcile.py finish <work> -o <新的群聊订单核对.xlsx>
 ```
 
 `finish` 要求所有群已封存，重新验证快照、原图哈希、判定指纹、金额关系和汇率字段，生成临时工作簿并逐格回读。
-输出已存在时拒绝覆盖。最终每群一张可见分表，包含汇率和每条资金记录的收款方。
+输出已存在时拒绝覆盖。最终每群一张可见分表，包含汇率、每条资金记录的收款方及收款方实际到账金额。工作簿按
+WPS 兼容门禁发布：业务单元格和汇总均为静态值，不含宏、外部链接或 Excel 专有公式；条件格式只使用基础公式。
 
 复杂关系仅在实际出现时读取 [advanced-relations.md](advanced-relations.md)。

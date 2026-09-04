@@ -9,6 +9,7 @@ import unittest
 from argparse import Namespace
 from datetime import datetime
 from pathlib import Path
+from unittest import mock
 
 from openpyxl import load_workbook
 
@@ -30,6 +31,7 @@ class ReconcileWorkflowTests(unittest.TestCase):
         accounting_date: str | None = None,
         accounting_from: str | None = None,
         accounting_to: str | None = None,
+        ocr_candidates: bool | None = False,
     ) -> tuple[Path, dict, dict]:
         export = root / "ChatExport"
         photos = export / "photos"
@@ -78,19 +80,33 @@ class ReconcileWorkflowTests(unittest.TestCase):
                 roster=Path(__file__).resolve().parent.parent / "config" / "roster.yaml",
                 line_backup=[],
                 line_self_name="LINE_SELF",
+                ocr_candidates=ocr_candidates,
             )
         )
         run = reconcile._load_run(work)
-        if accounting_date is None and accounting_from is None and accounting_to is None:
+        self.assertEqual(report["runtime_contract"], reconcile.RUNTIME_CONTRACT)
+        self.assertEqual(report["amount_policy"], reconcile.AMOUNT_POLICY)
+        self.assertEqual(
+            report["workbook_compatibility"],
+            reconcile.WORKBOOK_COMPATIBILITY,
+        )
+        self.assertEqual(run["runtime_contract"], reconcile.RUNTIME_CONTRACT)
+        self.assertEqual(run["amount_policy"], reconcile.AMOUNT_POLICY)
+        self.assertEqual(
+            run["workbook_compatibility"],
+            reconcile.WORKBOOK_COMPATIBILITY,
+        )
+        if accounting_date is None:
             self.assertNotIn("accounting_date", report)
             self.assertNotIn("accounting_date", run)
+        else:
+            self.assertEqual(report["accounting_date"], accounting_date)
+            self.assertEqual(run["accounting_date"], accounting_date)
+        if accounting_from is None and accounting_to is None:
             self.assertNotIn("accounting_from", report)
             self.assertNotIn("accounting_from", run)
             self.assertNotIn("accounting_to", report)
             self.assertNotIn("accounting_to", run)
-        elif accounting_date is not None:
-            self.assertEqual(report["accounting_date"], accounting_date)
-            self.assertEqual(run["accounting_date"], accounting_date)
         else:
             self.assertEqual(report["accounting_from"], accounting_from)
             self.assertEqual(report["accounting_to"], accounting_to)
@@ -100,9 +116,11 @@ class ReconcileWorkflowTests(unittest.TestCase):
         self.assertEqual(report["groups"], 1)
         self.assertTrue(
             all(
-                media.get("blob_sha256") in (None, "")
+                isinstance(media.get("blob_sha256"), str)
+                and len(media["blob_sha256"]) == 64
                 for message in normalized["groups"][0]["messages"]
                 for media in message["media"]
+                if media.get("availability") == "available"
             )
         )
         page = reconcile.review_command(
@@ -144,6 +162,44 @@ class ReconcileWorkflowTests(unittest.TestCase):
             core.atomic_json(decision_path, decision)
             core.atomic_json(reconcile._run_path(work), run)
         return work, run, normalized
+
+    @staticmethod
+    def _synthetic_media_group(
+        root: Path,
+        *,
+        count: int,
+        identical: bool = False,
+    ) -> dict:
+        media_root = root / "synthetic-media"
+        media_root.mkdir(parents=True, exist_ok=True)
+        messages: list[dict] = []
+        shared_path = media_root / "shared.jpg"
+        if identical:
+            shared_path.write_bytes(b"identical-image")
+        for index in range(count):
+            path = shared_path if identical else media_root / f"image-{index + 1}.jpg"
+            if not identical:
+                path.write_bytes(f"unique-image-{index + 1}".encode())
+            messages.append(
+                {
+                    "message_id": f"message-{index + 1}",
+                    "sender_name": "Alice",
+                    "sender_id": "user:alice",
+                    "role": "客户候选",
+                    "media": [
+                        {
+                            "media_id": f"media-{index + 1}",
+                            "kind": "image",
+                            "mime_type": "image/jpeg",
+                            "availability": "available",
+                            "path": str(path.resolve()),
+                            "byte_size": path.stat().st_size,
+                            "blob_sha256": core.sha256_file(path),
+                        }
+                    ],
+                }
+            )
+        return {"messages": messages}
 
     def _start_large_order_fixture(
         self,
@@ -285,6 +341,7 @@ class ReconcileWorkflowTests(unittest.TestCase):
                     "large",
                     "--date",
                     "2026-08-31",
+                    "--no-ocr-candidates",
                 ]
             )
         )
@@ -381,6 +438,10 @@ class ReconcileWorkflowTests(unittest.TestCase):
                     "large",
                     "--date",
                     "2026-08-31",
+                    "--from",
+                    "2026-08-31 05:00",
+                    "--to",
+                    "2026-09-01 05:00",
                 ]
             )
             report = reconcile.start_run(args)
@@ -397,6 +458,15 @@ class ReconcileWorkflowTests(unittest.TestCase):
                 sorted(expected_names),
             )
             self.assertEqual(run["group_mode"], "large")
+            self.assertEqual(run["accounting_date"], "2026-08-31")
+            self.assertEqual(run["accounting_from"], "2026-08-31 05:00")
+            self.assertEqual(run["accounting_to"], "2026-09-01 05:00")
+            self.assertEqual(report["runtime_contract"], reconcile.RUNTIME_CONTRACT)
+            self.assertEqual(report["amount_policy"], reconcile.AMOUNT_POLICY)
+            self.assertEqual(
+                report["workbook_compatibility"],
+                reconcile.WORKBOOK_COMPATIBILITY,
+            )
 
     def test_start_large_mode_requires_one_accounting_date(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1634,6 +1704,25 @@ class ReconcileWorkflowTests(unittest.TestCase):
             self.assertEqual(first["page_start"], 0)
             self.assertEqual(first["page_end"], 1)
             self.assertEqual(first["page_token"], repeated["page_token"])
+            self.assertEqual(first["media_queue"], repeated["media_queue"])
+            self.assertEqual(
+                first["media_queue"]["contract_version"],
+                reconcile.MEDIA_QUEUE_CONTRACT,
+            )
+            self.assertEqual(first["media_queue"]["mode"], "orders")
+            self.assertEqual(
+                first["media_queue"]["recommended_parallel_limit"],
+                reconcile.ORDER_MEDIA_BATCH_LIMIT,
+            )
+            self.assertEqual(first["media_queue"]["queued_images"], 1)
+            self.assertEqual(
+                first["media_queue"]["batches"][0]["items"][0]["label"],
+                "M0001",
+            )
+            self.assertEqual(
+                first["media_queue"]["batches"][0]["items"][0]["message_label"],
+                "S00001",
+            )
             self.assertFalse(first["done"])
             self.assertEqual(after["reviewed_through"], 0)
             self.assertFalse(after["read_complete"])
@@ -1641,6 +1730,578 @@ class ReconcileWorkflowTests(unittest.TestCase):
                 reconcile._semantic_fingerprint(before),
                 reconcile._semantic_fingerprint(after),
             )
+
+    def test_ocr_platform_defaults_and_manual_overrides_are_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            (source / "result.json").write_text(
+                json.dumps(
+                    {
+                        "id": "ocr-platforms",
+                        "name": "测试小额群",
+                        "messages": [
+                            {
+                                "id": 1,
+                                "type": "message",
+                                "date_unixtime": "1780000000",
+                                "from": "Alice",
+                                "from_id": "user:alice",
+                                "text": "仅测试平台默认值",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            cases = [
+                ("windows-auto", "Windows", [], False, "auto"),
+                ("windows-enabled", "Windows", ["--ocr-candidates"], True, "enabled"),
+                ("macos-auto", "Darwin", [], False, "auto"),
+                ("macos-enabled", "Darwin", ["--ocr-candidates"], True, "enabled"),
+                ("macos-disabled", "Darwin", ["--no-ocr-candidates"], False, "disabled"),
+                ("linux-auto", "Linux", [], False, "auto"),
+            ]
+            for name, system_name, flags, expected_enabled, expected_requested in cases:
+                with self.subTest(name=name):
+                    work = root / name
+                    args = reconcile.parse_args(
+                        [
+                            "start",
+                            str(source),
+                            "--work",
+                            str(work),
+                            *flags,
+                        ]
+                    )
+                    with mock.patch.object(
+                        reconcile.host_platform,
+                        "system",
+                        return_value=system_name,
+                    ):
+                        report = reconcile.start_run(args)
+                    run = reconcile._load_run(work)
+                    self.assertEqual(
+                        report["ocr_candidates"],
+                        run["ocr_candidates"],
+                    )
+                    self.assertEqual(
+                        run["ocr_candidates"]["enabled"], expected_enabled
+                    )
+                    self.assertEqual(
+                        run["ocr_candidates"]["requested"], expected_requested
+                    )
+                    self.assertFalse(run["ocr_candidates"]["default_enabled"])
+                    self.assertFalse(reconcile._ocr_cache_path(work).exists())
+
+    def test_disabled_ocr_does_not_invoke_worker_or_create_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with mock.patch.object(
+                reconcile,
+                "_invoke_ocr_worker",
+                side_effect=AssertionError("disabled OCR must not invoke its worker"),
+            ):
+                work, _, _ = self._start_fixture(
+                    root,
+                    controlled=True,
+                    commit_page=False,
+                    ocr_candidates=False,
+                )
+                page = reconcile.review_command(
+                    Namespace(
+                        work=work,
+                        review_action="next",
+                        group="测试小额群",
+                        limit=500,
+                    )
+                )
+            self.assertEqual(page["media_queue"]["ocr_candidates"]["status"], "disabled")
+            self.assertFalse(reconcile._ocr_cache_path(work).exists())
+            self.assertTrue(
+                all(
+                    "ocr_candidate" not in item
+                    for batch in page["media_queue"]["batches"]
+                    for item in batch["items"]
+                )
+            )
+
+    def test_enabled_ocr_candidates_are_cached_once_per_identical_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            messages = [
+                {
+                    "id": index + 1,
+                    "type": "message",
+                    "date_unixtime": str(1780000000 + index * 60),
+                    "from": "Alice",
+                    "from_id": "user:alice",
+                    "text": "重复发送同一张资金图",
+                    "photo": "photos/customer.jpg",
+                }
+                for index in range(3)
+            ]
+
+            def fake_worker(requests: list[dict[str, str]]) -> dict:
+                return {
+                    "status": "ready",
+                    "reason": None,
+                    "backend": "fake-ocr",
+                    "backend_version": "1.0",
+                    "results": {
+                        request["content_sha256"]: {
+                            "contract_version": reconcile.OCR_CANDIDATE_CONTRACT,
+                            "content_sha256": request["content_sha256"],
+                            "status": "ok",
+                            "backend": "fake-ocr",
+                            "backend_version": "1.0",
+                            "authoritative": False,
+                            "text": "100,000 THB\nxxx-1234",
+                            "average_confidence": 0.96,
+                            "line_count": 2,
+                            "elapsed_ms": 25,
+                            "truncated": False,
+                        }
+                        for request in requests
+                    },
+                }
+
+            with mock.patch.object(
+                reconcile,
+                "_invoke_ocr_worker",
+                side_effect=fake_worker,
+            ) as worker:
+                work, run, _ = self._start_fixture(
+                    root,
+                    messages=messages,
+                    controlled=True,
+                    commit_page=False,
+                    ocr_candidates=True,
+                )
+                first = reconcile.review_command(
+                    Namespace(
+                        work=work,
+                        review_action="next",
+                        group="测试小额群",
+                        limit=500,
+                    )
+                )
+                repeated = reconcile.review_command(
+                    Namespace(
+                        work=work,
+                        review_action="next",
+                        group="测试小额群",
+                        limit=500,
+                    )
+                )
+
+            self.assertEqual(worker.call_count, 1)
+            self.assertEqual(len(worker.call_args.args[0]), 1)
+            self.assertEqual(first["media_queue"], repeated["media_queue"])
+            queue = first["media_queue"]
+            self.assertEqual(queue["queued_images"], 1)
+            self.assertEqual(queue["duplicate_alias_labels"], 2)
+            self.assertEqual(queue["ocr_candidates"]["status"], "ready")
+            self.assertEqual(queue["ocr_candidates"]["candidate_count"], 1)
+            representative = queue["batches"][0]["items"][0]
+            self.assertEqual(representative["same_content_labels"], ["M0002", "M0003"])
+            self.assertEqual(
+                representative["ocr_candidate"]["text"],
+                "100,000 THB\nxxx-1234",
+            )
+            self.assertFalse(representative["ocr_candidate"]["authoritative"])
+            self.assertTrue(reconcile._ocr_cache_path(work).is_file())
+            decision = reconcile._load_json(
+                reconcile._decision_path(work, run["groups"][0])
+            )
+            self.assertEqual(decision["media_decisions"], {})
+            self.assertEqual(decision["reviewed_through"], 0)
+
+    def test_adaptive_media_batch_policy_scales_queue_up_and_down(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            group = self._synthetic_media_group(
+                Path(temporary),
+                count=12,
+            )
+
+            def decision_with_metrics(**updates: int) -> dict:
+                metrics = reconcile._empty_media_view_metrics()
+                metrics.update(updates)
+                return {
+                    "contract_version": reconcile.DECISION_CONTRACT,
+                    "media_decisions": {},
+                    "media_observation_cache": reconcile._empty_media_observation_cache(),
+                    "media_view_metrics": metrics,
+                }
+
+            default_queue = reconcile._review_media_queue(
+                group,
+                decision_with_metrics(),
+                0,
+                12,
+            )
+            fast_queue = reconcile._review_media_queue(
+                group,
+                decision_with_metrics(
+                    view_batches=2,
+                    opened_images=18,
+                    elapsed_ms=20_000,
+                ),
+                0,
+                12,
+            )
+            pressured_queue = reconcile._review_media_queue(
+                group,
+                decision_with_metrics(
+                    view_batches=2,
+                    opened_images=18,
+                    failed_images=3,
+                    elapsed_ms=20_000,
+                ),
+                0,
+                12,
+            )
+            maximum_policy = reconcile._adaptive_media_batch_policy(
+                decision_with_metrics(
+                    view_batches=4,
+                    opened_images=36,
+                    elapsed_ms=32_000,
+                ),
+                finance_mode=False,
+            )
+            minimum_policy = reconcile._adaptive_media_batch_policy(
+                decision_with_metrics(
+                    view_batches=2,
+                    opened_images=18,
+                    failed_images=6,
+                    elapsed_ms=20_000,
+                ),
+                finance_mode=False,
+            )
+
+            self.assertEqual(default_queue["recommended_parallel_limit"], 9)
+            self.assertEqual(
+                [len(batch["items"]) for batch in default_queue["batches"]],
+                [9, 3],
+            )
+            self.assertEqual(fast_queue["recommended_parallel_limit"], 11)
+            self.assertEqual(
+                [len(batch["items"]) for batch in fast_queue["batches"]],
+                [11, 1],
+            )
+            self.assertEqual(pressured_queue["recommended_parallel_limit"], 6)
+            self.assertEqual(
+                [len(batch["items"]) for batch in pressured_queue["batches"]],
+                [6, 6],
+            )
+            self.assertEqual(maximum_policy["recommended_parallel_limit"], 12)
+            self.assertEqual(minimum_policy["recommended_parallel_limit"], 4)
+            finance_decision = decision_with_metrics(
+                view_batches=2,
+                opened_images=8,
+                elapsed_ms=20_000,
+            )
+            finance_decision["contract_version"] = reconcile.finance_materials.DECISION_CONTRACT
+            self.assertEqual(
+                reconcile._adaptive_media_batch_policy(
+                    finance_decision,
+                    finance_mode=True,
+                )["recommended_parallel_limit"],
+                6,
+            )
+
+    def test_media_observation_cache_reuses_identical_images_without_merging_labels(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            messages = [
+                {
+                    "id": index + 1,
+                    "type": "message",
+                    "date_unixtime": str(1780000000 + index * 60),
+                    "from": "Alice",
+                    "from_id": "user:alice",
+                    "text": "重复发送同一张付款图",
+                    "photo": "photos/customer.jpg",
+                }
+                for index in range(3)
+            ]
+            work, run, _ = self._start_fixture(
+                root,
+                messages=messages,
+                controlled=True,
+                commit_page=False,
+            )
+            first_page = reconcile.review_command(
+                Namespace(
+                    work=work,
+                    review_action="next",
+                    group="测试小额群",
+                    limit=2,
+                )
+            )
+            queue = first_page["media_queue"]
+            self.assertEqual(queue["queued_images"], 1)
+            self.assertEqual(queue["duplicate_alias_labels"], 1)
+            self.assertEqual(
+                queue["batches"][0]["items"][0]["same_content_labels"],
+                ["M0002"],
+            )
+            digest = queue["batches"][0]["items"][0]["content_sha256"]
+            fund_decision = {
+                "classification": "fund",
+                "viewed_original": True,
+                "entries": [
+                    {
+                        "amount": "100",
+                        "currency": "CNY",
+                        "payee": "张三",
+                    }
+                ],
+            }
+            incomplete_observation_batch = self._write_review_batch(
+                root,
+                batch_id="observation-missing-label",
+                base_fingerprint=first_page["semantic_fingerprint"],
+                media_decisions={
+                    "M0001": copy.deepcopy(fund_decision),
+                    "M0002": copy.deepcopy(fund_decision),
+                },
+                media_observations={
+                    "M0001": {
+                        "contract_version": reconcile.MEDIA_OBSERVATION_CONTRACT,
+                        "classification": "fund",
+                        "review_status": "clear",
+                        "viewed_original": True,
+                        "recheck_reasons": [],
+                    }
+                },
+            )
+            with self.assertRaisesRegex(ValueError, "exactly one result"):
+                reconcile.review_command(
+                    Namespace(
+                        work=work,
+                        review_action="apply-batch",
+                        group="测试小额群",
+                        input=incomplete_observation_batch,
+                    )
+                )
+            first_batch = self._write_review_batch(
+                root,
+                batch_id="observation-first",
+                base_fingerprint=first_page["semantic_fingerprint"],
+                media_decisions={
+                    "M0001": copy.deepcopy(fund_decision),
+                    "M0002": copy.deepcopy(fund_decision),
+                },
+                media_observations={
+                    "M0001": {
+                        "contract_version": reconcile.MEDIA_OBSERVATION_CONTRACT,
+                        "classification": "fund",
+                        "review_status": "clear",
+                        "viewed_original": True,
+                        "recheck_reasons": [],
+                    },
+                    "M0002": {"reuse_from": "M0001"},
+                },
+                media_view_metrics={
+                    "view_batches": 1,
+                    "opened_images": 1,
+                    "failed_images": 0,
+                    "single_image_rechecks": 0,
+                    "elapsed_ms": 120,
+                },
+                page_commit={
+                    "page_start": first_page["page_start"],
+                    "page_end": first_page["page_end"],
+                    "page_token": first_page["page_token"],
+                },
+                open_orders=[],
+            )
+            first_result = reconcile.review_command(
+                Namespace(
+                    work=work,
+                    review_action="apply-batch",
+                    group="测试小额群",
+                    input=first_batch,
+                )
+            )
+            self.assertEqual(first_result["media_observations_recorded"], 2)
+            self.assertEqual(first_result["observation_cache_reuses"], 1)
+            self.assertEqual(first_result["observation_cache_entries"], 1)
+
+            second_page = reconcile.review_command(
+                Namespace(
+                    work=work,
+                    review_action="next",
+                    group="测试小额群",
+                    limit=1,
+                )
+            )
+            second_queue = second_page["media_queue"]
+            self.assertEqual(second_queue["queued_images"], 0)
+            self.assertEqual(second_queue["cache_hit_labels"], 1)
+            self.assertEqual(second_queue["cache_hits"][0]["labels"][0]["label"], "M0003")
+            self.assertEqual(
+                second_queue["cache_hits"][0]["observation"]["facts"]["entries"][0]["amount"],
+                "100",
+            )
+            second_batch = self._write_review_batch(
+                root,
+                batch_id="observation-cache-hit",
+                base_fingerprint=second_page["semantic_fingerprint"],
+                media_decisions={"M0003": copy.deepcopy(fund_decision)},
+                media_observations={"M0003": {"reuse_sha256": digest}},
+                page_commit={
+                    "page_start": second_page["page_start"],
+                    "page_end": second_page["page_end"],
+                    "page_token": second_page["page_token"],
+                },
+                open_orders=[],
+            )
+            second_result = reconcile.review_command(
+                Namespace(
+                    work=work,
+                    review_action="apply-batch",
+                    group="测试小额群",
+                    input=second_batch,
+                )
+            )
+            self.assertEqual(second_result["observation_cache_reuses"], 1)
+            decision = reconcile._load_json(
+                reconcile._decision_path(work, run["groups"][0])
+            )
+            self.assertEqual(sorted(decision["media_decisions"]), ["M0001", "M0002", "M0003"])
+            self.assertEqual(
+                decision["media_observation_cache"]["entries"][digest]["source_labels"],
+                ["M0001", "M0002", "M0003"],
+            )
+            self.assertEqual(decision["orders"], [])
+
+    def test_media_observation_recheck_queue_blocks_seal_until_resolved(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            work, run, _ = self._start_fixture(
+                root,
+                controlled=True,
+                commit_page=False,
+            )
+            page = reconcile.review_command(
+                Namespace(work=work, review_action="next", group="测试小额群", limit=500)
+            )
+            reference_decisions = {
+                "M0001": {"classification": "reference", "note": "测试资料"},
+                "M0002": {"classification": "reference", "note": "测试资料"},
+            }
+            batch_path = self._write_review_batch(
+                root,
+                batch_id="observation-needs-recheck",
+                base_fingerprint=page["semantic_fingerprint"],
+                media_decisions=reference_decisions,
+                media_observations={
+                    "M0001": {
+                        "contract_version": reconcile.MEDIA_OBSERVATION_CONTRACT,
+                        "classification": "reference",
+                        "review_status": "recheck_required",
+                        "viewed_original": True,
+                        "recheck_reasons": ["small_text"],
+                    },
+                    "M0002": {
+                        "contract_version": reconcile.MEDIA_OBSERVATION_CONTRACT,
+                        "classification": "reference",
+                        "review_status": "clear",
+                        "viewed_original": True,
+                        "recheck_reasons": [],
+                    },
+                },
+                media_view_metrics={
+                    "view_batches": 1,
+                    "opened_images": 2,
+                    "failed_images": 0,
+                    "single_image_rechecks": 0,
+                    "elapsed_ms": 200,
+                },
+                page_commit={
+                    "page_start": page["page_start"],
+                    "page_end": page["page_end"],
+                    "page_token": page["page_token"],
+                },
+                open_orders=[],
+            )
+            applied = reconcile.review_command(
+                Namespace(
+                    work=work,
+                    review_action="apply-batch",
+                    group="测试小额群",
+                    input=batch_path,
+                )
+            )
+            self.assertEqual(applied["media_recheck_required"], 1)
+            self.assertEqual(
+                applied["media_recheck_queue"][0]["representative_label"],
+                "M0001",
+            )
+            done_page = reconcile.review_command(
+                Namespace(work=work, review_action="next", group="测试小额群", limit=500)
+            )
+            self.assertEqual(
+                done_page["media_queue"]["pending_recheck_batches"][0]["items"][0]["label"],
+                "M0001",
+            )
+            with self.assertRaisesRegex(ValueError, "media observation recheck"):
+                reconcile.review_command(
+                    Namespace(work=work, review_action="seal", group="测试小额群")
+                )
+
+            decision_path = reconcile._decision_path(work, run["groups"][0])
+            decision = reconcile._load_json(decision_path)
+            resolved_path = self._write_review_batch(
+                root,
+                batch_id="observation-rechecked",
+                base_fingerprint=reconcile._semantic_fingerprint(decision),
+                media_decisions={"M0001": reference_decisions["M0001"]},
+                media_observations={
+                    "M0001": {
+                        "contract_version": reconcile.MEDIA_OBSERVATION_CONTRACT,
+                        "classification": "reference",
+                        "review_status": "clear",
+                        "viewed_original": True,
+                        "recheck_reasons": [],
+                    }
+                },
+                media_view_metrics={
+                    "view_batches": 1,
+                    "opened_images": 1,
+                    "failed_images": 0,
+                    "single_image_rechecks": 1,
+                    "elapsed_ms": 80,
+                },
+            )
+            resolved = reconcile.review_command(
+                Namespace(
+                    work=work,
+                    review_action="apply-batch",
+                    group="测试小额群",
+                    input=resolved_path,
+                )
+            )
+            self.assertEqual(resolved["media_recheck_required"], 0)
+            self.assertEqual(
+                resolved["media_view_performance"]["single_image_recheck_rate"],
+                1 / 3,
+            )
+            sealed = reconcile.review_command(
+                Namespace(work=work, review_action="seal", group="测试小额群")
+            )
+            self.assertTrue(sealed["sealed"])
+            (root / "ChatExport" / "photos" / "customer.jpg").write_bytes(
+                b"changed-after-observation"
+            )
+            with self.assertRaisesRegex(ValueError, "changed after the run snapshot"):
+                reconcile.review_command(
+                    Namespace(work=work, review_action="check", group="测试小额群")
+                )
 
     def test_review_next_default_returns_largest_complete_page_within_budget(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2008,6 +2669,8 @@ class ReconcileWorkflowTests(unittest.TestCase):
             self.assertTrue(applied["controlled_editing"])
             self.assertEqual(applied["orders"], 1)
             self.assertEqual(applied["fund_entries"], 2)
+            self.assertEqual(applied["evidence_hashes_computed"], 2)
+            self.assertEqual(applied["evidence_hashes_reused"], 0)
             decision = reconcile._load_json(decision_path)
             self.assertEqual(
                 decision["edit_control"]["approved_semantic_fingerprint"],
@@ -2029,10 +2692,32 @@ class ReconcileWorkflowTests(unittest.TestCase):
                 )
             )
             self.assertTrue(replayed["idempotent_replay"])
+            self.assertEqual(replayed["evidence_hashes_computed"], 0)
+            self.assertEqual(replayed["evidence_hashes_reused"], 2)
+
+            decision = reconcile._load_json(decision_path)
+            order_only_path = self._write_review_batch(
+                root,
+                batch_id="fixture-order-only",
+                base_fingerprint=reconcile._semantic_fingerprint(decision),
+                orders=copy.deepcopy(decision["orders"]),
+            )
+            order_only = reconcile.review_command(
+                Namespace(
+                    work=work,
+                    review_action="apply-batch",
+                    group="测试小额群",
+                    input=order_only_path,
+                )
+            )
+            self.assertEqual(order_only["evidence_hashes_computed"], 0)
+            self.assertEqual(order_only["evidence_hashes_reused"], 2)
             sealed = reconcile.review_command(
                 Namespace(work=work, review_action="seal", group="测试小额群")
             )
             self.assertTrue(sealed["sealed"])
+            self.assertEqual(sealed["evidence_hashes_computed"], 2)
+            self.assertEqual(sealed["evidence_hashes_reused"], 0)
 
     def test_controlled_decision_rejects_direct_semantic_overwrite(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2324,8 +3009,14 @@ class ReconcileWorkflowTests(unittest.TestCase):
             decision_path = self._write_complete_decision(work)
             decision = reconcile._load_json(decision_path)
             entry = decision["media_decisions"]["M0001"]["entries"][0]
-            for field in ("side", "result", "amount_state", "payee_state"):
-                entry.pop(field)
+            for field in (
+                "side",
+                "result",
+                "amount_state",
+                "payee_state",
+                "amount_basis",
+            ):
+                entry.pop(field, None)
             core.atomic_json(decision_path, decision)
 
             reconcile.review_command(
@@ -2336,6 +3027,21 @@ class ReconcileWorkflowTests(unittest.TestCase):
             self.assertEqual(entry["result"], "completed")
             self.assertEqual(entry["amount_state"], "clear")
             self.assertEqual(entry["payee_state"], "visible")
+            self.assertEqual(entry["amount_basis"], "receiver_received")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            work, _, _ = self._start_fixture(Path(temporary))
+            decision_path = self._write_complete_decision(work)
+            decision = reconcile._load_json(decision_path)
+            decision["media_decisions"]["M0001"]["entries"][0]["amount_basis"] = (
+                "payer_discounted_after_coupon"
+            )
+            core.atomic_json(decision_path, decision)
+
+            with self.assertRaisesRegex(ValueError, "amount_basis is unsupported"):
+                reconcile.review_command(
+                    Namespace(work=work, review_action="seal", group="测试小额群")
+                )
 
     def test_seal_derives_failed_result_from_explicit_failure_text(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2654,11 +3360,17 @@ class ReconcileWorkflowTests(unittest.TestCase):
                 customer_flow = next(row for row in rows if row[0] == "客户付款")
                 internal_flow = next(row for row in rows if row[0] == "内部回款")
                 self.assertEqual(
-                    (customer_flow[core.HEADERS.index("流水金额")], customer_flow[core.HEADERS.index("流水币种")]),
+                    (
+                        customer_flow[core.HEADERS.index("收款方实际到账金额")],
+                        customer_flow[core.HEADERS.index("流水币种")],
+                    ),
                     (106, "USDT"),
                 )
                 self.assertEqual(
-                    (internal_flow[core.HEADERS.index("流水金额")], internal_flow[core.HEADERS.index("流水币种")]),
+                    (
+                        internal_flow[core.HEADERS.index("收款方实际到账金额")],
+                        internal_flow[core.HEADERS.index("流水币种")],
+                    ),
                     (695, "CNY"),
                 )
             finally:

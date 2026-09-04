@@ -52,7 +52,9 @@ python scripts/extract_line_ios.py <backup> --list-groups
 - 优先使用完整 attachment；只有缩略图时保留缩略图；两者都没有则标记 `availability=missing`。
 - `start` 可以把 LINE 媒体复制到本次工作目录，以保证路径稳定，但提取时不逐张计算媒体 SHA-256。
 - LINE 数据库、`Manifest.db` 等来源文件在 `start` 时计入本次来源指纹。
-- 订单模式只有审阅后判为 `fund` 的原图在 `review check/seal` 时计算证据哈希；财务资料模式对判为
-  `document` 或 `chat_profile` 的原图采用相同保护。`finish` 再核对；参考图片不哈希。
+- `start` 对选中群可直接看图的图片计算一次内容哈希，用于同图代表查看和观察缓存；它不会把同哈希解释成重复
+  交易。订单模式判为 `fund`、财务资料模式判为 `document` 或 `chat_profile` 后，判定另保存 `evidence_sha256`。
+  普通后续批次复用已有哈希，`review check/seal` 和 `finish` 再全量核对；参考图片只有快照内容哈希，不进入资金或
+  资料证据输出。
 - 语音、视频、贴纸、表情包和动图不作为资金证据，不需要 OCR 或转录。
 - 缺失图片不能用相邻聊天金额、公式或旧表格反推。脚本会把它保留为可见的待确认记录。
