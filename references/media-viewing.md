@@ -1,7 +1,7 @@
 # 单代理自适应并行看图与观察缓存
 
 `review next` 返回 `media_queue`。它只组织媒体、内容哈希、缓存候选和复核队列，不改变消息顺序、订单边界或业务
-判定。按 `media_queue.batches` 的顺序处理；订单模式从 9 张起步并在 4–12 张内自适应，财务资料模式从 4 张起步并
+判定。按 `media_queue.batches` 的顺序处理；订单和门店开票群模式从 9 张起步并在 4–12 张内自适应，财务资料模式从 4 张起步并
 在 2–6 张内自适应。不要为看图开启子代理，完整聊天、跨图关系和 `open_orders`/`open_people` 始终由当前主代理维护。
 
 ## 先读队列
@@ -100,6 +100,8 @@ text(JSON.stringify({
 
 订单资金条目只要仍有 `amount_state=partial|unreadable` 或 `payee_state=unreadable`，脚本就拒绝 `clear` 并补入对应
 复核原因。财务资料的 `document`/`chat_profile` 若标 `clear`，`facts` 至少要保存一个当前图片实际可见的字段。
+门店开票群的 `voucher`、`expense` 或 `balance` 若标 `clear`，`facts` 也至少要保存一个当前图片实际可见的票号、
+票面日期、说明、货币变动或余额字段；聊天引用更正不能写入图片事实缓存。
 
 可用原因是 `small_text`、`blurred`、`cropped`、`obscured`、`label_mapping_uncertain`、
 `conflicting_visible_fields`、`thumbnail_only`、`read_failure`、`amount_unreadable`、`payee_unreadable`、
@@ -145,7 +147,7 @@ text(JSON.stringify({
 }
 ```
 
-脚本累计耗时、失败率、单图复核率和缓存复用数，并在下一次 `review next` 生成 `batch_policy`。订单范围固定为
+脚本累计耗时、失败率、单图复核率和缓存复用数，并在下一次 `review next` 生成 `batch_policy`。订单和门店开票群范围固定为
 4–12 张、默认 9 张；财务资料范围固定为 2–6 张、默认 4 张。指标和推荐批量都不参与订单判定。
 
 ## OCR 候选

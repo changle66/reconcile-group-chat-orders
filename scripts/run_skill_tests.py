@@ -14,6 +14,7 @@ TEST_MODULES = (
     "test_reconcile",
     "test_line_android_miui",
     "test_finance_materials",
+    "test_store_ledger",
     "test_simple_ledger",
 )
 
@@ -30,6 +31,7 @@ CURRENT_TEST_IDS = frozenset(
         "test_reconcile.ReconcileWorkflowTests.test_enabled_ocr_candidates_are_cached_once_per_identical_hash",
         "test_reconcile.ReconcileWorkflowTests.test_invalid_apply_batch_does_not_partially_write_the_decision",
         "test_reconcile.ReconcileWorkflowTests.test_large_group_finish_writes_daily_records_and_rate_grouped_totals",
+        "test_reconcile.ReconcileWorkflowTests.test_large_summary_includes_pending_actual_flow_with_status",
         "test_reconcile.ReconcileWorkflowTests.test_large_group_multiple_fund_images_compile_to_one_full_order",
         "test_reconcile.ReconcileWorkflowTests.test_large_group_review_uses_full_order_contract",
         "test_reconcile.ReconcileWorkflowTests.test_media_observation_cache_reuses_identical_images_without_merging_labels",
@@ -41,6 +43,7 @@ CURRENT_TEST_IDS = frozenset(
         "test_reconcile.ReconcileWorkflowTests.test_ocr_platform_defaults_and_manual_overrides_are_persisted",
         "test_reconcile.ReconcileWorkflowTests.test_page_commit_advances_and_carries_open_order_context",
         "test_reconcile.ReconcileWorkflowTests.test_page_commit_requires_explicit_open_order_state_and_valid_token",
+        "test_reconcile.ReconcileWorkflowTests.test_redmi_whatsapp_export_uses_bracket_timestamps_and_parent_group_name",
         "test_reconcile.ReconcileWorkflowTests.test_review_next_default_returns_largest_complete_page_within_budget",
         "test_reconcile.ReconcileWorkflowTests.test_review_next_is_read_only_until_page_commit",
         "test_reconcile.ReconcileWorkflowTests.test_start_date_filters_messages_by_bangkok_calendar_day",
@@ -55,11 +58,13 @@ CURRENT_TEST_IDS = frozenset(
         "test_line_android_miui.LineAndroidMiuiTests.test_start_discovers_and_normalizes_miui_backup",
         "test_line_android_miui.LineAndroidMiuiTests.test_start_finance_mode_selects_finance_miui_group",
         "test_line_android_miui.LineAndroidMiuiTests.test_start_large_mode_selects_nonexcluded_miui_groups",
+        "test_line_android_miui.LineAndroidMiuiTests.test_start_store_mode_selects_store_miui_group",
     }
 )
 
 CURRENT_TEST_PREFIXES = (
     "test_finance_materials.FinanceMaterialsTests.",
+    "test_store_ledger.StoreLedgerTests.",
     "test_simple_ledger.SimpleLedgerTests.",
 )
 COMPATIBILITY_TEST_IDS = frozenset(
@@ -69,7 +74,7 @@ COMPATIBILITY_TEST_IDS = frozenset(
     }
 )
 
-EXPECTED_ALL_TESTS = 121
+EXPECTED_ALL_TESTS = 130
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

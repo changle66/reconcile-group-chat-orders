@@ -24,7 +24,13 @@ python scripts/reconcile.py start <原始导出根目录> --line-backup <LINE备
 python scripts/reconcile.py start <原始导出根目录> --line-backup <LINE备份目录> --work <全新工作目录> --mode finance
 ```
 
-大额模式从备份读取全部群，再统一排除群名包含 `小额出` 或 `财务资料群` 的群。
+门店开票群模式也由同一读取器自动分流，只筛选实际群名包含 `门店开票群` 的群，并保留回复目标消息及其图片标签：
+
+```powershell
+python scripts/reconcile.py start <原始导出根目录> --line-backup <LINE备份目录> --work <全新工作目录> --mode store-ledger
+```
+
+大额模式从备份读取全部群，再统一排除群名包含 `小额出`、`财务资料群` 或 `门店开票群` 的群。
 
 统一流程按 LINE 数据库中解析出的实际群名筛选，不把显示名相同的 Telegram、WhatsApp 或 LINE 群混在
 一起。新任务不要先运行旧提取脚本再拼接 normalized 文件，也不要使用 `--force` 覆盖历史输出。

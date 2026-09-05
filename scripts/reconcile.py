@@ -26,6 +26,7 @@ import finance_materials
 import large_daily
 import normalize_exports
 import simple_ledger
+import store_ledger
 
 
 RUN_CONTRACT = "group-chat-reconcile-run/1.0"
@@ -33,7 +34,7 @@ RUNTIME_CONTRACT = "reconcile-current-runtime/1.0"
 AMOUNT_POLICY = "receiver-actual-received/1.0"
 WORKBOOK_COMPATIBILITY = "wps-xlsx-static-values/1.0"
 DECISION_CONTRACT = "group-chat-decision/3.2"
-REVIEW_PAGE_CONTRACT = "group-chat-review-page/2.0"
+REVIEW_PAGE_CONTRACT = "group-chat-review-page/2.1"
 REVIEW_BATCH_CONTRACT = "group-chat-review-batch/1.1"
 MEDIA_QUEUE_CONTRACT = "group-chat-media-queue/2.1"
 MEDIA_OBSERVATION_CONTRACT = "group-chat-media-observation/1.0"
@@ -168,11 +169,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     start.add_argument("--work", required=True, type=Path, help="new, non-existing run directory")
     start.add_argument(
         "--mode",
-        choices=("small", "large", "finance"),
+        choices=("small", "large", "finance", "store-ledger"),
         default="small",
         help=(
-            "small selects the existing name filter; large selects every group except 小额出 and 财务资料群; "
-            "finance selects 财务资料群 for identity and chat-account records"
+            "small selects the existing name filter; large selects every group except 小额出, 财务资料群, and 门店开票群; "
+            "finance selects 财务资料群 for identity and chat-account records; "
+            "store-ledger selects 门店开票群 for signed internal currency movements"
         ),
     )
     start.add_argument("--contains", default="小额", help="required text in the parsed group name")
@@ -384,9 +386,14 @@ def _load_run(work: Path) -> dict[str, Any]:
     run = _load_json(path)
     core.require(run.get("contract_version") == RUN_CONTRACT, "unsupported run contract")
     core.require(isinstance(run.get("groups"), list), "run groups must be a list")
+    expected_amount_policy = (
+        store_ledger.AMOUNT_POLICY
+        if core.clean_text(run.get("group_mode")).casefold() == store_ledger.GROUP_MODE
+        else AMOUNT_POLICY
+    )
     for field, expected in (
         ("runtime_contract", RUNTIME_CONTRACT),
-        ("amount_policy", AMOUNT_POLICY),
+        ("amount_policy", expected_amount_policy),
         ("workbook_compatibility", WORKBOOK_COMPATIBILITY),
     ):
         if field in run:
@@ -526,7 +533,7 @@ def _large_group_name(value: object) -> bool:
     normalized = core.normalize_name(value)
     return all(
         core.normalize_name(excluded) not in normalized
-        for excluded in ("小额出", "财务资料群")
+        for excluded in ("小额出", "财务资料群", store_ledger.GROUP_NAME_MARKER)
     )
 
 
@@ -535,6 +542,8 @@ def _group_name_selected(value: object, *, group_mode: str, contains: str) -> bo
         return _large_group_name(value)
     if group_mode == finance_materials.GROUP_MODE:
         return finance_materials.group_name_selected(value)
+    if group_mode == store_ledger.GROUP_MODE:
+        return store_ledger.group_name_selected(value)
     return contains.casefold() in str(value or "").casefold()
 
 
@@ -684,7 +693,10 @@ def _merge_documents(
             seen.add(key)
             groups.append(copy.deepcopy(group))
     if group_mode == "large":
-        core.require(bool(groups), "no large groups remain after excluding 小额出 and 财务资料群")
+        core.require(
+            bool(groups),
+            "no large groups remain after excluding 小额出, 财务资料群, and 门店开票群",
+        )
     else:
         core.require(bool(groups), f"no parsed group name contains {contains!r}")
     groups.sort(key=lambda item: (str(item.get("platform")), str(item.get("group_name")), str(item.get("group_key"))))
@@ -744,6 +756,8 @@ def _decision_template(
     contract_version = (
         finance_materials.DECISION_CONTRACT
         if group_mode == finance_materials.GROUP_MODE
+        else store_ledger.DECISION_CONTRACT
+        if group_mode == store_ledger.GROUP_MODE
         else large_daily.DECISION_CONTRACT
         if group_mode == "large"
         else DECISION_CONTRACT
@@ -771,6 +785,15 @@ def _decision_template(
                 "group_mode": finance_materials.GROUP_MODE,
                 "people": [],
                 "open_people": [],
+            }
+        )
+    elif group_mode == store_ledger.GROUP_MODE:
+        decision.update(
+            {
+                "group_mode": store_ledger.GROUP_MODE,
+                "records": [],
+                "open_records": [],
+                "balance_snapshots": [],
             }
         )
     elif group_mode == "large":
@@ -836,17 +859,43 @@ def _filter_normalized_window(
     start_at: datetime,
     end_at: datetime,
     fingerprint_fields: Mapping[str, object],
+    preserve_reply_context: bool = False,
 ) -> dict[str, Any]:
     core.require(start_at.tzinfo is not None and end_at.tzinfo is not None, "accounting window requires timezone")
     filtered = copy.deepcopy(normalized)
     for group in filtered.get("groups", []):
-        group["messages"] = [
-            message
-            for message in group.get("messages", [])
+        messages = list(group.get("messages", []))
+        in_window_ids = {
+            str(message.get("message_id") or "")
+            for message in messages
             if start_at
             <= datetime.fromisoformat(str(message.get("timestamp"))).astimezone(start_at.tzinfo)
             < end_at
-        ]
+        }
+        retained_ids = set(in_window_ids)
+        if preserve_reply_context:
+            changed = True
+            while changed:
+                changed = False
+                for message in messages:
+                    message_id = str(message.get("message_id") or "")
+                    reply_id = str(message.get("reply_to_message_id") or "")
+                    if (
+                        (message_id in retained_ids and reply_id and reply_id not in retained_ids)
+                        or (reply_id in retained_ids and message_id not in retained_ids)
+                    ):
+                        retained_ids.update(item for item in (message_id, reply_id) if item)
+                        changed = True
+        retained: list[dict[str, Any]] = []
+        for message in messages:
+            message_id = str(message.get("message_id") or "")
+            if message_id not in retained_ids:
+                continue
+            if message_id not in in_window_ids:
+                message["accounting_context_only"] = True
+                message["excluded_from_accounting"] = True
+            retained.append(message)
+        group["messages"] = retained
     messages = [message for group in filtered.get("groups", []) for message in group.get("messages", [])]
     media = [item for message in messages for item in message.get("media", [])]
     filtered["source_fingerprint"] = core.fingerprint_json(
@@ -869,11 +918,20 @@ def _filter_normalized_window(
         }
     )
     filtered["statistics"] = statistics
+    filtered["accounting_window"] = {
+        "start": start_at.isoformat(),
+        "end": end_at.isoformat(),
+        "reply_context_preserved": preserve_reply_context,
+    }
     return filtered
 
 
 def _filter_normalized_date(
-    normalized: dict[str, Any], *, accounting_date: str, timezone_name: str
+    normalized: dict[str, Any],
+    *,
+    accounting_date: str,
+    timezone_name: str,
+    preserve_reply_context: bool = False,
 ) -> dict[str, Any]:
     zone = ZoneInfo(timezone_name)
     start_at = datetime.strptime(accounting_date, "%Y-%m-%d").replace(tzinfo=zone)
@@ -885,6 +943,7 @@ def _filter_normalized_date(
             "accounting_date": accounting_date,
             "timezone": timezone_name,
         },
+        preserve_reply_context=preserve_reply_context,
     )
 
 
@@ -894,6 +953,7 @@ def _filter_normalized_time_range(
     accounting_from: str,
     accounting_to: str,
     timezone_name: str,
+    preserve_reply_context: bool = False,
 ) -> dict[str, Any]:
     zone = ZoneInfo(timezone_name)
     return _filter_normalized_window(
@@ -905,6 +965,7 @@ def _filter_normalized_time_range(
             "accounting_to": accounting_to,
             "timezone": timezone_name,
         },
+        preserve_reply_context=preserve_reply_context,
     )
 
 
@@ -961,12 +1022,15 @@ def start_run(args: argparse.Namespace) -> dict[str, Any]:
         core.require(path.exists(), f"input does not exist: {path}")
     group_mode = core.clean_text(getattr(args, "mode", "small")).casefold()
     core.require(
-        group_mode in {"small", "large", finance_materials.GROUP_MODE},
-        "--mode must be small, large, or finance",
+        group_mode
+        in {"small", "large", finance_materials.GROUP_MODE, store_ledger.GROUP_MODE},
+        "--mode must be small, large, finance, or store-ledger",
     )
     contains = (
         finance_materials.GROUP_NAME_MARKER
         if group_mode == finance_materials.GROUP_MODE
+        else store_ledger.GROUP_NAME_MARKER
+        if group_mode == store_ledger.GROUP_MODE
         else core.clean_text(getattr(args, "contains", "小额"))
     )
     core.require(bool(contains), "--contains cannot be empty")
@@ -1046,12 +1110,14 @@ def start_run(args: argparse.Namespace) -> dict[str, Any]:
             accounting_from=accounting_from,
             accounting_to=accounting_to,
             timezone_name=args.timezone,
+            preserve_reply_context=group_mode == store_ledger.GROUP_MODE,
         )
     elif accounting_date is not None:
         normalized = _filter_normalized_date(
             normalized,
             accounting_date=accounting_date,
             timezone_name=args.timezone,
+            preserve_reply_context=group_mode == store_ledger.GROUP_MODE,
         )
     media_hash_statistics = _capture_normalized_media_hashes(normalized)
     snapshot_path = _snapshot_path(work)
@@ -1084,10 +1150,15 @@ def start_run(args: argparse.Namespace) -> dict[str, Any]:
                 "group_mode": group_mode,
             }
         )
+    amount_policy = (
+        store_ledger.AMOUNT_POLICY
+        if group_mode == store_ledger.GROUP_MODE
+        else AMOUNT_POLICY
+    )
     run = {
         "contract_version": RUN_CONTRACT,
         "runtime_contract": RUNTIME_CONTRACT,
-        "amount_policy": AMOUNT_POLICY,
+        "amount_policy": amount_policy,
         "workbook_compatibility": WORKBOOK_COMPATIBILITY,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "accounting_timezone": args.timezone,
@@ -1102,7 +1173,11 @@ def start_run(args: argparse.Namespace) -> dict[str, Any]:
         "groups": group_reports,
     }
     if group_mode == "large":
-        run["group_name_excludes"] = ["小额出", "财务资料群"]
+        run["group_name_excludes"] = [
+            "小额出",
+            "财务资料群",
+            store_ledger.GROUP_NAME_MARKER,
+        ]
     else:
         run["group_name_contains"] = contains
     if accounting_date is not None:
@@ -1114,7 +1189,7 @@ def start_run(args: argparse.Namespace) -> dict[str, Any]:
     result = {
         "work": str(work),
         "runtime_contract": RUNTIME_CONTRACT,
-        "amount_policy": AMOUNT_POLICY,
+        "amount_policy": amount_policy,
         "workbook_compatibility": WORKBOOK_COMPATIBILITY,
         "groups": len(group_reports),
         "messages": normalized["statistics"]["messages"],
@@ -1200,6 +1275,17 @@ def _semantic_fingerprint(decision: Mapping[str, Any]) -> str:
                 "open_people": decision.get("open_people"),
             })
         )
+    if decision.get("contract_version") == store_ledger.DECISION_CONTRACT:
+        return core.fingerprint_json(
+            with_media_review_state({
+                "reviewed_through": decision.get("reviewed_through"),
+                "read_complete": decision.get("read_complete"),
+                "media_decisions": decision.get("media_decisions"),
+                "records": decision.get("records"),
+                "open_records": decision.get("open_records"),
+                "balance_snapshots": decision.get("balance_snapshots"),
+            })
+        )
     if decision.get("contract_version") == large_daily.LEGACY_DECISION_CONTRACT:
         return core.fingerprint_json(
             with_media_review_state({
@@ -1233,6 +1319,8 @@ def _open_field_for_decision(decision: Mapping[str, Any]) -> str:
     contract_version = decision.get("contract_version")
     if contract_version == finance_materials.DECISION_CONTRACT:
         return "open_people"
+    if contract_version == store_ledger.DECISION_CONTRACT:
+        return "open_records"
     if contract_version == large_daily.LEGACY_DECISION_CONTRACT:
         return "open_exchanges"
     return "open_orders"
@@ -1242,6 +1330,8 @@ def _expected_contracts_for_run_group(run_group: Mapping[str, Any]) -> set[str]:
     group_mode = core.clean_text(run_group.get("group_mode")).casefold()
     if group_mode == finance_materials.GROUP_MODE:
         return {finance_materials.DECISION_CONTRACT}
+    if group_mode == store_ledger.GROUP_MODE:
+        return {store_ledger.DECISION_CONTRACT}
     if group_mode == "large":
         return {large_daily.DECISION_CONTRACT, large_daily.LEGACY_DECISION_CONTRACT}
     return {DECISION_CONTRACT}
@@ -1432,6 +1522,11 @@ def _load_review_batch(path: Path) -> dict[str, Any]:
         "people",
         "remove_person_ids",
         "open_people",
+        "records",
+        "remove_record_ids",
+        "open_records",
+        "balance_snapshots",
+        "remove_balance_snapshot_ids",
     }
     unknown = sorted(set(batch) - allowed)
     core.require(
@@ -1477,9 +1572,12 @@ def _load_review_batch(path: Path) -> dict[str, Any]:
         )
         page_commit["page_token"] = page_token
         core.require(
-            any(field in batch for field in ("open_orders", "open_exchanges", "open_people")),
+            any(
+                field in batch
+                for field in ("open_orders", "open_exchanges", "open_people", "open_records")
+            ),
             "review batch that commits a page must include the complete open_orders, "
-            "open_exchanges, or open_people list",
+            "open_exchanges, open_people, or open_records list",
         )
     if "open_orders" in batch:
         core.require(isinstance(batch["open_orders"], list), "review batch open_orders must be a list")
@@ -1490,6 +1588,8 @@ def _load_review_batch(path: Path) -> dict[str, Any]:
         )
     if "open_people" in batch:
         core.require(isinstance(batch["open_people"], list), "review batch open_people must be a list")
+    if "open_records" in batch:
+        core.require(isinstance(batch["open_records"], list), "review batch open_records must be a list")
     if "media_observations" in batch:
         core.require(
             isinstance(batch["media_observations"], Mapping),
@@ -1564,12 +1664,38 @@ def _merge_review_batch(
             "exchanges",
             "remove_exchange_ids",
             "open_exchanges",
+            "records",
+            "remove_record_ids",
+            "open_records",
+            "balance_snapshots",
+            "remove_balance_snapshot_ids",
         )
         core.require(
             not any(field in batch for field in incompatible),
             "finance-material review batches must use people and open_people",
         )
         return finance_materials.merge_review_batch(candidate, batch)
+
+    if candidate.get("contract_version") == store_ledger.DECISION_CONTRACT:
+        incompatible = (
+            "orders",
+            "remove_order_ids",
+            "open_orders",
+            "balance_links",
+            "settlement_allocations",
+            "unknown_payee_reviewed_entry_ids",
+            "exchanges",
+            "remove_exchange_ids",
+            "open_exchanges",
+            "people",
+            "remove_person_ids",
+            "open_people",
+        )
+        core.require(
+            not any(field in batch for field in incompatible),
+            "store-ledger review batches must use records, open_records, and balance_snapshots",
+        )
+        return store_ledger.merge_review_batch(candidate, batch)
 
     if candidate.get("contract_version") == large_daily.LEGACY_DECISION_CONTRACT:
         core.require(
@@ -1584,6 +1710,11 @@ def _merge_review_batch(
                     "people",
                     "remove_person_ids",
                     "open_people",
+                    "records",
+                    "remove_record_ids",
+                    "open_records",
+                    "balance_snapshots",
+                    "remove_balance_snapshot_ids",
                 )
             ),
             "large-group review batches must use exchanges and open_exchanges",
@@ -1674,6 +1805,11 @@ def _merge_review_batch(
                 "people",
                 "remove_person_ids",
                 "open_people",
+                "records",
+                "remove_record_ids",
+                "open_records",
+                "balance_snapshots",
+                "remove_balance_snapshot_ids",
             )
         ),
         "order-based review batches must use orders and open_orders",
@@ -1977,9 +2113,12 @@ def _normalize_full_media_observation(
         f"{field}.classification must match media_decisions.{label}",
     )
     finance_mode = decision.get("contract_version") == finance_materials.DECISION_CONTRACT
+    store_mode = decision.get("contract_version") == store_ledger.DECISION_CONTRACT
     allowed_classifications = (
         finance_materials.MEDIA_CLASSIFICATIONS
         if finance_mode
+        else store_ledger.MEDIA_CLASSIFICATIONS
+        if store_mode
         else {"fund", "reference"}
     )
     core.require(
@@ -2027,6 +2166,29 @@ def _normalize_full_media_observation(
             core.require(
                 bool(facts),
                 f"{field}.facts must include at least one visible document or account field",
+            )
+    elif store_mode:
+        canonical = store_ledger.normalize_visible_facts(
+            media_decision.get("facts"),
+            classification=classification,
+            field=f"{field}.facts",
+        )
+        supplied_facts = value.get("facts")
+        if supplied_facts is not None:
+            supplied = store_ledger.normalize_visible_facts(
+                supplied_facts,
+                classification=classification,
+                field=f"{field}.facts",
+            )
+            core.require(
+                supplied == canonical,
+                f"{field}.facts must match media_decisions.{label}.facts",
+            )
+        facts = canonical
+        if classification != "reference" and review_status == "clear":
+            core.require(
+                bool(facts),
+                f"{field}.facts must include at least one fact visible in the store image",
             )
     else:
         canonical = _order_observation_facts(media_decision)
@@ -3412,6 +3574,30 @@ def _validate_decision(
                 verify_files=rehash_labels is None,
             ),
         }
+    if decision.get("contract_version") == store_ledger.DECISION_CONTRACT:
+        expected = _decision_template(
+            normalized,
+            group,
+            group_mode=store_ledger.GROUP_MODE,
+        )
+        statistics = store_ledger.validate_decision(
+            normalized,
+            group,
+            decision,
+            expected,
+            require_complete=require_complete,
+            capture_hashes=capture_hashes,
+            rehash_labels=rehash_labels,
+        )
+        return {
+            **statistics,
+            **_validate_media_observation_cache(
+                group,
+                decision,
+                require_complete=require_complete,
+                verify_files=rehash_labels is None,
+            ),
+        }
     if decision.get("contract_version") == large_daily.LEGACY_DECISION_CONTRACT:
         statistics = _validate_large_decision(
             normalized,
@@ -4228,6 +4414,7 @@ def _review_media_queue(
             for label, (_, media) in inventory.items()
         }
     finance_mode = decision.get("contract_version") == finance_materials.DECISION_CONTRACT
+    store_mode = decision.get("contract_version") == store_ledger.DECISION_CONTRACT
     batch_policy = _adaptive_media_batch_policy(
         decision,
         finance_mode=finance_mode,
@@ -4440,7 +4627,13 @@ def _review_media_queue(
         )
     return {
         "contract_version": MEDIA_QUEUE_CONTRACT,
-        "mode": "finance_materials" if finance_mode else "orders",
+        "mode": (
+            "finance_materials"
+            if finance_mode
+            else "store_ledger"
+            if store_mode
+            else "orders"
+        ),
         "recommended_parallel_limit": parallel_limit,
         "batch_policy": batch_policy,
         "queued_images": queued_images,
@@ -4839,10 +5032,16 @@ def _compact_page(
         reply = None
         if reply_id in label_by_id:
             target = message_by_id.get(reply_id)
+            target_media_labels = [
+                media_labels[str(media.get("media_id") or "")]
+                for media in (target.get("media", []) if target else [])
+                if str(media.get("media_id") or "") in media_labels
+            ]
             reply = {
                 "label": label_by_id[reply_id],
                 "sender": target.get("sender_name") if target else None,
                 "text": target.get("text") if target else None,
+                "media_labels": target_media_labels,
             }
         result.append(
             {
@@ -4851,6 +5050,7 @@ def _compact_page(
                 "sender": message.get("sender_name") or message.get("sender_id"),
                 "role": message.get("role"),
                 "text": message.get("text"),
+                "accounting_context_only": bool(message.get("accounting_context_only")),
                 "reply": reply,
                 "media": media_items,
             }
@@ -5035,6 +5235,8 @@ RISK_DIAGNOSTIC_FIELDS = (
     "unknown_payee_warning",
     "pending_people",
     "unassigned_material_media",
+    "pending_store_records",
+    "unassigned_store_media",
     "media_recheck_required",
 )
 RISK_FLAG_FIELDS = (
@@ -5048,6 +5250,8 @@ RISK_FLAG_FIELDS = (
     "unknown_payee_warning",
     "pending_people",
     "unassigned_material_media",
+    "pending_store_records",
+    "unassigned_store_media",
     "media_recheck_required",
 )
 
@@ -5264,6 +5468,7 @@ def review_command(args: argparse.Namespace) -> dict[str, Any]:
             "open_orders",
             "open_exchanges",
             "open_people",
+            "open_records",
         } - {expected_open_field}
         if batch.get("page_commit") is not None:
             core.require(
@@ -5863,11 +6068,46 @@ def finish_run(args: argparse.Namespace) -> dict[str, Any]:
 
     group_mode = core.clean_text(run.get("group_mode")).casefold()
     finance_run = group_mode == finance_materials.GROUP_MODE
+    store_run = group_mode == store_ledger.GROUP_MODE
     large_run = group_mode == "large"
     decision_contracts = {
         core.clean_text(decision.get("contract_version"))
         for decision in decisions.values()
     }
+    if store_run:
+        core.require(
+            decision_contracts == {store_ledger.DECISION_CONTRACT},
+            "store-ledger decisions must all use the supported store contract",
+        )
+        ledger, ledger_statistics = store_ledger.compile_ledger(normalized, decisions)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="finish-", dir=work) as temporary_name:
+            temporary = Path(temporary_name)
+            ledger_path = temporary / "store_ledger.json"
+            workbook_path = temporary / "workbook.xlsx"
+            core.atomic_json(ledger_path, ledger)
+            workbook = store_ledger.build_workbook(ledger)
+            workbook.save(workbook_path)
+            workbook.close()
+            errors = store_ledger.check_workbook(workbook_path, ledger)
+            core.require(
+                not errors,
+                "store-ledger workbook verification failed: " + "; ".join(errors[:10]),
+            )
+            workbook_path.replace(output)
+        run["status"] = "finished"
+        run["finished_at"] = datetime.now(timezone.utc).isoformat()
+        run["output"] = str(output)
+        core.atomic_json(_run_path(work), run)
+        return {
+            "output": str(output),
+            **ledger_statistics,
+            "missing_media": sum(
+                int(item.get("missing_media") or 0)
+                for item in review_statistics.values()
+            ),
+            "risk_report": _review_risk_summary(finish_risk_reports),
+        }
     if finance_run:
         core.require(
             decision_contracts == {finance_materials.DECISION_CONTRACT},

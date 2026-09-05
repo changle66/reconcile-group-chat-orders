@@ -14,7 +14,7 @@ LEGACY_DECISION_CONTRACT = "group-chat-large-daily-decision/1.0"
 DECISION_CONTRACT = "group-chat-large-daily-decision/2.0"
 LEGACY_OUTPUT_CONTRACT = "large-group-daily-ledger/1.0"
 OUTPUT_CONTRACT = "large-group-daily-orders/2.0"
-FUND_TYPES = frozenset({"wechat", "alipay", "bank_card", "usdt"})
+FUND_TYPES = frozenset({"wechat", "alipay", "bank_card", "usdt", "cash"})
 RATE_OPERATORS = frozenset({"multiply", "divide"})
 LEGACY_HEADERS = [
     "记录类型",
@@ -35,12 +35,14 @@ SUMMARY_HEADERS = [
     "笔数",
     "换出合计",
     "换入合计",
+    "状态",
 ]
 FUND_TYPE_LABELS = {
     "wechat": "微信",
     "alipay": "支付宝",
     "bank_card": "银行卡",
     "usdt": "USDT",
+    "cash": "现金",
 }
 FUND_TYPE_ORDER = tuple(FUND_TYPE_LABELS)
 
@@ -49,7 +51,7 @@ def normalize_fund_type(value: object, *, field: str) -> str:
     fund_type = core.clean_text(value).casefold()
     core.require(
         fund_type in FUND_TYPES,
-        f"{field} must be wechat, alipay, bank_card, or usdt",
+        f"{field} must be wechat, alipay, bank_card, usdt, or cash",
     )
     return fund_type
 
@@ -320,10 +322,10 @@ def compile_order_summaries(
     *,
     group_key: str,
 ) -> list[dict[str, Any]]:
-    """Group confirmed order scopes without replacing their detailed rows."""
+    """Group all order scopes while keeping pending amounts explicitly unknown."""
 
-    buckets: dict[tuple[str, str, str, str], dict[str, Any]] = {}
-    first_seen: dict[tuple[str, str, str, str], int] = {}
+    buckets: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
+    first_seen: dict[tuple[str, str, str, str, str], int] = {}
     sequence = 0
     for order_position, order in enumerate(orders):
         field = f"{group_key}.orders[{order_position}]"
@@ -332,40 +334,74 @@ def compile_order_summaries(
         )
         for scope_position, scope in enumerate(_summary_scopes(order)):
             scope_field = f"{field}.summary_scopes[{scope_position}]"
-            if _reconciliation_pending(scope.get("reconciliation")):
-                continue
-            direction = core.canonical_direction(
-                scope.get("direction"), field=f"{scope_field}.direction"
-            )
+            pending = _reconciliation_pending(scope.get("reconciliation"))
+            status_label = "待确认" if pending else "已确认"
+            raw_direction = core.clean_text(scope.get("direction"))
+            if raw_direction:
+                direction = core.canonical_direction(
+                    raw_direction, field=f"{scope_field}.direction"
+                )
+            else:
+                core.require(
+                    pending,
+                    f"{scope_field}.direction is required for a confirmed daily summary",
+                )
+                direction = "待确认"
             source_amount = core.parse_decimal(
-                scope.get("payment_total"), field=f"{scope_field}.payment_total"
+                scope.get("payment_total"),
+                field=f"{scope_field}.payment_total",
+                allow_none=True,
             )
             target_amount = core.parse_decimal(
                 scope.get("actual_payout_total"),
                 field=f"{scope_field}.actual_payout_total",
+                allow_none=True,
             )
             rate = core.parse_decimal(
-                scope.get("actual_rate"), field=f"{scope_field}.actual_rate"
+                scope.get("actual_rate"),
+                field=f"{scope_field}.actual_rate",
+                allow_none=True,
             )
             operator = core.clean_text(scope.get("rate_operator")).casefold()
             core.require(
-                source_amount is not None and source_amount > 0,
-                f"{scope_field}.payment_total must be positive for daily summary",
+                source_amount is None or source_amount > 0,
+                f"{scope_field}.payment_total must be positive when known",
             )
             core.require(
-                target_amount is not None and target_amount >= 0,
+                target_amount is None or target_amount >= 0,
                 f"{scope_field}.actual_payout_total cannot be negative",
             )
             core.require(
-                rate is not None and rate > 0,
-                f"{scope_field}.actual_rate must be positive for daily summary",
+                rate is None or rate > 0,
+                f"{scope_field}.actual_rate must be positive when known",
             )
             core.require(
-                operator in RATE_OPERATORS,
-                f"{scope_field}.rate_operator must be multiply or divide",
+                not operator or operator in RATE_OPERATORS,
+                f"{scope_field}.rate_operator must be multiply or divide when known",
             )
-            rate_text = core.decimal_text(rate)
-            key = (fund_type, direction, operator, rate_text)
+            if not pending:
+                core.require(
+                    source_amount is not None,
+                    f"{scope_field}.payment_total is required for a confirmed daily summary",
+                )
+                core.require(
+                    target_amount is not None,
+                    f"{scope_field}.actual_payout_total is required for a confirmed daily summary",
+                )
+                core.require(
+                    rate is not None and operator in RATE_OPERATORS,
+                    f"{scope_field}.rate and operator are required for a confirmed daily summary",
+                )
+            rate_text = core.decimal_text(rate) if rate is not None else ""
+            rate_display_text = (
+                rate_display(rate_text, operator)
+                if rate is not None and operator in RATE_OPERATORS
+                else "待确认"
+            )
+            operator_label = (
+                "乘" if operator == "multiply" else "除" if operator == "divide" else ""
+            )
+            key = (fund_type, direction, operator, rate_text, status_label)
             if key not in buckets:
                 first_seen[key] = sequence
                 sequence += 1
@@ -374,17 +410,26 @@ def compile_order_summaries(
                     "fund_type_label": FUND_TYPE_LABELS[fund_type],
                     "direction": direction,
                     "operator": operator,
-                    "operator_label": "乘" if operator == "multiply" else "除",
+                    "operator_label": operator_label,
                     "rate": rate_text,
-                    "rate_display": rate_display(rate_text, operator),
+                    "rate_display": rate_display_text,
+                    "status_label": status_label,
                     "count": 0,
                     "source_total": Decimal("0"),
                     "target_total": Decimal("0"),
+                    "source_total_complete": True,
+                    "target_total_complete": True,
                 }
             bucket = buckets[key]
             bucket["count"] += 1
-            bucket["source_total"] += source_amount
-            bucket["target_total"] += target_amount
+            if source_amount is None:
+                bucket["source_total_complete"] = False
+            else:
+                bucket["source_total"] += source_amount
+            if target_amount is None:
+                bucket["target_total_complete"] = False
+            else:
+                bucket["target_total"] += target_amount
 
     fund_order = {value: position for position, value in enumerate(FUND_TYPE_ORDER)}
     keys = sorted(
@@ -393,8 +438,16 @@ def compile_order_summaries(
     )
     result = [buckets[key] for key in keys]
     for summary in result:
-        summary["source_total"] = core.decimal_text(summary["source_total"])
-        summary["target_total"] = core.decimal_text(summary["target_total"])
+        summary["source_total"] = (
+            core.decimal_text(summary["source_total"])
+            if summary.pop("source_total_complete")
+            else None
+        )
+        summary["target_total"] = (
+            core.decimal_text(summary["target_total"])
+            if summary.pop("target_total_complete")
+            else None
+        )
     return result
 
 

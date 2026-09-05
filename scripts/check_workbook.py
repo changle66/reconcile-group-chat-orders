@@ -366,22 +366,19 @@ def check(workbook_path: Path, orders_path: Path) -> list[str]:
             if large_order_mode:
                 title_row = len(expected_rows) + 2
                 summary_header_row = title_row + 1
-                expected_title = (
-                    "资金汇总（已确认订单）"
-                    if expected_summary_rows
-                    else "资金汇总（暂无已确认项目；待确认订单请查看上方）"
-                )
+                expected_title = "资金汇总"
                 title_cell = worksheet.cell(title_row, 1)
                 if title_cell.value != expected_title:
                     errors.append(
                         f"{sheet_name}!A{title_row}: daily summary title mismatch"
                     )
-                expected_merge = f"A{title_row}:G{title_row}"
+                summary_last_column = get_column_letter(len(large_daily.SUMMARY_HEADERS))
+                expected_merge = f"A{title_row}:{summary_last_column}{title_row}"
                 if expected_merge not in {
                     str(merged_range) for merged_range in worksheet.merged_cells.ranges
                 }:
                     errors.append(
-                        f"{sheet_name}!{title_row}: daily summary title must merge A:G"
+                        f"{sheet_name}!{title_row}: daily summary title must merge A:{summary_last_column}"
                     )
                 if not has_solid_fill(
                     title_cell,
@@ -403,7 +400,7 @@ def check(workbook_path: Path, orders_path: Path) -> list[str]:
                     )
                 trailing_title_values = [
                     worksheet.cell(title_row, column).value
-                    for column in range(8, last_column + 1)
+                    for column in range(len(large_daily.SUMMARY_HEADERS) + 1, last_column + 1)
                 ]
                 if any(value is not None for value in trailing_title_values):
                     errors.append(
@@ -488,6 +485,7 @@ def check(workbook_path: Path, orders_path: Path) -> list[str]:
                     "E": 11,
                     "F": 18,
                     "G": 18,
+                    "H": 14,
                 }
                 for column_letter, minimum_width in minimum_widths.items():
                     actual_width = worksheet.column_dimensions[column_letter].width or 0

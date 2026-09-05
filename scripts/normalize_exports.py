@@ -21,13 +21,18 @@ NORMALIZER_VERSION = "1.1.0"
 WHATSAPP_HEADER_RE = re.compile(
     r"^(?P<date>\d{4}/\d{1,2}/\d{1,2})\s+(?P<time>\d{1,2}:\d{2})\s+-\s+(?P<body>.*)$"
 )
+WHATSAPP_REDMI_HEADER_RE = re.compile(
+    r"^[\u200e\u200f\u202a-\u202e\u2066-\u2069]*"
+    r"\[(?P<date>\d{4}/\d{1,2}/\d{1,2})\s+"
+    r"(?P<time>\d{1,2}:\d{2}(?::\d{2})?)\]\s*(?P<body>.*)$"
+)
 WHATSAPP_ATTACHMENT_RE = re.compile(
     r"(?P<name>[^\\/:*?\"<>|\r\n]+?\.(?:jpe?g|png|webp|gif|heic|pdf|mp4|mov|m4a|mp3|opus|ogg|wav|was))"
     r"(?:\s*\((?:文件附件|file attached)\))?",
     re.IGNORECASE,
 )
 MENTION_RE = re.compile(r"@([^@\n\r，。；、]{1,64})")
-WHATSAPP_SENDER_RE = re.compile(r"^(?P<sender>[^:\n]{1,120}):(?:\s(?P<text>[\s\S]*))?$")
+WHATSAPP_SENDER_RE = re.compile(r"^(?P<sender>[^:\n]{1,120}):\s*(?P<text>[\s\S]*)$")
 GENERATED_PATH_MARKERS = ("订单核对", "上游重跑", "ocr_runtime", ".reconcile")
 
 
@@ -67,7 +72,12 @@ def discover_sources(inputs: Iterable[Path]) -> tuple[list[Path], list[Path]]:
             relative_parts = candidate.relative_to(path).parts[:-1]
             if any(marker.casefold() in part.casefold() for part in relative_parts for marker in GENERATED_PATH_MARKERS):
                 continue
-            if "whatsapp" in candidate.name.casefold():
+            candidate_name = candidate.name.casefold()
+            parent_name = candidate.parent.name.casefold()
+            if "whatsapp" in candidate_name or (
+                candidate_name in {"_chat.txt", "chat.txt"}
+                and "whatsapp" in parent_name
+            ):
                 whatsapp.add(candidate.resolve())
     if not telegram and not whatsapp:
         raise ValueError("no Telegram result.json or WhatsApp .txt exports found")
@@ -222,6 +232,15 @@ def normalize_telegram(
 
 def whatsapp_group_name(source: Path) -> str:
     name = source.stem
+    if name.casefold() in {"_chat", "chat"}:
+        parent_name = core.clean_text(source.parent.name)
+        parent_match = re.match(
+            r"^WhatsApp(?:\s+Chat)?\s*[-\u2013\u2014]\s*(?P<name>.+)$",
+            parent_name,
+            flags=re.IGNORECASE,
+        )
+        if parent_match:
+            name = parent_match.group("name")
     if name.startswith("与") and "的 WhatsApp 聊天" in name:
         name = name[1 : name.rfind("的 WhatsApp 聊天")]
     return core.clean_text(name) or source.stem
@@ -234,11 +253,16 @@ def split_whatsapp_blocks(source: Path) -> list[tuple[datetime, str, int]]:
     current_sequence = 0
     for line_number, line in enumerate(source.read_text(encoding="utf-8-sig").splitlines(), start=1):
         match = WHATSAPP_HEADER_RE.match(line)
+        timestamp_format = "%Y/%m/%d %H:%M"
+        if match is None:
+            match = WHATSAPP_REDMI_HEADER_RE.match(line)
+            if match is not None and match.group("time").count(":") == 2:
+                timestamp_format = "%Y/%m/%d %H:%M:%S"
         if match:
             if current_time is not None:
                 blocks.append((current_time, "\n".join(current_lines), current_sequence))
             current_time = datetime.strptime(
-                f"{match.group('date')} {match.group('time')}", "%Y/%m/%d %H:%M"
+                f"{match.group('date')} {match.group('time')}", timestamp_format
             )
             current_lines = [match.group("body")]
             current_sequence = line_number
@@ -268,6 +292,11 @@ def whatsapp_media(text: str, source: Path) -> tuple[list[dict[str, Any]], list[
     seen: set[str] = set()
     for match in WHATSAPP_ATTACHMENT_RE.finditer(text):
         reference = core.clean_text(match.group("name")).strip()
+        # Redmi/MIUI WhatsApp backups commonly wrap attachments as
+        # ``<附件：filename.jpg>`` without whitespace after the sender colon.
+        # The loose filename regexp intentionally accepts non-ASCII names, so
+        # strip the localized wrapper prefix before resolving the real file.
+        reference = re.sub(r"^(?:附件|attachment|attached)\s*[：:]\s*", "", reference, flags=re.IGNORECASE)
         if reference in seen:
             continue
         seen.add(reference)

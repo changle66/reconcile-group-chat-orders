@@ -144,27 +144,56 @@ def validate_orders(data: object) -> list[dict[str, Any]]:
                     == large_daily.FUND_TYPE_LABELS[fund_type],
                     f"{field}.fund_type_label does not match fund_type",
                 )
-                core.canonical_direction(
-                    summary.get("direction"), field=f"{field}.direction"
+                status_label = core.clean_text(summary.get("status_label"))
+                core.require(
+                    status_label in {"已确认", "待确认"},
+                    f"{field}.status_label is unsupported",
                 )
+                pending_summary = status_label == "待确认"
+                direction = core.clean_text(summary.get("direction"))
+                if direction == "待确认":
+                    core.require(
+                        pending_summary,
+                        f"{field}.direction can be pending only for a pending summary",
+                    )
+                else:
+                    core.canonical_direction(direction, field=f"{field}.direction")
                 operator = core.clean_text(summary.get("operator")).casefold()
                 core.require(
-                    operator in large_daily.RATE_OPERATORS,
+                    operator in large_daily.RATE_OPERATORS
+                    or (pending_summary and not operator),
                     f"{field}.operator is unsupported",
                 )
-                rate = core.parse_decimal(summary.get("rate"), field=f"{field}.rate")
-                core.require(rate is not None and rate > 0, f"{field}.rate must be positive")
+                rate = core.parse_decimal(
+                    summary.get("rate"),
+                    field=f"{field}.rate",
+                    allow_none=True,
+                )
+                core.require(
+                    rate is None or rate > 0,
+                    f"{field}.rate must be positive when known",
+                )
+                core.require(
+                    pending_summary or rate is not None,
+                    f"{field}.rate is required for a confirmed summary",
+                )
                 core.require(
                     isinstance(summary.get("count"), int) and summary.get("count") > 0,
                     f"{field}.count must be a positive integer",
                 )
                 for amount_field in ("source_total", "target_total"):
                     amount = core.parse_decimal(
-                        summary.get(amount_field), field=f"{field}.{amount_field}"
+                        summary.get(amount_field),
+                        field=f"{field}.{amount_field}",
+                        allow_none=True,
                     )
                     core.require(
-                        amount is not None and amount >= 0,
+                        amount is None or amount >= 0,
                         f"{field}.{amount_field} cannot be negative",
+                    )
+                    core.require(
+                        pending_summary or amount is not None,
+                        f"{field}.{amount_field} is required for a confirmed summary",
                     )
         for order_index, order in enumerate(orders):
             core.require(
@@ -611,8 +640,17 @@ def large_summary_rows(group: Mapping[str, Any]) -> list[list[Any]]:
             summary.get("operator_label"),
             summary.get("rate_display"),
             int(summary.get("count") or 0),
-            excel_number(summary.get("source_total")),
-            excel_number(summary.get("target_total")),
+            (
+                excel_number(summary.get("source_total"))
+                if summary.get("source_total") is not None
+                else "未确认"
+            ),
+            (
+                excel_number(summary.get("target_total"))
+                if summary.get("target_total") is not None
+                else "未确认"
+            ),
+            summary.get("status_label"),
         ]
         for summary in group.get("daily_summaries", [])
     ]
@@ -655,11 +693,7 @@ def build_large_order_workbook(
             end_column=summary_column_count,
         )
         title_cell = worksheet.cell(title_row, 1)
-        title_cell.value = (
-            "资金汇总（已确认订单）"
-            if summary_rows
-            else "资金汇总（暂无已确认项目；待确认订单请查看上方）"
-        )
+        title_cell.value = "资金汇总"
         for column in range(1, summary_column_count + 1):
             cell = worksheet.cell(title_row, column)
             cell.fill = PatternFill("solid", fgColor=LARGE_SUMMARY_TITLE_FILL_RGB)
@@ -757,6 +791,7 @@ def build_large_order_workbook(
             "E": 11,
             "F": 18,
             "G": 18,
+            "H": 14,
         }
         for column_letter, minimum_width in minimum_widths.items():
             current_width = worksheet.column_dimensions[column_letter].width or 0

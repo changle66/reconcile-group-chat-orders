@@ -65,6 +65,9 @@ CURRENCY_TOLERANCES = {
     "USDT": Decimal("0"),
     "TRX": Decimal("0"),
     "USD": Decimal("0"),
+    "JPY": Decimal("0"),
+    "GBP": Decimal("0"),
+    "SGD": Decimal("0"),
 }
 CURRENCIES = frozenset(CURRENCY_TOLERANCES)
 DIRECTIONS = {

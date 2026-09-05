@@ -20,6 +20,50 @@ import reconcile
 
 
 class ReconcileWorkflowTests(unittest.TestCase):
+    def test_redmi_whatsapp_export_uses_bracket_timestamps_and_parent_group_name(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            export = root / "WhatsApp Chat - 小额出🐱🐱🐱群1"
+            export.mkdir()
+            source = export / "_chat.txt"
+            source.write_text(
+                "[2026/9/4 15:53:27] Alice: 第一行\n"
+                "续行\n"
+                "\u200e[2026/9/4 16:03:39] QQ~x: 齐\n",
+                encoding="utf-8",
+            )
+
+            telegram, whatsapp = reconcile.normalize_exports.discover_sources([root])
+            self.assertEqual(telegram, [])
+            self.assertEqual(whatsapp, [source.resolve()])
+            self.assertEqual(
+                reconcile.normalize_exports.whatsapp_group_name(source),
+                "小额出🐱🐱🐱群1",
+            )
+            blocks = reconcile.normalize_exports.split_whatsapp_blocks(source)
+            self.assertEqual(
+                blocks,
+                [
+                    (datetime(2026, 9, 4, 15, 53, 27), "Alice: 第一行\n续行", 1),
+                    (datetime(2026, 9, 4, 16, 3, 39), "QQ~x: 齐", 3),
+                ],
+            )
+
+            attachment = export / "00000444-PHOTO-2026-09-04-12-43-33.jpg"
+            attachment.write_bytes(b"fresh-image")
+            sender, text = reconcile.normalize_exports.whatsapp_sender_and_text(
+                "~ 刘超雄:<附件：00000444-PHOTO-2026-09-04-12-43-33.jpg>"
+            )
+            self.assertEqual(sender, "~ 刘超雄")
+            media, warnings, fingerprint_paths = reconcile.normalize_exports.whatsapp_media(
+                text, source
+            )
+            self.assertEqual(warnings, [])
+            self.assertEqual(fingerprint_paths, [])
+            self.assertEqual(len(media), 1)
+            self.assertEqual(media[0]["availability"], "available")
+            self.assertEqual(media[0]["path"], str(attachment.resolve()))
+
     def _start_fixture(
         self,
         root: Path,
@@ -736,6 +780,34 @@ class ReconcileWorkflowTests(unittest.TestCase):
             finally:
                 workbook.close()
 
+    def test_large_summary_includes_pending_actual_flow_with_status(self) -> None:
+        group_key = "line:pending-rent"
+        summaries = reconcile.large_daily.compile_order_summaries(
+            [
+                {
+                    "fund_type": "alipay",
+                    "direction": "THB->CNY",
+                    "payment_total": None,
+                    "actual_payout_total": "91469",
+                    "actual_rate": "4.97",
+                    "rate_operator": "divide",
+                    "reconciliation": {
+                        "status": "pending",
+                        "reason": "evidence_incomplete",
+                    },
+                }
+            ],
+            group_key=group_key,
+        )
+
+        self.assertEqual(len(summaries), 1)
+        self.assertEqual(summaries[0]["fund_type_label"], "支付宝")
+        self.assertEqual(summaries[0]["direction"], "THB->CNY")
+        self.assertEqual(summaries[0]["rate_display"], "÷4.97")
+        self.assertIsNone(summaries[0]["source_total"])
+        self.assertEqual(summaries[0]["target_total"], "91469")
+        self.assertEqual(summaries[0]["status_label"], "待确认")
+
     def test_large_group_finish_writes_daily_records_and_rate_grouped_totals(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -815,7 +887,7 @@ class ReconcileWorkflowTests(unittest.TestCase):
             )
             self.assertEqual(result["orders"], 7)
             self.assertEqual(result["pending_orders"], 1)
-            self.assertEqual(result["summary_rows"], 5)
+            self.assertEqual(result["summary_rows"], 6)
             self.assertEqual(result["groups"], 1)
             workbook = load_workbook(output, read_only=False, data_only=False)
             try:
@@ -835,11 +907,12 @@ class ReconcileWorkflowTests(unittest.TestCase):
                 self.assertEqual(
                     summary_rows,
                     [
-                        ("微信", "CNY->THB", "乘", "×4.72", 2, 15000, 70800),
-                        ("微信", "CNY->THB", "乘", "×4.7", 1, 1000, 4700),
-                        ("支付宝", "CNY->THB", "乘", "×4.7", 1, 2000, 9400),
-                        ("银行卡", "THB->CNY", "除", "÷4.7", 1, 47000, 10000),
-                        ("USDT", "THB->USDT", "除", "÷32.6", 1, 32600, 1000),
+                        ("微信", "CNY->THB", "乘", "×4.72", 2, 15000, 70800, "已确认"),
+                        ("微信", "CNY->THB", "乘", "×4.7", 1, 1000, 4700, "已确认"),
+                        ("支付宝", "CNY->THB", "乘", "×4.7", 1, 2000, 9400, "已确认"),
+                        ("银行卡", "THB->CNY", "除", "÷4.7", 1, 47000, 10000, "已确认"),
+                        ("银行卡", "CNY->THB", "乘", "待确认", 1, 100, 500, "待确认"),
+                        ("USDT", "THB->USDT", "除", "÷32.6", 1, 32600, 1000, "已确认"),
                     ],
                 )
                 summary_header_row = next(
@@ -850,10 +923,10 @@ class ReconcileWorkflowTests(unittest.TestCase):
                 summary_title_row = summary_header_row - 1
                 self.assertEqual(
                     worksheet.cell(summary_title_row, 1).value,
-                    "资金汇总（已确认订单）",
+                    "资金汇总",
                 )
                 self.assertIn(
-                    f"A{summary_title_row}:G{summary_title_row}",
+                    f"A{summary_title_row}:H{summary_title_row}",
                     {str(item) for item in worksheet.merged_cells.ranges},
                 )
                 self.assertTrue(
@@ -903,6 +976,7 @@ class ReconcileWorkflowTests(unittest.TestCase):
                     "E": 11,
                     "F": 18,
                     "G": 18,
+                    "H": 14,
                 }.items():
                     self.assertGreaterEqual(
                         worksheet.column_dimensions[column_letter].width,
