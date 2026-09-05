@@ -99,7 +99,7 @@ class StoreLedgerTests(unittest.TestCase):
         run = reconcile._load_run(work)
         self.assertEqual(run["group_mode"], store_ledger.GROUP_MODE)
         self.assertEqual(run["group_name_contains"], store_ledger.GROUP_NAME_MARKER)
-        self.assertFalse(reconcile._large_group_name("曼谷门店开票群"))
+        self.assertTrue(reconcile._large_group_name("曼谷门店开票群"))
         return work
 
     def test_public_workflow_preserves_reply_media_and_publishes_store_workbook(self) -> None:

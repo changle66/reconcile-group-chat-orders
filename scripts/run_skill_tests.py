@@ -16,6 +16,7 @@ TEST_MODULES = (
     "test_finance_materials",
     "test_store_ledger",
     "test_simple_ledger",
+    "test_roll_forward",
 )
 
 # These non-ledger tests already exercise the supported start/review/finish
@@ -66,6 +67,7 @@ CURRENT_TEST_PREFIXES = (
     "test_finance_materials.FinanceMaterialsTests.",
     "test_store_ledger.StoreLedgerTests.",
     "test_simple_ledger.SimpleLedgerTests.",
+    "test_roll_forward.RollForwardTests.",
 )
 COMPATIBILITY_TEST_IDS = frozenset(
     {
@@ -74,7 +76,7 @@ COMPATIBILITY_TEST_IDS = frozenset(
     }
 )
 
-EXPECTED_ALL_TESTS = 130
+EXPECTED_ALL_TESTS = 141
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

@@ -633,6 +633,7 @@ def _validate_record(
         "movements",
         "transfer",
         "status_reason",
+        "status_history",
         "note",
     }
     unknown = sorted(set(value) - allowed)
@@ -761,6 +762,75 @@ def _validate_record(
     if posting_status != "posted":
         core.require(bool(status_reason), f"{field}.status_reason is required when not posted")
     note = core.clean_text(value.get("note"))
+    status_history_value = value.get("status_history")
+    if status_history_value in (None, ""):
+        status_at = posting_at or max(
+            str(message_by_label[label].get("timestamp") or "") for label in sources
+        )
+        status_history = [
+            {
+                "status": posting_status,
+                "at": status_at,
+                "reason": status_reason,
+                "source_messages": sources[-1:],
+            }
+        ]
+    else:
+        core.require(isinstance(status_history_value, list) and status_history_value, f"{field}.status_history must be a nonempty list")
+        status_history = []
+        previous_at = ""
+        for history_position, raw_history in enumerate(status_history_value):
+            history_field = f"{field}.status_history[{history_position}]"
+            core.require(isinstance(raw_history, Mapping), f"{history_field} must be an object")
+            unknown_history = sorted(
+                set(raw_history) - {"status", "at", "reason", "source_messages"}
+            )
+            core.require(not unknown_history, f"{history_field} has unsupported fields: {', '.join(unknown_history)}")
+            history_status = core.clean_text(raw_history.get("status")).casefold()
+            core.require(history_status in POSTING_STATUSES, f"{history_field}.status is unsupported")
+            history_at = _timestamp(raw_history.get("at"), field=f"{history_field}.at")
+            core.require(history_at >= previous_at, f"{field}.status_history must be chronological")
+            previous_at = history_at
+            history_sources = _validate_source_messages(
+                raw_history.get("source_messages"),
+                field=f"{history_field}.source_messages",
+                message_by_label=message_by_label,
+                reviewed_through=reviewed_through,
+            )
+            core.require(set(history_sources) <= set(sources), f"{history_field}.source_messages must belong to the record")
+            history_reason = core.clean_text(raw_history.get("reason"))
+            if history_status != "posted":
+                core.require(bool(history_reason), f"{history_field}.reason is required")
+            status_history.append(
+                {
+                    "status": history_status,
+                    "at": history_at,
+                    "reason": history_reason,
+                    "source_messages": history_sources,
+                }
+            )
+        if status_history[-1]["status"] == "pending" and posting_status in {"posted", "void"}:
+            transition_at = posting_at or max(
+                str(message_by_label[label].get("timestamp") or "") for label in sources
+            )
+            core.require(
+                transition_at > status_history[-1]["at"],
+                f"{field}: posted/void transition must be later than the pending status",
+            )
+            status_history.append(
+                {
+                    "status": posting_status,
+                    "at": transition_at,
+                    "reason": status_reason,
+                    "source_messages": sources[-1:],
+                }
+            )
+        core.require(status_history[-1]["status"] == posting_status, f"{field}.status_history final status mismatch")
+        if posting_status == "posted":
+            core.require(
+                status_history[-1]["at"] == posting_at,
+                f"{field}.posting_at must equal the final posted history time",
+            )
     result: dict[str, Any] = {
         "id": record_id,
         "record_type": record_type,
@@ -773,6 +843,7 @@ def _validate_record(
         "representative_media_label": representative,
         "movements": movements,
         "status_reason": status_reason,
+        "status_history": status_history,
         "note": note,
     }
     if transfer is not None:
@@ -1071,6 +1142,14 @@ def _merge_by_id(
         item_id = core.clean_text(item.get("id"))
         replacement = deepcopy(dict(item))
         if item_id in positions:
+            existing = current[positions[item_id]]
+            if (
+                collection == "records"
+                and "status_history" not in replacement
+                and isinstance(existing, Mapping)
+                and isinstance(existing.get("status_history"), list)
+            ):
+                replacement["status_history"] = deepcopy(existing["status_history"])
             current[positions[item_id]] = replacement
         else:
             positions[item_id] = len(current)

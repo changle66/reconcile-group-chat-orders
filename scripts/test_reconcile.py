@@ -446,6 +446,7 @@ class ReconcileWorkflowTests(unittest.TestCase):
                 ("small", "QQ小额出🐱群"),
                 ("finance", "财务资料群"),
                 ("large-b", "长期合作换汇群"),
+                ("store", "曼谷门店开票群"),
             ]
             for group_id, group_name in groups:
                 export = source / group_id
@@ -492,7 +493,7 @@ class ReconcileWorkflowTests(unittest.TestCase):
             run = reconcile._load_run(work)
             normalized = reconcile._load_snapshot(work, run)
 
-            expected_names = ["曼谷固定换汇一群", "长期合作换汇群"]
+            expected_names = ["曼谷固定换汇一群", "长期合作换汇群", "曼谷门店开票群"]
             self.assertEqual(
                 sorted(item["group_name"] for item in report["selected_groups"]),
                 sorted(expected_names),
@@ -806,7 +807,7 @@ class ReconcileWorkflowTests(unittest.TestCase):
         self.assertEqual(summaries[0]["rate_display"], "÷4.97")
         self.assertIsNone(summaries[0]["source_total"])
         self.assertEqual(summaries[0]["target_total"], "91469")
-        self.assertEqual(summaries[0]["status_label"], "待确认")
+        self.assertEqual(summaries[0]["status_label"], "待次日继续")
 
     def test_large_group_finish_writes_daily_records_and_rate_grouped_totals(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -902,23 +903,23 @@ class ReconcileWorkflowTests(unittest.TestCase):
                 summary_rows = [
                     tuple(row[: len(reconcile.large_daily.SUMMARY_HEADERS)])
                     for row in worksheet.iter_rows(values_only=True)
-                    if row[0] in {"微信", "支付宝", "银行卡", "USDT"}
+                    if row[1] in {"微信", "支付宝", "银行卡", "USDT"}
                 ]
                 self.assertEqual(
                     summary_rows,
                     [
-                        ("微信", "CNY->THB", "乘", "×4.72", 2, 15000, 70800, "已确认"),
-                        ("微信", "CNY->THB", "乘", "×4.7", 1, 1000, 4700, "已确认"),
-                        ("支付宝", "CNY->THB", "乘", "×4.7", 1, 2000, 9400, "已确认"),
-                        ("银行卡", "THB->CNY", "除", "÷4.7", 1, 47000, 10000, "已确认"),
-                        ("银行卡", "CNY->THB", "乘", "待确认", 1, 100, 500, "待确认"),
-                        ("USDT", "THB->USDT", "除", "÷32.6", 1, 32600, 1000, "已确认"),
+                        ("2026-08-31", "微信", "CNY->THB", "乘", "×4.72", 2, 15000, 70800, "已完成"),
+                        ("2026-08-31", "微信", "CNY->THB", "乘", "×4.7", 1, 1000, 4700, "已完成"),
+                        ("2026-08-31", "支付宝", "CNY->THB", "乘", "×4.7", 1, 2000, 9400, "已完成"),
+                        ("2026-08-31", "银行卡", "THB->CNY", "除", "÷4.7", 1, 47000, 10000, "已完成"),
+                        ("2026-08-31", "银行卡", "CNY->THB", "乘", "待确认", 1, 100, 500, "已完成"),
+                        ("2026-08-31", "USDT", "THB->USDT", "除", "÷32.6", 1, 32600, 1000, "已完成"),
                     ],
                 )
                 summary_header_row = next(
                     row
                     for row in range(1, worksheet.max_row + 1)
-                    if worksheet.cell(row, 1).value == "资金类型"
+                    if worksheet.cell(row, 1).value == "统计日期"
                 )
                 summary_title_row = summary_header_row - 1
                 self.assertEqual(
@@ -926,7 +927,7 @@ class ReconcileWorkflowTests(unittest.TestCase):
                     "资金汇总",
                 )
                 self.assertIn(
-                    f"A{summary_title_row}:H{summary_title_row}",
+                    f"A{summary_title_row}:I{summary_title_row}",
                     {str(item) for item in worksheet.merged_cells.ranges},
                 )
                 self.assertTrue(
@@ -964,19 +965,20 @@ class ReconcileWorkflowTests(unittest.TestCase):
                             .upper()
                             .endswith(expected_fill)
                         )
-                    for column in (5, 6, 7):
+                    for column in (6, 7, 8):
                         self.assertTrue(
                             worksheet.cell(summary_header_row + offset, column).font.bold
                         )
                 for column_letter, minimum_width in {
-                    "A": 18,
-                    "B": 23,
-                    "C": 16,
-                    "D": 13,
-                    "E": 11,
-                    "F": 18,
+                    "A": 14,
+                    "B": 18,
+                    "C": 23,
+                    "D": 16,
+                    "E": 13,
+                    "F": 11,
                     "G": 18,
-                    "H": 14,
+                    "H": 18,
+                    "I": 14,
                 }.items():
                     self.assertGreaterEqual(
                         worksheet.column_dimensions[column_letter].width,

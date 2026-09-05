@@ -211,6 +211,7 @@ def check(workbook_path: Path, orders_path: Path) -> list[str]:
         and orders.get("contract_version") == large_daily.OUTPUT_CONTRACT
     )
     datetime_column = core.HEADERS.index("聊天消息时间") + 1
+    completion_datetime_column = core.HEADERS.index("完成时间") + 1
     payee_column = core.HEADERS.index("收款方") + 1
     review_column = core.HEADERS.index("核对结果") + 1
     review_column_letter = get_column_letter(review_column)
@@ -363,6 +364,17 @@ def check(workbook_path: Path, orders_path: Path) -> list[str]:
                 ):
                     coordinate = worksheet.cell(row_index, datetime_column).coordinate
                     errors.append(f"{sheet_name}!{coordinate}: wrong datetime number format")
+                if (
+                    worksheet.cell(row_index, completion_datetime_column).value is not None
+                    and canonical_number_format(
+                        worksheet.cell(row_index, completion_datetime_column).number_format
+                    )
+                    != canonical_number_format("yyyy-mm-dd hh:mm:ss")
+                ):
+                    coordinate = worksheet.cell(
+                        row_index, completion_datetime_column
+                    ).coordinate
+                    errors.append(f"{sheet_name}!{coordinate}: wrong completion datetime number format")
             if large_order_mode:
                 title_row = len(expected_rows) + 2
                 summary_header_row = title_row + 1
@@ -471,21 +483,22 @@ def check(workbook_path: Path, orders_path: Path) -> list[str]:
                             f"{sheet_name}!{row_index}: daily summary row fill mismatch; "
                             f"wrong cells: {wrong_fill!r}"
                         )
-                    for amount_column in (5, 6, 7):
+                    for amount_column in (6, 7, 8):
                         amount_cell = worksheet.cell(row_index, amount_column)
                         if not amount_cell.font.bold:
                             errors.append(
                                 f"{sheet_name}!{amount_cell.coordinate}: summary count/amount must be bold"
                             )
                 minimum_widths = {
-                    "A": 18,
-                    "B": 23,
-                    "C": 16,
-                    "D": 13,
-                    "E": 11,
-                    "F": 18,
+                    "A": 14,
+                    "B": 18,
+                    "C": 23,
+                    "D": 16,
+                    "E": 13,
+                    "F": 11,
                     "G": 18,
-                    "H": 14,
+                    "H": 18,
+                    "I": 14,
                 }
                 for column_letter, minimum_width in minimum_widths.items():
                     actual_width = worksheet.column_dimensions[column_letter].width or 0

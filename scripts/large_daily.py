@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import copy
 from decimal import Decimal
+from datetime import datetime
 from typing import Any, Mapping
+from zoneinfo import ZoneInfo
 
 import core
 
@@ -28,6 +30,7 @@ LEGACY_HEADERS = [
 ]
 HEADERS = LEGACY_HEADERS
 SUMMARY_HEADERS = [
+    "统计日期",
     "资金类型",
     "换汇方向",
     "计算方式",
@@ -317,15 +320,176 @@ def _summary_scopes(order: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     return [order]
 
 
+def _flow_date(flow: Mapping[str, Any]) -> str:
+    timestamp = core.clean_text(flow.get("message_time"))
+    if not timestamp:
+        return ""
+    try:
+        return (
+            datetime.fromisoformat(timestamp)
+            .astimezone(ZoneInfo("Asia/Bangkok"))
+            .date()
+            .isoformat()
+        )
+    except ValueError:
+        return ""
+
+
+def _lifecycle_status_on_date(order: Mapping[str, Any], statistics_date: str) -> str:
+    lifecycle = order.get("lifecycle")
+    if not isinstance(lifecycle, Mapping):
+        return "待次日继续" if _reconciliation_pending(order.get("reconciliation")) else "已完成"
+    history = lifecycle.get("history")
+    latest_status = "pending_next_day"
+    if isinstance(history, list):
+        for event in history:
+            if not isinstance(event, Mapping):
+                continue
+            at = core.clean_text(event.get("at"))
+            if at and at[:10] <= statistics_date:
+                latest_status = core.clean_text(event.get("status")).casefold()
+    final_status = core.clean_text(lifecycle.get("status")).casefold()
+    completion_at = core.clean_text(lifecycle.get("completion_at"))
+    if final_status == "completed" and completion_at and completion_at[:10] <= statistics_date:
+        latest_status = "completed"
+    labels = {
+        "completed": "已完成",
+        "pending_next_day": "待次日继续",
+        "cancelled": "已取消",
+    }
+    return labels.get(latest_status, "待次日继续")
+
+
+def _scope_daily_amounts(
+    order: Mapping[str, Any],
+    scope: Mapping[str, Any],
+    *,
+    accounting_date: str | None,
+) -> list[dict[str, Any]]:
+    raw_flows = order.get("flows")
+    flows = [item for item in raw_flows or [] if isinstance(item, Mapping)]
+    if raw_flows is None:
+        pending = _reconciliation_pending(scope.get("reconciliation"))
+        return [
+            {
+                "date": accounting_date or "",
+                "source_total": core.parse_decimal(
+                    scope.get("payment_total"),
+                    field="large summary payment_total",
+                    allow_none=True,
+                ),
+                "source_state": "unknown"
+                if scope.get("payment_total") is None
+                else "known",
+                "target_total": core.parse_decimal(
+                    scope.get("actual_payout_total"),
+                    field="large summary actual_payout_total",
+                    allow_none=True,
+                ),
+                "target_state": "unknown"
+                if scope.get("actual_payout_total") is None
+                else "known",
+                "pending": pending,
+            }
+        ]
+
+    leg_id = core.clean_text(scope.get("leg_id"))
+    source_flows = [
+        flow
+        for flow in flows
+        if core.clean_text(flow.get("side")).casefold()
+        in {"payment", "payment_refund"}
+        and not flow.get("duplicate_of")
+        and flow.get("status") != "failed"
+    ]
+    target_flows = [
+        flow
+        for flow in flows
+        if core.clean_text(flow.get("side")).casefold() in {"payout", "recovery"}
+        and not flow.get("duplicate_of")
+        and flow.get("status") != "failed"
+        and (not leg_id or core.clean_text(flow.get("leg_id")) == leg_id)
+    ]
+    if not source_flows and not target_flows:
+        return []
+    dates = sorted(
+        {
+            date
+            for date in (_flow_date(flow) for flow in source_flows + target_flows)
+            if date
+        }
+    )
+    if not dates:
+        dates = [accounting_date or ""]
+
+    def side_value(
+        candidates: list[Mapping[str, Any]],
+        date: str,
+        positive_side: str,
+        negative_side: str,
+    ) -> tuple[Decimal | None, str]:
+        selected = [flow for flow in candidates if _flow_date(flow) == date]
+        if not selected:
+            return None, "absent"
+        if any(
+            not flow.get("included") or flow.get("amount") in (None, "")
+            for flow in selected
+        ):
+            return None, "unknown"
+        total = Decimal("0")
+        for flow in selected:
+            amount = core.parse_decimal(
+                flow.get("amount"), field="large summary flow amount"
+            )
+            assert amount is not None
+            total += amount if flow.get("side") == positive_side else -amount
+        return total, "known"
+
+    result: list[dict[str, Any]] = []
+    source_dates = {date for date in (_flow_date(flow) for flow in source_flows) if date}
+    for date in dates:
+        source_total, source_state = side_value(
+            source_flows, date, "payment", "payment_refund"
+        )
+        if leg_id and source_state == "known":
+            # A multi-leg order shares the physical customer payment. When it
+            # occurred on one day, attribute each leg's explicit allocation to
+            # that day instead of counting the physical payment once per leg.
+            if len(source_dates) == 1:
+                source_total = core.parse_decimal(
+                    scope.get("payment_total"),
+                    field="large summary leg payment_total",
+                    allow_none=True,
+                )
+                source_state = "known" if source_total is not None else "unknown"
+            else:
+                source_total, source_state = None, "unknown"
+        target_total, target_state = side_value(
+            target_flows, date, "payout", "recovery"
+        )
+        result.append(
+            {
+                "date": date,
+                "source_total": source_total,
+                "source_state": source_state,
+                "target_total": target_total,
+                "target_state": target_state,
+                "pending": _lifecycle_status_on_date(order, date) == "待次日继续",
+            }
+        )
+    return result
+
+
 def compile_order_summaries(
     orders: list[Mapping[str, Any]],
     *,
     group_key: str,
+    accounting_date: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Group all order scopes while keeping pending amounts explicitly unknown."""
+    """Group funds by their actual Bangkok occurrence date and exact pricing."""
 
-    buckets: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
-    first_seen: dict[tuple[str, str, str, str, str], int] = {}
+    buckets: dict[tuple[str, str, str, str, str, str], dict[str, Any]] = {}
+    first_seen: dict[tuple[str, str, str, str, str, str], int] = {}
     sequence = 0
     for order_position, order in enumerate(orders):
         field = f"{group_key}.orders[{order_position}]"
@@ -334,8 +498,6 @@ def compile_order_summaries(
         )
         for scope_position, scope in enumerate(_summary_scopes(order)):
             scope_field = f"{field}.summary_scopes[{scope_position}]"
-            pending = _reconciliation_pending(scope.get("reconciliation"))
-            status_label = "待确认" if pending else "已确认"
             raw_direction = core.clean_text(scope.get("direction"))
             if raw_direction:
                 direction = core.canonical_direction(
@@ -343,34 +505,16 @@ def compile_order_summaries(
                 )
             else:
                 core.require(
-                    pending,
+                    _reconciliation_pending(scope.get("reconciliation")),
                     f"{scope_field}.direction is required for a confirmed daily summary",
                 )
                 direction = "待确认"
-            source_amount = core.parse_decimal(
-                scope.get("payment_total"),
-                field=f"{scope_field}.payment_total",
-                allow_none=True,
-            )
-            target_amount = core.parse_decimal(
-                scope.get("actual_payout_total"),
-                field=f"{scope_field}.actual_payout_total",
-                allow_none=True,
-            )
             rate = core.parse_decimal(
                 scope.get("actual_rate"),
                 field=f"{scope_field}.actual_rate",
                 allow_none=True,
             )
             operator = core.clean_text(scope.get("rate_operator")).casefold()
-            core.require(
-                source_amount is None or source_amount > 0,
-                f"{scope_field}.payment_total must be positive when known",
-            )
-            core.require(
-                target_amount is None or target_amount >= 0,
-                f"{scope_field}.actual_payout_total cannot be negative",
-            )
             core.require(
                 rate is None or rate > 0,
                 f"{scope_field}.actual_rate must be positive when known",
@@ -379,15 +523,7 @@ def compile_order_summaries(
                 not operator or operator in RATE_OPERATORS,
                 f"{scope_field}.rate_operator must be multiply or divide when known",
             )
-            if not pending:
-                core.require(
-                    source_amount is not None,
-                    f"{scope_field}.payment_total is required for a confirmed daily summary",
-                )
-                core.require(
-                    target_amount is not None,
-                    f"{scope_field}.actual_payout_total is required for a confirmed daily summary",
-                )
+            if not _reconciliation_pending(scope.get("reconciliation")):
                 core.require(
                     rate is not None and operator in RATE_OPERATORS,
                     f"{scope_field}.rate and operator are required for a confirmed daily summary",
@@ -401,53 +537,66 @@ def compile_order_summaries(
             operator_label = (
                 "乘" if operator == "multiply" else "除" if operator == "divide" else ""
             )
-            key = (fund_type, direction, operator, rate_text, status_label)
-            if key not in buckets:
-                first_seen[key] = sequence
-                sequence += 1
-                buckets[key] = {
-                    "fund_type": fund_type,
-                    "fund_type_label": FUND_TYPE_LABELS[fund_type],
-                    "direction": direction,
-                    "operator": operator,
-                    "operator_label": operator_label,
-                    "rate": rate_text,
-                    "rate_display": rate_display_text,
-                    "status_label": status_label,
-                    "count": 0,
-                    "source_total": Decimal("0"),
-                    "target_total": Decimal("0"),
-                    "source_total_complete": True,
-                    "target_total_complete": True,
-                }
-            bucket = buckets[key]
-            bucket["count"] += 1
-            if source_amount is None:
-                bucket["source_total_complete"] = False
-            else:
-                bucket["source_total"] += source_amount
-            if target_amount is None:
-                bucket["target_total_complete"] = False
-            else:
-                bucket["target_total"] += target_amount
+            for daily in _scope_daily_amounts(
+                order, scope, accounting_date=accounting_date
+            ):
+                statistics_date = str(daily["date"])
+                status_label = _lifecycle_status_on_date(order, statistics_date)
+                key = (
+                    statistics_date,
+                    fund_type,
+                    direction,
+                    operator,
+                    rate_text,
+                    status_label,
+                )
+                if key not in buckets:
+                    first_seen[key] = sequence
+                    sequence += 1
+                    buckets[key] = {
+                        "statistics_date": statistics_date,
+                        "fund_type": fund_type,
+                        "fund_type_label": FUND_TYPE_LABELS[fund_type],
+                        "direction": direction,
+                        "operator": operator,
+                        "operator_label": operator_label,
+                        "rate": rate_text,
+                        "rate_display": rate_display_text,
+                        "status_label": status_label,
+                        "count": 0,
+                        "source_total": Decimal("0"),
+                        "target_total": Decimal("0"),
+                        "source_total_state": "absent",
+                        "target_total_state": "absent",
+                    }
+                bucket = buckets[key]
+                bucket["count"] += 1
+                for prefix in ("source", "target"):
+                    state_field = f"{prefix}_total_state"
+                    value_field = f"{prefix}_total"
+                    incoming_state = str(daily[f"{prefix}_state"])
+                    current_state = str(bucket[state_field])
+                    if incoming_state == "unknown":
+                        bucket[state_field] = "unknown"
+                    elif incoming_state == "known":
+                        if current_state != "unknown":
+                            bucket[state_field] = "known"
+                            bucket[value_field] += daily[f"{prefix}_total"]
 
     fund_order = {value: position for position, value in enumerate(FUND_TYPE_ORDER)}
     keys = sorted(
         buckets,
-        key=lambda key: (fund_order[key[0]], first_seen[key]),
+        key=lambda key: (key[0], fund_order[key[1]], first_seen[key]),
     )
     result = [buckets[key] for key in keys]
     for summary in result:
-        summary["source_total"] = (
-            core.decimal_text(summary["source_total"])
-            if summary.pop("source_total_complete")
-            else None
-        )
-        summary["target_total"] = (
-            core.decimal_text(summary["target_total"])
-            if summary.pop("target_total_complete")
-            else None
-        )
+        for prefix in ("source", "target"):
+            state = summary[f"{prefix}_total_state"]
+            summary[f"{prefix}_total"] = (
+                core.decimal_text(summary[f"{prefix}_total"])
+                if state == "known"
+                else None
+            )
     return result
 
 
@@ -478,6 +627,7 @@ def compile_order_daily_ledger(
         group["daily_summaries"] = compile_order_summaries(
             typed_orders,
             group_key=core.clean_text(group.get("group_key")),
+            accounting_date=accounting_date,
         )
         result_groups.append(group)
         order_count += len(typed_orders)
@@ -493,6 +643,14 @@ def compile_order_daily_ledger(
             "contract_version": OUTPUT_CONTRACT,
             "accounting_mode": "large_daily",
             "accounting_date": accounting_date,
+            "accounting_dates": sorted(
+                {
+                    str(summary.get("statistics_date") or "")
+                    for group in result_groups
+                    for summary in group.get("daily_summaries", [])
+                    if summary.get("statistics_date")
+                }
+            ),
             "groups": result_groups,
         }
     )

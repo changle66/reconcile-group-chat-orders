@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a fresh group-chat reconciliation through start, review, and finish."""
+"""Run fresh or cross-day group-chat reconciliation through review and finish."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import copy
 import json
 import platform as host_platform
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -16,6 +17,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Iterable, Mapping
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from openpyxl import load_workbook
 
 import build_workbook
 import check_workbook
@@ -158,6 +161,9 @@ STATUS_CLASS = {
     "not_shown": "blank",
     "unknown": "unknown",
 }
+ORDER_LIFECYCLE_STATUSES = frozenset(
+    {"completed", "pending_next_day", "cancelled"}
+)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -172,7 +178,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=("small", "large", "finance", "store-ledger"),
         default="small",
         help=(
-            "small selects the existing name filter; large selects every group except 小额出, 财务资料群, and 门店开票群; "
+            "small selects the existing name filter; large selects every group except 小额出 and 财务资料群 (门店开票群也按大额订单语义独立处理); "
             "finance selects 财务资料群 for identity and chat-account records; "
             "store-ledger selects 门店开票群 for signed internal currency movements"
         ),
@@ -248,6 +254,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=Path(__file__).resolve().parent.parent / "assets" / "模版.xlsx",
     )
+    finish.add_argument(
+        "--replace-predecessor",
+        action="store_true",
+        help="atomically replace only the predecessor workbook registered by roll-forward",
+    )
+
+    roll_forward = commands.add_parser(
+        "roll-forward",
+        help="continue a finished run with the immediately following accounting period",
+    )
+    roll_forward.add_argument("previous_work", type=Path)
+    roll_forward.add_argument("inputs", nargs="+", type=Path)
+    roll_forward.add_argument("--previous-output", required=True, type=Path)
+    roll_forward.add_argument("--work", required=True, type=Path)
+    roll_forward.add_argument("--date", required=True)
+    roll_forward.add_argument("--confirmed-amendments", type=Path)
     return parser.parse_args(argv)
 
 
@@ -533,7 +555,7 @@ def _large_group_name(value: object) -> bool:
     normalized = core.normalize_name(value)
     return all(
         core.normalize_name(excluded) not in normalized
-        for excluded in ("小额出", "财务资料群", store_ledger.GROUP_NAME_MARKER)
+        for excluded in ("小额出", "财务资料群")
     )
 
 
@@ -695,7 +717,7 @@ def _merge_documents(
     if group_mode == "large":
         core.require(
             bool(groups),
-            "no large groups remain after excluding 小额出, 财务资料群, and 门店开票群",
+            "no large groups remain after excluding 小额出 and 财务资料群",
         )
     else:
         core.require(bool(groups), f"no parsed group name contains {contains!r}")
@@ -1011,6 +1033,446 @@ def _capture_normalized_media_hashes(normalized: dict[str, Any]) -> dict[str, in
     }
 
 
+def _stable_timestamp(value: object) -> str:
+    parsed = datetime.fromisoformat(str(value))
+    return parsed.replace(microsecond=0).isoformat()
+
+
+def _message_source_identity(
+    group: Mapping[str, Any], message: Mapping[str, Any]
+) -> str:
+    platform = core.clean_text(group.get("platform")).casefold()
+    message_id = core.clean_text(message.get("message_id"))
+    if platform not in {"telegram", "line"} or not message_id:
+        return ""
+    return f"{core.clean_text(group.get('group_key'))}|{message_id}"
+
+
+def _assign_stable_identities(normalized: dict[str, Any]) -> None:
+    """Add cross-snapshot identities without changing the normalized adapter contract."""
+
+    for group in normalized.get("groups", []):
+        occurrences: dict[str, int] = {}
+        slot_occurrences: dict[str, int] = {}
+        for message in group.get("messages", []):
+            sender = core.normalize_name(
+                message.get("sender_name") or message.get("sender_id") or ""
+            )
+            material = {
+                "group_key": core.clean_text(group.get("group_key")),
+                "timestamp": _stable_timestamp(message.get("timestamp")),
+                "sender": sender,
+                "text": core.clean_text(message.get("text")),
+            }
+            base = core.fingerprint_json(material)
+            occurrences[base] = occurrences.get(base, 0) + 1
+            slot_base = core.fingerprint_json(
+                {
+                    "group_key": material["group_key"],
+                    "timestamp": material["timestamp"],
+                    "sender": material["sender"],
+                }
+            )
+            slot_occurrences[slot_base] = slot_occurrences.get(slot_base, 0) + 1
+            stable_message_id = core.clean_text(message.get("stable_message_id")) or (
+                "stable-message:"
+                + core.stable_token(base, occurrences[base], length=32)
+            )
+            message["stable_message_id"] = stable_message_id
+            message["stable_message_slot_base"] = core.clean_text(
+                message.get("stable_message_slot_base")
+            ) or slot_base
+            message["stable_message_slot_id"] = core.clean_text(
+                message.get("stable_message_slot_id")
+            ) or (
+                "stable-slot:"
+                + core.stable_token(
+                    slot_base, slot_occurrences[slot_base], length=32
+                )
+            )
+            source_identity = core.clean_text(
+                message.get("source_message_identity")
+            ) or _message_source_identity(group, message)
+            if source_identity:
+                message["source_message_identity"] = source_identity
+            for position, media in enumerate(message.get("media", []), start=1):
+                if not isinstance(media, dict):
+                    continue
+                media["stable_media_id"] = core.clean_text(
+                    media.get("stable_media_id")
+                ) or f"{stable_message_id}#media:{position:03d}"
+
+
+def _message_conflict_fields(
+    left: Mapping[str, Any], right: Mapping[str, Any]
+) -> list[str]:
+    conflicts: list[str] = []
+    try:
+        left_time = _stable_timestamp(left.get("timestamp"))
+        right_time = _stable_timestamp(right.get("timestamp"))
+    except (TypeError, ValueError):
+        left_time = core.clean_text(left.get("timestamp"))
+        right_time = core.clean_text(right.get("timestamp"))
+    if left_time != right_time:
+        conflicts.append("timestamp")
+    for field in ("sender_name", "sender_id"):
+        left_value = core.normalize_name(left.get(field))
+        right_value = core.normalize_name(right.get(field))
+        if left_value and right_value and left_value != right_value:
+            conflicts.append(field)
+    if core.clean_text(left.get("text")) != core.clean_text(right.get("text")):
+        conflicts.append("text")
+    return conflicts
+
+
+def _reply_relation_identity(
+    group: Mapping[str, Any], message: Mapping[str, Any]
+) -> tuple[str, str]:
+    """Return the resolved stable target and the adapter-level target id."""
+
+    raw_target = core.clean_text(message.get("reply_to_message_id"))
+    if not raw_target:
+        return "", ""
+    for candidate in group.get("messages", []):
+        if not isinstance(candidate, Mapping):
+            continue
+        candidate_ids = {
+            core.clean_text(candidate.get("message_id")),
+            core.clean_text(candidate.get("original_message_id")),
+        }
+        if raw_target in candidate_ids:
+            return core.clean_text(candidate.get("stable_message_id")), raw_target
+    return "", raw_target
+
+
+def _merge_reply_relation(
+    target_group: Mapping[str, Any],
+    target_message: dict[str, Any],
+    incoming_group: Mapping[str, Any],
+    incoming_message: Mapping[str, Any],
+) -> None:
+    left_stable, left_raw = _reply_relation_identity(target_group, target_message)
+    right_stable, right_raw = _reply_relation_identity(
+        incoming_group, incoming_message
+    )
+    if left_raw and right_raw:
+        same_relation = (
+            bool(left_stable)
+            and bool(right_stable)
+            and left_stable == right_stable
+        ) or left_raw == right_raw
+        core.require(
+            same_relation,
+            "same stable message identity has conflicting reply relationships",
+        )
+    elif not left_raw and right_raw:
+        target_message["reply_to_message_id"] = right_raw
+
+
+def _merge_message_media(
+    target: dict[str, Any], incoming: Mapping[str, Any]
+) -> None:
+    target_media = target.get("media", [])
+    incoming_media = incoming.get("media", [])
+    core.require(
+        isinstance(target_media, list) and isinstance(incoming_media, list),
+        "message media must be lists",
+    )
+    for position, incoming_item in enumerate(incoming_media):
+        if not isinstance(incoming_item, Mapping):
+            continue
+        if position >= len(target_media):
+            target_media.append(copy.deepcopy(dict(incoming_item)))
+            continue
+        target_item = target_media[position]
+        core.require(isinstance(target_item, dict), "message media item must be an object")
+        left_hash = core.clean_text(target_item.get("blob_sha256"))
+        right_hash = core.clean_text(incoming_item.get("blob_sha256"))
+        core.require(
+            not left_hash or not right_hash or left_hash == right_hash,
+            "same stable media identity has conflicting content hashes",
+        )
+        if (
+            target_item.get("availability") != "available"
+            and incoming_item.get("availability") == "available"
+        ):
+            stable_media_id = target_item.get("stable_media_id")
+            target_item.clear()
+            target_item.update(copy.deepcopy(dict(incoming_item)))
+            if stable_media_id:
+                target_item["stable_media_id"] = stable_media_id
+        elif not left_hash and right_hash:
+            target_item["blob_sha256"] = right_hash
+    target["media"] = target_media
+
+
+def _canonicalize_group_messages(group: dict[str, Any]) -> None:
+    raw_to_stable: dict[str, str] = {}
+    for message in group.get("messages", []):
+        raw_id = core.clean_text(message.get("message_id"))
+        stable_id = core.clean_text(message.get("stable_message_id"))
+        if raw_id and stable_id:
+            raw_to_stable[raw_id] = stable_id
+    for message in group.get("messages", []):
+        stable_id = core.clean_text(message.get("stable_message_id"))
+        core.require(bool(stable_id), "stable_message_id is missing")
+        reply_id = core.clean_text(message.get("reply_to_message_id"))
+        if not core.clean_text(message.get("original_message_id")):
+            message["original_message_id"] = core.clean_text(message.get("message_id"))
+        message["message_id"] = stable_id
+        if reply_id:
+            message["reply_to_message_id"] = raw_to_stable.get(reply_id, reply_id)
+        for media in message.get("media", []):
+            if not isinstance(media, dict):
+                continue
+            stable_media_id = core.clean_text(media.get("stable_media_id"))
+            core.require(bool(stable_media_id), "stable_media_id is missing")
+            if not core.clean_text(media.get("original_media_id")):
+                media["original_media_id"] = core.clean_text(media.get("media_id"))
+            media["media_id"] = stable_media_id
+    for sequence, message in enumerate(group["messages"], start=1):
+        message["source_sequence"] = sequence
+
+
+def _merge_normalized_snapshots(
+    predecessor: dict[str, Any], incoming: dict[str, Any]
+) -> tuple[dict[str, Any], dict[str, int]]:
+    core.require(
+        predecessor.get("timezone") == incoming.get("timezone") == "Asia/Bangkok",
+        "predecessor and incoming snapshots must use Asia/Bangkok",
+    )
+    left = copy.deepcopy(predecessor)
+    right = copy.deepcopy(incoming)
+    _assign_stable_identities(left)
+    _assign_stable_identities(right)
+    groups = {
+        core.clean_text(group.get("group_key")): group
+        for group in left.get("groups", [])
+        if isinstance(group, dict)
+    }
+    deduplicated = 0
+    richer_media = 0
+    appended = 0
+    for incoming_group in right.get("groups", []):
+        core.require(isinstance(incoming_group, dict), "incoming group must be an object")
+        key = core.clean_text(incoming_group.get("group_key"))
+        if key not in groups:
+            groups[key] = copy.deepcopy(incoming_group)
+            appended += len(incoming_group.get("messages", []))
+            continue
+        target_group = groups[key]
+        core.require(
+            core.normalize_name(target_group.get("group_name"))
+            == core.normalize_name(incoming_group.get("group_name")),
+            f"group identity conflict for {key}: group name changed",
+        )
+        core.require(
+            core.clean_text(target_group.get("platform")).casefold()
+            == core.clean_text(incoming_group.get("platform")).casefold(),
+            f"group identity conflict for {key}: platform changed",
+        )
+        stable_index = {
+            core.clean_text(message.get("stable_message_id")): message
+            for message in target_group.get("messages", [])
+            if isinstance(message, dict)
+        }
+        source_index = {
+            core.clean_text(message.get("source_message_identity")): message
+            for message in target_group.get("messages", [])
+            if isinstance(message, dict)
+            and core.clean_text(message.get("source_message_identity"))
+        }
+        slot_index = {
+            core.clean_text(message.get("stable_message_slot_id")): message
+            for message in target_group.get("messages", [])
+            if isinstance(message, dict)
+            and core.clean_text(message.get("stable_message_slot_id"))
+        }
+        target_slot_counts: dict[str, int] = {}
+        incoming_slot_counts: dict[str, int] = {}
+        for message in target_group.get("messages", []):
+            if isinstance(message, Mapping):
+                slot_base = core.clean_text(
+                    message.get("stable_message_slot_base")
+                )
+                if slot_base:
+                    target_slot_counts[slot_base] = (
+                        target_slot_counts.get(slot_base, 0) + 1
+                    )
+        for message in incoming_group.get("messages", []):
+            if isinstance(message, Mapping):
+                slot_base = core.clean_text(
+                    message.get("stable_message_slot_base")
+                )
+                if slot_base:
+                    incoming_slot_counts[slot_base] = (
+                        incoming_slot_counts.get(slot_base, 0) + 1
+                    )
+        for incoming_message in incoming_group.get("messages", []):
+            core.require(isinstance(incoming_message, Mapping), "incoming message must be an object")
+            stable_id = core.clean_text(incoming_message.get("stable_message_id"))
+            source_identity = core.clean_text(
+                incoming_message.get("source_message_identity")
+            )
+            target_message = source_index.get(source_identity) if source_identity else None
+            if target_message is None:
+                target_message = stable_index.get(stable_id)
+            if target_message is None:
+                slot_base = core.clean_text(
+                    incoming_message.get("stable_message_slot_base")
+                )
+                if (
+                    slot_base
+                    and target_slot_counts.get(slot_base)
+                    == incoming_slot_counts.get(slot_base)
+                ):
+                    target_message = slot_index.get(
+                        core.clean_text(
+                            incoming_message.get("stable_message_slot_id")
+                        )
+                    )
+            if target_message is None:
+                copied = copy.deepcopy(dict(incoming_message))
+                target_group.setdefault("messages", []).append(copied)
+                stable_index[stable_id] = copied
+                if source_identity:
+                    source_index[source_identity] = copied
+                slot_id = core.clean_text(copied.get("stable_message_slot_id"))
+                if slot_id:
+                    slot_index[slot_id] = copied
+                appended += 1
+                continue
+            conflicts = _message_conflict_fields(target_message, incoming_message)
+            core.require(
+                not conflicts,
+                f"message identity conflict in {key}: {', '.join(conflicts)}",
+            )
+            _merge_reply_relation(
+                target_group,
+                target_message,
+                incoming_group,
+                incoming_message,
+            )
+            before_available = sum(
+                isinstance(item, Mapping) and item.get("availability") == "available"
+                for item in target_message.get("media", [])
+            )
+            _merge_message_media(target_message, incoming_message)
+            after_available = sum(
+                isinstance(item, Mapping) and item.get("availability") == "available"
+                for item in target_message.get("media", [])
+            )
+            richer_media += max(0, after_available - before_available)
+            # A message previously counted as context is authoritative when its
+            # predecessor copy belonged to the actual accounting period.
+            if not incoming_message.get("accounting_context_only"):
+                target_message.pop("accounting_context_only", None)
+                if not incoming_message.get("excluded_from_accounting"):
+                    target_message["excluded_from_accounting"] = False
+            deduplicated += 1
+        target_group["source_files"] = list(
+            dict.fromkeys(
+                [str(item) for item in target_group.get("source_files", [])]
+                + [str(item) for item in incoming_group.get("source_files", [])]
+            )
+        )
+        merged_rate_candidates: list[Any] = []
+        seen_rate_candidates: set[str] = set()
+        for candidate in list(target_group.get("rate_candidates", [])) + list(
+            incoming_group.get("rate_candidates", [])
+        ):
+            fingerprint = core.fingerprint_json(candidate)
+            if fingerprint in seen_rate_candidates:
+                continue
+            seen_rate_candidates.add(fingerprint)
+            merged_rate_candidates.append(copy.deepcopy(candidate))
+        target_group["rate_candidates"] = merged_rate_candidates
+
+    result_groups = list(groups.values())
+    for group in result_groups:
+        # Reply ids are only meaningful inside their own chat. LINE and other
+        # adapters may reuse the same raw id in unrelated groups.
+        raw_to_stable: dict[str, str] = {}
+        for message in group.get("messages", []):
+            if not isinstance(message, Mapping):
+                continue
+            stable_id = core.clean_text(message.get("stable_message_id"))
+            for field in ("message_id", "original_message_id"):
+                raw_id = core.clean_text(message.get(field))
+                if raw_id:
+                    raw_to_stable[raw_id] = stable_id
+        for message in group.get("messages", []):
+            reply_id = core.clean_text(message.get("reply_to_message_id"))
+            if reply_id in raw_to_stable:
+                message["reply_to_message_id"] = raw_to_stable[reply_id]
+        _canonicalize_group_messages(group)
+    result_groups.sort(
+        key=lambda item: (
+            str(item.get("platform")),
+            str(item.get("group_name")),
+            str(item.get("group_key")),
+        )
+    )
+    messages = [
+        message for group in result_groups for message in group.get("messages", [])
+    ]
+    media = [item for message in messages for item in message.get("media", [])]
+    result = {
+        "contract_version": core.NORMALIZED_CONTRACT,
+        "timezone": "Asia/Bangkok",
+        "source_fingerprint": core.fingerprint_json(
+            {
+                "normalizer": "roll-forward/1.0",
+                "predecessor": predecessor.get("source_fingerprint"),
+                "incoming": incoming.get("source_fingerprint"),
+                "stable_messages": [
+                    message.get("stable_message_id") for message in messages
+                ],
+            }
+        ),
+        "groups": result_groups,
+        "statistics": {
+            "groups": len(result_groups),
+            "messages": len(messages),
+            "excluded_messages": sum(
+                bool(message.get("excluded_from_accounting")) for message in messages
+            ),
+            "media": len(media),
+            "available_media": sum(
+                isinstance(item, Mapping) and item.get("availability") == "available"
+                for item in media
+            ),
+            "missing_media": sum(
+                isinstance(item, Mapping) and item.get("availability") == "missing"
+                for item in media
+            ),
+            "rate_candidates": sum(
+                len(group.get("rate_candidates", [])) for group in result_groups
+            ),
+            "source_files": sum(
+                len(group.get("source_files", [])) for group in result_groups
+            ),
+        },
+        "warnings": list(
+            dict.fromkeys(
+                [str(item) for item in predecessor.get("warnings", [])]
+                + [str(item) for item in incoming.get("warnings", [])]
+            )
+        ),
+        "skipped_files": list(
+            dict.fromkeys(
+                [str(item) for item in predecessor.get("skipped_files", [])]
+                + [str(item) for item in incoming.get("skipped_files", [])]
+            )
+        ),
+    }
+    return result, {
+        "messages_added": appended,
+        "messages_deduplicated": deduplicated,
+        "media_enriched": richer_media,
+    }
+
+
 def start_run(args: argparse.Namespace) -> dict[str, Any]:
     work = args.work.resolve()
     core.require(not work.exists(), f"work directory already exists; start requires a new path: {work}")
@@ -1110,16 +1572,17 @@ def start_run(args: argparse.Namespace) -> dict[str, Any]:
             accounting_from=accounting_from,
             accounting_to=accounting_to,
             timezone_name=args.timezone,
-            preserve_reply_context=group_mode == store_ledger.GROUP_MODE,
+            preserve_reply_context=True,
         )
     elif accounting_date is not None:
         normalized = _filter_normalized_date(
             normalized,
             accounting_date=accounting_date,
             timezone_name=args.timezone,
-            preserve_reply_context=group_mode == store_ledger.GROUP_MODE,
+            preserve_reply_context=True,
         )
     media_hash_statistics = _capture_normalized_media_hashes(normalized)
+    _assign_stable_identities(normalized)
     snapshot_path = _snapshot_path(work)
     core.atomic_json(snapshot_path, normalized)
     core.load_normalized(snapshot_path)
@@ -1167,6 +1630,9 @@ def start_run(args: argparse.Namespace) -> dict[str, Any]:
         "normalized_source_fingerprint": normalized["source_fingerprint"],
         "snapshot_sha256": core.sha256_file(snapshot_path),
         "input_roots": [str(path) for path in inputs],
+        "roster_path": str(roster_path),
+        "roster_sha256": core.sha256_file(roster_path),
+        "line_self_name": args.line_self_name,
         "line_backups": [str(path) for path in line_backups],
         "line_android_backups": [str(path) for path in line_android_backups],
         "ocr_candidates": ocr_candidate_config,
@@ -1176,7 +1642,6 @@ def start_run(args: argparse.Namespace) -> dict[str, Any]:
         run["group_name_excludes"] = [
             "小额出",
             "财务资料群",
-            store_ledger.GROUP_NAME_MARKER,
         ]
     else:
         run["group_name_contains"] = contains
@@ -1862,6 +2327,13 @@ def _merge_review_batch(
         order_id = core.clean_text(order.get("id"))
         replacement = copy.deepcopy(dict(order))
         if order_id in order_positions:
+            existing_order = candidate_orders[order_positions[order_id]]
+            if (
+                "lifecycle" not in replacement
+                and isinstance(existing_order, Mapping)
+                and isinstance(existing_order.get("lifecycle"), Mapping)
+            ):
+                replacement["lifecycle"] = copy.deepcopy(existing_order["lifecycle"])
             candidate_orders[order_positions[order_id]] = replacement
         else:
             order_positions[order_id] = len(candidate_orders)
@@ -3541,6 +4013,256 @@ def _validate_large_decision(
     }
 
 
+def _lifecycle_evidence_event(
+    status: str,
+    *,
+    source_labels: list[str],
+    message_by_label: Mapping[str, Mapping[str, Any]],
+    reason: str,
+) -> dict[str, Any]:
+    cited = [label for label in source_labels if label in message_by_label]
+    core.require(bool(cited), "order lifecycle requires at least one source message")
+    latest = max(
+        cited,
+        key=lambda label: str(message_by_label[label].get("timestamp") or ""),
+    )
+    return {
+        "status": status,
+        "at": str(message_by_label[latest]["timestamp"]),
+        "reason": reason,
+        "source_messages": [latest],
+    }
+
+
+def _derived_order_lifecycle(
+    *,
+    source_labels: list[str],
+    message_by_label: Mapping[str, Mapping[str, Any]],
+    entry_records: Mapping[str, Mapping[str, Any]],
+    entry_source_labels: Mapping[str, str],
+    entry_ids: list[str],
+) -> dict[str, Any]:
+    completed_sides = {
+        core.clean_text(entry_records[entry_id].get("side")).casefold()
+        for entry_id in entry_ids
+        if entry_records[entry_id].get("result") == "completed"
+    }
+    completed_labels = list(
+        dict.fromkeys(
+            entry_source_labels[entry_id]
+            for entry_id in entry_ids
+            if entry_records[entry_id].get("result") == "completed"
+            and core.clean_text(entry_records[entry_id].get("side")).casefold()
+            in {"payment", "payout"}
+        )
+    )
+    cited_text = "\n".join(
+        core.clean_text(message_by_label[label].get("text"))
+        for label in source_labels
+        if label in message_by_label
+    ).casefold()
+    has_cancel_marker = any(marker.casefold() in cited_text for marker in FAILURE_STATUS_MARKERS)
+    all_failed_or_blank = all(
+        core.clean_text(entry_records[entry_id].get("result")).casefold()
+        in {"failed", "not_shown", "unknown"}
+        for entry_id in entry_ids
+    )
+    signed_totals: dict[tuple[str, str], Any] = {}
+    amount_unknown = False
+    for entry_id in entry_ids:
+        entry = entry_records[entry_id]
+        if entry.get("result") != "completed":
+            continue
+        side = core.clean_text(entry.get("side")).casefold()
+        currency = core.clean_text(entry.get("currency"))
+        amount = core.parse_decimal(
+            entry.get("amount"),
+            field="order lifecycle amount",
+            allow_none=True,
+        )
+        if not currency or amount is None:
+            amount_unknown = True
+            continue
+        family = "payment" if side in {"payment", "payment_refund"} else "payout"
+        sign = -1 if side in {"payment_refund", "recovery"} else 1
+        key = (family, currency)
+        signed_totals[key] = signed_totals.get(key, amount * 0) + amount * sign
+    funds_fully_reversed = (
+        not amount_unknown
+        and bool(signed_totals)
+        and all(amount == 0 for amount in signed_totals.values())
+    )
+    if has_cancel_marker and (all_failed_or_blank or funds_fully_reversed):
+        status = "cancelled"
+        reason = "聊天明确取消或失败，且没有待履行资金"
+        evidence = source_labels
+    elif {"payment", "payout"} <= completed_sides:
+        status = "completed"
+        reason = "付款与内部回款均已有完成依据"
+        evidence = completed_labels or source_labels
+    else:
+        status = "pending_next_day"
+        reason = "截至本期末尚未形成完整付款与内部回款闭环"
+        evidence = source_labels
+    event = _lifecycle_evidence_event(
+        status,
+        source_labels=evidence,
+        message_by_label=message_by_label,
+        reason=reason,
+    )
+    return {
+        "status": status,
+        "completion_at": event["at"] if status == "completed" else "",
+        "reason": reason,
+        "source_messages": event["source_messages"],
+        "history": [event],
+    }
+
+
+def _normalize_order_lifecycle(
+    value: object,
+    *,
+    field: str,
+    source_labels: list[str],
+    message_by_label: Mapping[str, Mapping[str, Any]],
+    entry_records: Mapping[str, Mapping[str, Any]],
+    entry_source_labels: Mapping[str, str],
+    entry_ids: list[str],
+    allow_derived_transition: bool = False,
+) -> dict[str, Any]:
+    derived = _derived_order_lifecycle(
+        source_labels=source_labels,
+        message_by_label=message_by_label,
+        entry_records=entry_records,
+        entry_source_labels=entry_source_labels,
+        entry_ids=entry_ids,
+    )
+    if value in (None, ""):
+        return derived
+    core.require(isinstance(value, Mapping), f"{field} must be an object")
+    unknown = sorted(
+        set(value) - {"status", "completion_at", "reason", "source_messages", "history"}
+    )
+    core.require(not unknown, f"{field} has unsupported fields: {', '.join(unknown)}")
+    status = core.clean_text(value.get("status")).casefold()
+    core.require(status in ORDER_LIFECYCLE_STATUSES, f"{field}.status is unsupported")
+    raw_sources = value.get("source_messages", [])
+    core.require(isinstance(raw_sources, list), f"{field}.source_messages must be a list")
+    lifecycle_sources = [str(item) for item in raw_sources]
+    core.require(
+        bool(lifecycle_sources)
+        and len(lifecycle_sources) == len(set(lifecycle_sources))
+        and set(lifecycle_sources) <= set(source_labels),
+        f"{field}.source_messages must cite unique messages belonging to the order",
+    )
+    reason = core.clean_text(value.get("reason"))
+    if status != "completed":
+        core.require(bool(reason), f"{field}.reason is required when status is {status}")
+    completion_at = core.clean_text(value.get("completion_at"))
+    cited_timestamps = {
+        str(message_by_label[label].get("timestamp") or "")
+        for label in lifecycle_sources
+    }
+    if status == "completed":
+        core.require(
+            completion_at in cited_timestamps,
+            f"{field}.completion_at must equal a cited source-message timestamp",
+        )
+    else:
+        core.require(not completion_at, f"{field}.completion_at is only for completed orders")
+
+    history_value = value.get("history", [])
+    core.require(isinstance(history_value, list) and history_value, f"{field}.history is required")
+    history: list[dict[str, Any]] = []
+    prior_at = ""
+    for position, raw_event in enumerate(history_value):
+        event_field = f"{field}.history[{position}]"
+        core.require(isinstance(raw_event, Mapping), f"{event_field} must be an object")
+        unknown_event = sorted(
+            set(raw_event) - {"status", "at", "reason", "source_messages"}
+        )
+        core.require(
+            not unknown_event,
+            f"{event_field} has unsupported fields: {', '.join(unknown_event)}",
+        )
+        event_status = core.clean_text(raw_event.get("status")).casefold()
+        core.require(
+            event_status in ORDER_LIFECYCLE_STATUSES,
+            f"{event_field}.status is unsupported",
+        )
+        event_sources_value = raw_event.get("source_messages", [])
+        core.require(
+            isinstance(event_sources_value, list) and event_sources_value,
+            f"{event_field}.source_messages is required",
+        )
+        event_sources = [str(item) for item in event_sources_value]
+        core.require(
+            len(event_sources) == len(set(event_sources))
+            and set(event_sources) <= set(source_labels),
+            f"{event_field}.source_messages must belong to the order",
+        )
+        event_at = core.clean_text(raw_event.get("at"))
+        core.require(
+            event_at
+            in {
+                str(message_by_label[label].get("timestamp") or "")
+                for label in event_sources
+            },
+            f"{event_field}.at must equal a cited source-message timestamp",
+        )
+        core.require(event_at >= prior_at, f"{field}.history must be chronological")
+        prior_at = event_at
+        event_reason = core.clean_text(raw_event.get("reason"))
+        if event_status != "completed":
+            core.require(bool(event_reason), f"{event_field}.reason is required")
+        history.append(
+            {
+                "status": event_status,
+                "at": event_at,
+                "reason": event_reason,
+                "source_messages": event_sources,
+            }
+        )
+
+    # A carried pending order normally omits lifecycle in the next review batch.
+    # The merge retains its history and this transition closes it from new facts.
+    if (
+        allow_derived_transition
+        and status == "pending_next_day"
+        and derived["status"] in {"completed", "cancelled"}
+    ):
+        transition = derived["history"][-1]
+        if transition["at"] > history[-1]["at"]:
+            history.append(transition)
+            status = derived["status"]
+            completion_at = derived["completion_at"]
+            reason = derived["reason"]
+            lifecycle_sources = derived["source_messages"]
+
+    core.require(history[-1]["status"] == status, f"{field}.history final status mismatch")
+    if status == "completed":
+        core.require(
+            completion_at == history[-1]["at"],
+            f"{field}.completion_at must equal the final completed history time",
+        )
+        core.require(
+            derived["status"] == "completed",
+            f"{field}: completed requires completed payment and payout evidence",
+        )
+    if status == "cancelled":
+        core.require(
+            derived["status"] == "cancelled",
+            f"{field}: cancelled requires explicit cancellation/failure evidence and no live obligation",
+        )
+    return {
+        "status": status,
+        "completion_at": completion_at,
+        "reason": reason,
+        "source_messages": lifecycle_sources,
+        "history": history,
+    }
+
+
 def _validate_decision(
     normalized: Mapping[str, Any],
     group: Mapping[str, Any],
@@ -3549,6 +4271,7 @@ def _validate_decision(
     require_complete: bool,
     capture_hashes: bool,
     rehash_labels: set[str] | None = None,
+    auto_transition_order_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     if decision.get("contract_version") == finance_materials.DECISION_CONTRACT:
         expected = _decision_template(
@@ -3810,6 +4533,7 @@ def _validate_decision(
         "note",
         "same_transactions",
         "legs",
+        "lifecycle",
     }
     if large_order_mode:
         order_fields.add("fund_type")
@@ -4054,6 +4778,17 @@ def _validate_decision(
             for entry_id in refs
             if entry_records[entry_id].get("result") == "completed"
         }
+        order["lifecycle"] = _normalize_order_lifecycle(
+            order.get("lifecycle"),
+            field=f"{field}.lifecycle",
+            source_labels=source_labels,
+            message_by_label=message_by_label,
+            entry_records=entry_records,
+            entry_source_labels=entry_source_labels,
+            entry_ids=refs,
+            allow_derived_transition=order_id
+            in (auto_transition_order_ids or set()),
+        )
         if (
             not blank_direction
             and not unknown_pricing
@@ -5138,6 +5873,64 @@ def _open_order_carry_messages(
     return result
 
 
+def _roll_forward_carry_messages(
+    group: Mapping[str, Any],
+    decision: Mapping[str, Any],
+    carry_ids: object,
+) -> list[dict[str, Any]]:
+    if not isinstance(carry_ids, list) or not carry_ids:
+        return []
+    wanted = {str(item) for item in carry_ids}
+    collection = (
+        list(decision.get("records", []))
+        + list(decision.get("balance_snapshots", []))
+        if decision.get("contract_version") == store_ledger.DECISION_CONTRACT
+        else decision.get("orders", [])
+    )
+    sources: list[str] = []
+    for item in collection:
+        if not isinstance(item, Mapping) or core.clean_text(item.get("id")) not in wanted:
+            continue
+        raw_sources = item.get("source_messages", [])
+        if isinstance(raw_sources, list):
+            sources.extend(str(value) for value in raw_sources)
+        lifecycle = item.get("lifecycle")
+        if isinstance(lifecycle, Mapping) and isinstance(
+            lifecycle.get("source_messages"), list
+        ):
+            sources.extend(str(value) for value in lifecycle["source_messages"])
+    return _open_order_carry_messages(
+        group,
+        [{"source_messages": list(dict.fromkeys(sources))}],
+    )
+
+
+def _reply_target_carry_messages(
+    group: Mapping[str, Any], start: int, end: int
+) -> list[dict[str, Any]]:
+    messages = list(group.get("messages", []))
+    position_by_id = {
+        core.clean_text(message.get("message_id")): position
+        for position, message in enumerate(messages)
+        if isinstance(message, Mapping)
+        and core.clean_text(message.get("message_id"))
+    }
+    positions: list[int] = []
+    for message in messages[start:end]:
+        if not isinstance(message, Mapping):
+            continue
+        target_position = position_by_id.get(
+            core.clean_text(message.get("reply_to_message_id"))
+        )
+        if target_position is not None and not start <= target_position < end:
+            positions.append(target_position)
+    result: list[dict[str, Any]] = []
+    for position in dict.fromkeys(positions):
+        compact, _ = _compact_page(group, position, position + 1)
+        result.extend(compact)
+    return result
+
+
 def _render_result_json(result: Mapping[str, Any], *, compact: bool) -> str:
     if compact:
         return json.dumps(result, ensure_ascii=False, separators=(",", ":")) + "\n"
@@ -5188,6 +5981,15 @@ def _review_page_result(
         if start < end
         else None
     )
+    combined_carry: list[dict[str, Any]] = []
+    seen_carry_labels: set[str] = set()
+    for item in carry_messages + _reply_target_carry_messages(group, start, end):
+        label = core.clean_text(item.get("label"))
+        if label and label in seen_carry_labels:
+            continue
+        if label:
+            seen_carry_labels.add(label)
+        combined_carry.append(item)
     result = {
         "contract_version": REVIEW_PAGE_CONTRACT,
         "group_key": group_key,
@@ -5201,7 +6003,10 @@ def _review_page_result(
         "page_reaches_group_end": end == len(messages),
         "done": bool(decision.get("read_complete")),
         "commit_required": start < end,
-        "carry_messages": carry_messages,
+        "carry_messages": combined_carry,
+        "roll_forward_carry": copy.deepcopy(
+            run_group.get("roll_forward_carry", [])
+        ),
         "media_queue": _review_media_queue(
             group,
             decision,
@@ -5527,6 +6332,31 @@ def review_command(args: argparse.Namespace) -> dict[str, Any]:
             "review batch is stale: base_fingerprint does not match the current decision; "
             "refresh review status and rebuild the batch",
         )
+        auto_transition_order_ids: set[str] = set()
+        if decision.get("contract_version") in {
+            DECISION_CONTRACT,
+            large_daily.DECISION_CONTRACT,
+        }:
+            existing_orders = {
+                core.clean_text(item.get("id")): item
+                for item in decision.get("orders", [])
+                if isinstance(item, Mapping)
+            }
+            for update in batch.get("orders", []):
+                if not isinstance(update, Mapping) or "lifecycle" in update:
+                    continue
+                order_id = core.clean_text(update.get("id"))
+                existing = existing_orders.get(order_id)
+                lifecycle = (
+                    existing.get("lifecycle")
+                    if isinstance(existing, Mapping)
+                    else None
+                )
+                if (
+                    isinstance(lifecycle, Mapping)
+                    and lifecycle.get("status") == "pending_next_day"
+                ):
+                    auto_transition_order_ids.add(order_id)
         candidate = _merge_review_batch(decision, batch)
         committed_page = _commit_review_page(candidate, batch, group)
         statistics = _validate_decision(
@@ -5539,6 +6369,7 @@ def review_command(args: argparse.Namespace) -> dict[str, Any]:
                 str(label)
                 for label in batch.get("media_decisions", {})
             },
+            auto_transition_order_ids=auto_transition_order_ids,
         )
         observation_apply_statistics = _apply_media_observations(
             candidate,
@@ -5554,6 +6385,8 @@ def review_command(args: argparse.Namespace) -> dict[str, Any]:
             )
         )
         statistics.update(observation_apply_statistics)
+        if "roll_forward_carry" in run_group:
+            run_group["roll_forward_carry"] = _carry_ids(candidate)
         result_fingerprint = _semantic_fingerprint(candidate)
         prior_batch_count = (
             control.get("batch_count")
@@ -5622,6 +6455,19 @@ def review_command(args: argparse.Namespace) -> dict[str, Any]:
         open_field = _open_field_for_decision(decision)
         open_records = copy.deepcopy(decision.get(open_field, []))
         carry_messages = _open_order_carry_messages(group, open_records)
+        carry_messages.extend(
+            _roll_forward_carry_messages(
+                group,
+                decision,
+                run_group.get("roll_forward_carry", []),
+            )
+        )
+        carry_messages = list(
+            {
+                core.clean_text(item.get("label")) or core.fingerprint_json(item): item
+                for item in carry_messages
+            }.values()
+        )
         label_by_id, _ = _message_labels(group)
         message_by_id = {
             str(message.get("message_id") or ""): message
@@ -5770,6 +6616,8 @@ def review_command(args: argparse.Namespace) -> dict[str, Any]:
         decision["sealed_decision_fingerprint"] = None
     core.atomic_json(decision_path, decision)
     run_group["sealed"] = bool(decision.get("sealed"))
+    if "roll_forward_carry" in run_group:
+        run_group["roll_forward_carry"] = _carry_ids(decision)
     core.atomic_json(_run_path(work), run)
     return {
         "group_key": group_key,
@@ -5808,6 +6656,38 @@ def _translated_pricing(
         for label in value.get("source_messages", [])
     ]
     return pricing
+
+
+def _translated_lifecycle(
+    value: object,
+    *,
+    message_by_label: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    core.require(isinstance(value, Mapping), "lifecycle must be an object")
+    result = {
+        key: copy.deepcopy(item)
+        for key, item in value.items()
+        if key not in {"source_messages", "history"}
+    }
+    result["source_message_ids"] = [
+        str(message_by_label[str(label)]["message_id"])
+        for label in value.get("source_messages", [])
+    ]
+    history: list[dict[str, Any]] = []
+    for raw_event in value.get("history", []):
+        core.require(isinstance(raw_event, Mapping), "lifecycle history must contain objects")
+        event = {
+            key: copy.deepcopy(item)
+            for key, item in raw_event.items()
+            if key != "source_messages"
+        }
+        event["source_message_ids"] = [
+            str(message_by_label[str(label)]["message_id"])
+            for label in raw_event.get("source_messages", [])
+        ]
+        history.append(event)
+    result["history"] = history
+    return result
 
 
 def _translated_advanced_order(
@@ -5964,6 +6844,11 @@ def _compile_decisions_v3(
                     raw.get("pricing"),
                     message_by_label=message_by_label,
                 )
+            if raw.get("lifecycle") not in (None, ""):
+                order["lifecycle"] = _translated_lifecycle(
+                    raw.get("lifecycle"),
+                    message_by_label=message_by_label,
+                )
             event_sides = {
                 event_by_entry[entry_id]: side_by_entry[entry_id]
                 for entry_id in entry_ids
@@ -6029,11 +6914,1203 @@ def _compile_decisions_v3(
     return events, plan
 
 
+AMENDMENTS_CONTRACT = "group-chat-confirmed-amendments/1.0"
+ROLL_FORWARD_CONTRACT = "group-chat-roll-forward/1.0"
+
+
+def _successor_period(
+    run: Mapping[str, Any],
+    normalized: Mapping[str, Any],
+    requested_date: str,
+) -> dict[str, str | None]:
+    accounting_date = _normalize_accounting_date(requested_date)
+    assert accounting_date is not None
+    prior_from = core.clean_text(run.get("accounting_from"))
+    prior_to = core.clean_text(run.get("accounting_to"))
+    if prior_from or prior_to:
+        core.require(
+            bool(prior_from) and bool(prior_to),
+            "predecessor accounting window is incomplete",
+        )
+        start = datetime.strptime(prior_from, "%Y-%m-%d %H:%M")
+        end = datetime.strptime(prior_to, "%Y-%m-%d %H:%M")
+        duration = end - start
+        core.require(duration > timedelta(0), "predecessor accounting window is invalid")
+        successor_start = end
+        successor_end = successor_start + duration
+        core.require(
+            accounting_date == successor_start.date().isoformat(),
+            "roll-forward date must be the calendar date on which the immediately following window starts",
+        )
+        return {
+            "date": accounting_date,
+            "accounting_from": successor_start.strftime("%Y-%m-%d %H:%M"),
+            "accounting_to": successor_end.strftime("%Y-%m-%d %H:%M"),
+        }
+
+    prior_date = core.clean_text(run.get("accounting_date"))
+    if prior_date:
+        expected = (
+            datetime.strptime(prior_date, "%Y-%m-%d").date() + timedelta(days=1)
+        ).isoformat()
+    else:
+        dates = [
+            str(message.get("timestamp") or "")[:10]
+            for group in normalized.get("groups", [])
+            for message in group.get("messages", [])
+            if isinstance(message, Mapping)
+            and not message.get("accounting_context_only")
+        ]
+        core.require(bool(dates), "cannot infer the predecessor accounting date")
+        expected = (
+            datetime.strptime(max(dates), "%Y-%m-%d").date() + timedelta(days=1)
+        ).isoformat()
+    core.require(
+        accounting_date == expected,
+        f"roll-forward date must immediately follow the predecessor period: expected {expected}",
+    )
+    return {"date": accounting_date, "accounting_from": None, "accounting_to": None}
+
+
+def _load_finished_decisions(
+    work: Path,
+    run: Mapping[str, Any],
+    normalized: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    core.require(run.get("status") == "finished", "predecessor run must be finished")
+    groups = _group_index(normalized)
+    decisions: dict[str, dict[str, Any]] = {}
+    for run_group in run.get("groups", []):
+        core.require(isinstance(run_group, Mapping), "predecessor run group is invalid")
+        group_key = core.clean_text(run_group.get("group_key"))
+        core.require(group_key in groups, f"predecessor group is missing: {group_key}")
+        original = _load_json(_decision_path(work, run_group))
+        _require_controlled_semantics(run_group, original)
+        core.require(original.get("sealed") is True, f"predecessor group is not sealed: {group_key}")
+        core.require(
+            original.get("sealed_decision_fingerprint")
+            == _semantic_fingerprint(original),
+            f"predecessor sealed decision changed: {group_key}",
+        )
+        decision = copy.deepcopy(original)
+        _validate_decision(
+            normalized,
+            groups[group_key],
+            decision,
+            require_complete=True,
+            capture_hashes=False,
+            rehash_labels=set(),
+        )
+        decisions[group_key] = decision
+    return decisions
+
+
+def _render_predecessor_for_comparison(
+    previous_work: Path,
+    *,
+    template: Path,
+    decisions: Mapping[str, Mapping[str, Any]] | None = None,
+) -> Path:
+    temporary_root = Path(
+        tempfile.mkdtemp(prefix="roll-forward-compare-", dir=previous_work.parent)
+    )
+    clone = temporary_root / "work"
+    clone.mkdir()
+    shutil.copy2(_run_path(previous_work), _run_path(clone))
+    shutil.copytree(previous_work / "decisions", clone / "decisions")
+    (clone / "snapshot").mkdir()
+    shutil.copy2(_snapshot_path(previous_work), _snapshot_path(clone))
+    if decisions is not None:
+        clone_run = _load_run(clone)
+        run_groups = {
+            core.clean_text(item.get("group_key")): item
+            for item in clone_run.get("groups", [])
+            if isinstance(item, Mapping)
+        }
+        core.require(
+            set(decisions) == set(run_groups),
+            "amended predecessor decisions do not match the published groups",
+        )
+        for group_key, source_decision in decisions.items():
+            candidate = copy.deepcopy(dict(source_decision))
+            candidate["sealed"] = True
+            candidate["sealed_decision_fingerprint"] = None
+            candidate["edit_control"] = _new_edit_control(
+                _semantic_fingerprint(candidate)
+            )
+            candidate["sealed_decision_fingerprint"] = _semantic_fingerprint(
+                candidate
+            )
+            core.atomic_json(
+                _decision_path(clone, run_groups[group_key]), candidate
+            )
+    output = temporary_root / "expected.xlsx"
+    try:
+        finish_run(
+            SimpleNamespace(
+                work=clone,
+                output=output,
+                template=template,
+                replace_predecessor=False,
+            )
+        )
+    except Exception:
+        shutil.rmtree(temporary_root, ignore_errors=True)
+        raise
+    return output
+
+
+def _predecessor_workbook_drift(
+    previous_work: Path,
+    previous_run: Mapping[str, Any],
+    previous_output: Path,
+) -> tuple[bool, str, str]:
+    core.require(previous_output.is_file(), f"predecessor workbook is missing: {previous_output}")
+    registered = Path(str(previous_run.get("output") or "")).resolve()
+    core.require(
+        registered == previous_output,
+        "--previous-output must be the workbook published by the predecessor run",
+    )
+    actual_hash = core.sha256_file(previous_output)
+    saved_hash = core.clean_text(previous_run.get("output_sha256"))
+    saved_business = core.clean_text(
+        previous_run.get("output_business_fingerprint")
+    )
+    actual_business = _workbook_business_fingerprint(previous_output)
+    if saved_hash and actual_hash == saved_hash:
+        return False, actual_hash, actual_business
+    if saved_business:
+        return actual_business != saved_business, actual_hash, actual_business
+
+    expected = _render_predecessor_for_comparison(
+        previous_work,
+        template=Path(__file__).resolve().parent.parent / "assets" / "模版.xlsx",
+    )
+    temporary_root = expected.parent
+    try:
+        legacy = _workbook_uses_legacy_order_layout(previous_output)
+        expected_business = _workbook_business_fingerprint(
+            expected, legacy=legacy
+        )
+        actual_legacy_business = _workbook_business_fingerprint(
+            previous_output, legacy=legacy
+        )
+        return (
+            actual_legacy_business != expected_business,
+            actual_hash,
+            actual_business,
+        )
+    finally:
+        shutil.rmtree(temporary_root, ignore_errors=True)
+
+
+def _require_amendments_rebuild_workbook(
+    previous_work: Path,
+    previous_run: Mapping[str, Any],
+    previous_output: Path,
+    decisions: Mapping[str, Mapping[str, Any]],
+) -> None:
+    expected = _render_predecessor_for_comparison(
+        previous_work,
+        template=Path(__file__).resolve().parent.parent / "assets" / "模版.xlsx",
+        decisions=decisions,
+    )
+    temporary_root = expected.parent
+    try:
+        legacy = (
+            not bool(
+                core.clean_text(previous_run.get("output_business_fingerprint"))
+            )
+            and _workbook_uses_legacy_order_layout(previous_output)
+        )
+        expected_business = _workbook_business_fingerprint(
+            expected, legacy=legacy
+        )
+        actual_business = _workbook_business_fingerprint(
+            previous_output, legacy=legacy
+        )
+        core.require(
+            expected_business == actual_business,
+            "confirmed amendments do not fully explain the predecessor workbook business-cell changes",
+        )
+    finally:
+        shutil.rmtree(temporary_root, ignore_errors=True)
+
+
+def _set_amendment_field(target: dict[str, Any], field_path: str, value: Any) -> None:
+    parts = [part for part in field_path.split(".") if part]
+    core.require(bool(parts), "confirmed amendment field is required")
+    current: Any = target
+    for part in parts[:-1]:
+        if isinstance(current, list):
+            core.require(part.isdigit(), "list amendment path segment must be an index")
+            position = int(part)
+            core.require(0 <= position < len(current), "amendment list index is outside the object")
+            current = current[position]
+        else:
+            core.require(isinstance(current, dict) and part in current, f"unknown amendment path: {field_path}")
+            current = current[part]
+    final = parts[-1]
+    if isinstance(current, list):
+        core.require(final.isdigit(), "list amendment path segment must be an index")
+        position = int(final)
+        core.require(0 <= position < len(current), "amendment list index is outside the object")
+        current[position] = copy.deepcopy(value)
+    else:
+        core.require(isinstance(current, dict), f"invalid amendment path: {field_path}")
+        current[final] = copy.deepcopy(value)
+
+
+def _apply_confirmed_amendments(
+    path: Path | None,
+    *,
+    previous_output_sha256: str,
+    normalized: Mapping[str, Any],
+    decisions: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    if path is None:
+        return {"count": 0, "sha256": None, "path": None}
+    resolved = path.resolve()
+    payload = _load_json(resolved)
+    core.require(
+        payload.get("contract_version") == AMENDMENTS_CONTRACT,
+        f"unsupported confirmed amendments contract; expected {AMENDMENTS_CONTRACT}",
+    )
+    core.require(
+        core.clean_text(payload.get("previous_output_sha256"))
+        == previous_output_sha256,
+        "confirmed amendments are not bound to the current predecessor workbook hash",
+    )
+    amendments = payload.get("amendments")
+    core.require(isinstance(amendments, list) and amendments, "confirmed amendments must be nonempty")
+    groups = _group_index(normalized)
+    allowed_roots = {
+        "orders": {
+            "customer_nickname",
+            "direction",
+            "pricing",
+            "note",
+            "fund_type",
+            "lifecycle",
+            "legs",
+        },
+        "records": {
+            "record_type",
+            "posting_status",
+            "posting_at",
+            "voucher_number",
+            "voucher_date",
+            "source_messages",
+            "media_roles",
+            "representative_media_label",
+            "movements",
+            "transfer",
+            "status_reason",
+            "note",
+        },
+    }
+    applied: list[dict[str, str]] = []
+    for position, amendment in enumerate(amendments):
+        field = f"confirmed amendments[{position}]"
+        core.require(isinstance(amendment, Mapping), f"{field} must be an object")
+        unknown = sorted(
+            set(amendment)
+            - {"group_key", "collection", "id", "field", "value", "reason", "basis", "source_messages"}
+        )
+        core.require(not unknown, f"{field} has unsupported fields: {', '.join(unknown)}")
+        group_key = core.clean_text(amendment.get("group_key"))
+        collection = core.clean_text(amendment.get("collection")).casefold()
+        item_id = core.clean_text(amendment.get("id"))
+        field_path = core.clean_text(amendment.get("field"))
+        reason = core.clean_text(amendment.get("reason"))
+        basis = core.clean_text(amendment.get("basis"))
+        core.require(group_key in decisions and group_key in groups, f"{field}.group_key is unknown")
+        core.require(collection in allowed_roots, f"{field}.collection must be orders or records")
+        core.require(bool(item_id) and bool(reason) and bool(basis), f"{field} requires id, reason, and basis")
+        root = field_path.split(".", 1)[0]
+        core.require(root in allowed_roots[collection], f"{field}.field is not amendable")
+        source_value = amendment.get("source_messages")
+        core.require(isinstance(source_value, list) and source_value, f"{field}.source_messages is required")
+        source_labels = [str(item) for item in source_value]
+        _, message_by_label = _message_labels(groups[group_key])
+        core.require(
+            len(source_labels) == len(set(source_labels))
+            and set(source_labels) <= set(message_by_label),
+            f"{field}.source_messages contains an unknown predecessor message",
+        )
+        collection_value = decisions[group_key].get(collection)
+        core.require(isinstance(collection_value, list), f"{field}.collection is unavailable for this mode")
+        matches = [
+            item
+            for item in collection_value
+            if isinstance(item, dict) and core.clean_text(item.get("id")) == item_id
+        ]
+        core.require(len(matches) == 1, f"{field}.id must identify exactly one object")
+        _set_amendment_field(matches[0], field_path, amendment.get("value"))
+        applied.append(
+            {
+                "group_key": group_key,
+                "collection": collection,
+                "id": item_id,
+                "field": field_path,
+                "reason": reason,
+                "basis": basis,
+            }
+        )
+    return {
+        "count": len(applied),
+        "sha256": core.sha256_file(resolved),
+        "path": str(resolved),
+        "items": applied,
+    }
+
+
+def _relocate_snapshot_paths(
+    normalized: dict[str, Any], old_root: Path, new_root: Path
+) -> None:
+    old_resolved = old_root.resolve()
+    for group in normalized.get("groups", []):
+        for message in group.get("messages", []):
+            for media in message.get("media", []):
+                if not isinstance(media, dict) or not media.get("path"):
+                    continue
+                path = Path(str(media["path"])).resolve()
+                try:
+                    relative = path.relative_to(old_resolved)
+                except ValueError:
+                    continue
+                media["path"] = str((new_root / relative).resolve())
+
+
+def _label_maps(
+    previous_group: Mapping[str, Any], cumulative_group: Mapping[str, Any]
+) -> tuple[dict[str, str], dict[str, str], set[str]]:
+    _, previous_messages = _message_labels(previous_group)
+    _, cumulative_messages = _message_labels(cumulative_group)
+    cumulative_message_labels = {
+        core.clean_text(message.get("stable_message_id")): label
+        for label, message in cumulative_messages.items()
+    }
+    message_map: dict[str, str] = {}
+    for label, message in previous_messages.items():
+        stable_id = core.clean_text(message.get("stable_message_id"))
+        core.require(stable_id in cumulative_message_labels, "predecessor message disappeared during merge")
+        message_map[label] = cumulative_message_labels[stable_id]
+
+    previous_media = _media_inventory(previous_group)
+    cumulative_media = _media_inventory(cumulative_group)
+    cumulative_media_by_stable = {
+        core.clean_text(media.get("stable_media_id")): (label, media)
+        for label, (_, media) in cumulative_media.items()
+    }
+    media_map: dict[str, str] = {}
+    reusable_media_labels: set[str] = set()
+    for label, (_, media) in previous_media.items():
+        stable_id = core.clean_text(media.get("stable_media_id"))
+        core.require(stable_id in cumulative_media_by_stable, "predecessor media disappeared during merge")
+        cumulative_label, cumulative_item = cumulative_media_by_stable[stable_id]
+        media_map[label] = cumulative_label
+        previous_hash = core.clean_text(media.get("blob_sha256"))
+        cumulative_hash = core.clean_text(cumulative_item.get("blob_sha256"))
+        if previous_hash and previous_hash == cumulative_hash:
+            reusable_media_labels.add(cumulative_label)
+    return message_map, media_map, reusable_media_labels
+
+
+def _remap_decision_labels(
+    value: Any,
+    *,
+    message_map: Mapping[str, str],
+    media_map: Mapping[str, str],
+) -> Any:
+    if isinstance(value, list):
+        return [
+            _remap_decision_labels(
+                item, message_map=message_map, media_map=media_map
+            )
+            for item in value
+        ]
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            mapped_key = media_map.get(key, message_map.get(key, key))
+            result[mapped_key] = _remap_decision_labels(
+                item, message_map=message_map, media_map=media_map
+            )
+        return result
+    if isinstance(value, str):
+        if value in message_map:
+            return message_map[value]
+        if value in media_map:
+            return media_map[value]
+        match = re.fullmatch(r"(M\d{4})(\.\d+)", value)
+        if match and match.group(1) in media_map:
+            return media_map[match.group(1)] + match.group(2)
+    return copy.deepcopy(value)
+
+
+def _carry_ids(decision: Mapping[str, Any]) -> list[str]:
+    if decision.get("contract_version") == store_ledger.DECISION_CONTRACT:
+        result = [
+            core.clean_text(item.get("id"))
+            for item in decision.get("records", [])
+            if isinstance(item, Mapping)
+            and (
+                item.get("posting_status") != "posted"
+                or bool(core.clean_text(item.get("status_reason")))
+                or bool(core.clean_text(item.get("note")))
+                or item.get("record_type") == "internal_transfer"
+            )
+        ]
+        closing_snapshots = [
+            item
+            for item in decision.get("balance_snapshots", [])
+            if isinstance(item, Mapping) and item.get("kind") == "closing"
+        ]
+        if closing_snapshots:
+            latest_date = max(
+                core.clean_text(item.get("date")) for item in closing_snapshots
+            )
+            result.extend(
+                core.clean_text(item.get("id"))
+                for item in closing_snapshots
+                if core.clean_text(item.get("date")) == latest_date
+            )
+        return list(dict.fromkeys(item for item in result if item))
+
+    def pricing_unknown(value: object) -> bool:
+        if not isinstance(value, Mapping):
+            return True
+        expected = value.get("expected")
+        return not isinstance(expected, Mapping) or core.clean_text(
+            expected.get("kind")
+        ).casefold() == "unknown"
+
+    result: list[str] = []
+    for item in decision.get("orders", []):
+        if not isinstance(item, Mapping):
+            continue
+        lifecycle = item.get("lifecycle")
+        legs = item.get("legs")
+        exceptional = (
+            not isinstance(lifecycle, Mapping)
+            or lifecycle.get("status") != "completed"
+            or bool(core.clean_text(item.get("note")))
+            or not bool(core.clean_text(item.get("direction")))
+            or (
+                any(
+                    pricing_unknown(leg.get("pricing"))
+                    for leg in legs
+                    if isinstance(leg, Mapping)
+                )
+                if isinstance(legs, list) and legs
+                else pricing_unknown(item.get("pricing"))
+            )
+        )
+        if exceptional:
+            result.append(core.clean_text(item.get("id")))
+    return result
+
+
+def _migrate_legacy_large_decision(
+    normalized: Mapping[str, Any],
+    group: Mapping[str, Any],
+    legacy: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Convert a sealed exchange-only decision into reviewable full orders."""
+
+    core.require(
+        legacy.get("contract_version") == large_daily.LEGACY_DECISION_CONTRACT,
+        "legacy large migration received the wrong contract",
+    )
+    core.require(
+        legacy.get("open_exchanges") in (None, []),
+        "legacy large run still has open exchanges and cannot be rolled forward",
+    )
+    _, message_by_label = _message_labels(group)
+    orders: list[dict[str, Any]] = []
+    for position, raw_exchange in enumerate(legacy.get("exchanges", [])):
+        field = f"legacy large exchanges[{position}]"
+        core.require(isinstance(raw_exchange, Mapping), f"{field} must be an object")
+        entry_ids = [str(item) for item in raw_exchange.get("entry_ids", [])]
+        core.require(
+            bool(entry_ids),
+            f"{field} has no source fund entries; regenerate this legacy group with the full-order contract before roll-forward",
+        )
+        sources = [str(item) for item in raw_exchange.get("source_messages", [])]
+        customer_names = list(
+            dict.fromkeys(
+                core.clean_text(
+                    message_by_label[label].get("sender_name")
+                    or message_by_label[label].get("sender_id")
+                )
+                for label in sources
+                if label in message_by_label
+                and message_by_label[label].get("role") == "客户候选"
+                and core.clean_text(
+                    message_by_label[label].get("sender_name")
+                    or message_by_label[label].get("sender_id")
+                )
+            )
+        )
+        migration_note = "旧大额合同迁移：需结合前序聊天复核客户和完整订单边界。"
+        original_note = core.clean_text(raw_exchange.get("note"))
+        orders.append(
+            {
+                "id": core.clean_text(raw_exchange.get("id")),
+                "entry_ids": entry_ids,
+                "source_messages": sources,
+                "customer_nickname": (
+                    customer_names[0] if len(customer_names) == 1 else ""
+                ),
+                "direction": core.clean_text(raw_exchange.get("direction")),
+                "pricing": {
+                    "source_messages": sources,
+                    "terms": {
+                        "rate": raw_exchange.get("rate"),
+                        "operator": raw_exchange.get("operator"),
+                    },
+                    "expected": {
+                        "kind": "explicit",
+                        "amount": raw_exchange.get("target_amount"),
+                    },
+                },
+                "fund_type": raw_exchange.get("fund_type"),
+                "note": "\n".join(
+                    item for item in (original_note, migration_note) if item
+                ),
+            }
+        )
+
+    candidate = copy.deepcopy(dict(legacy))
+    candidate["contract_version"] = large_daily.DECISION_CONTRACT
+    candidate["group_mode"] = "large"
+    candidate["orders"] = orders
+    candidate["open_orders"] = []
+    candidate["balance_links"] = []
+    candidate["settlement_allocations"] = []
+    candidate.setdefault("unknown_payee_reviewed_entry_ids", [])
+    candidate.pop("exchanges", None)
+    candidate.pop("open_exchanges", None)
+    candidate["sealed"] = False
+    candidate["sealed_decision_fingerprint"] = None
+    candidate["edit_control"] = _new_edit_control(_semantic_fingerprint(candidate))
+    _validate_decision(
+        normalized,
+        group,
+        candidate,
+        require_complete=True,
+        capture_hashes=False,
+        rehash_labels=set(),
+    )
+    candidate["edit_control"] = _new_edit_control(_semantic_fingerprint(candidate))
+    candidate["sealed"] = True
+    candidate["sealed_decision_fingerprint"] = _semantic_fingerprint(candidate)
+    return candidate
+
+
+def _migrate_decision(
+    normalized: Mapping[str, Any],
+    previous_group: Mapping[str, Any],
+    cumulative_group: Mapping[str, Any],
+    previous_decision: Mapping[str, Any],
+    *,
+    group_mode: str,
+) -> tuple[dict[str, Any], list[str], int]:
+    message_map, media_map, reusable_media_labels = _label_maps(
+        previous_group, cumulative_group
+    )
+    candidate = _remap_decision_labels(
+        previous_decision, message_map=message_map, media_map=media_map
+    )
+    core.require(isinstance(candidate, dict), "migrated decision must be an object")
+    media_decisions = candidate.get("media_decisions")
+    if isinstance(media_decisions, dict):
+        for label in list(media_decisions):
+            if label not in reusable_media_labels:
+                media_decisions.pop(label)
+    expected = _decision_template(normalized, cumulative_group, group_mode=group_mode)
+    for field in (
+        "normalized_source_fingerprint",
+        "group_fingerprint",
+        "group_key",
+        "group_name",
+        "platform",
+        "message_count",
+        "evidence_media_count",
+        "group_mode",
+    ):
+        if field in expected:
+            candidate[field] = copy.deepcopy(expected[field])
+        else:
+            candidate.pop(field, None)
+    previous_stable_ids = [
+        core.clean_text(message.get("stable_message_id"))
+        for message in previous_group.get("messages", [])
+    ]
+    cumulative_stable_ids = [
+        core.clean_text(message.get("stable_message_id"))
+        for message in cumulative_group.get("messages", [])
+    ]
+    core.require(
+        cumulative_stable_ids[: len(previous_stable_ids)] == previous_stable_ids,
+        "predecessor chronology is not a stable prefix after merging snapshots",
+    )
+    reviewed_through = len(previous_stable_ids)
+    candidate["reviewed_through"] = reviewed_through
+    candidate["read_complete"] = reviewed_through == len(cumulative_stable_ids)
+    candidate["sealed"] = False
+    candidate["sealed_decision_fingerprint"] = None
+    candidate["edit_control"] = _new_edit_control(_semantic_fingerprint(candidate))
+    _validate_decision(
+        normalized,
+        cumulative_group,
+        candidate,
+        require_complete=False,
+        capture_hashes=False,
+        rehash_labels=set(),
+    )
+    candidate["edit_control"] = _new_edit_control(_semantic_fingerprint(candidate))
+    carry = _carry_ids(candidate)
+    new_count = len(cumulative_stable_ids) - reviewed_through
+    if not carry and new_count == 0:
+        candidate["sealed"] = True
+        candidate["sealed_decision_fingerprint"] = _semantic_fingerprint(candidate)
+    return candidate, carry, new_count
+
+
+def _cumulative_accounting_window(
+    predecessor: Mapping[str, Any], incoming: Mapping[str, Any]
+) -> tuple[dict[str, str | bool], list[dict[str, Any]]]:
+    periods: list[dict[str, Any]] = []
+    previous_periods = predecessor.get("accounting_periods")
+    if isinstance(previous_periods, list):
+        periods.extend(copy.deepcopy(previous_periods))
+    elif isinstance(predecessor.get("accounting_window"), Mapping):
+        periods.append(copy.deepcopy(dict(predecessor["accounting_window"])))
+    else:
+        predecessor_timestamps = [
+            core.clean_text(message.get("timestamp"))
+            for group in predecessor.get("groups", [])
+            for message in group.get("messages", [])
+            if isinstance(message, Mapping)
+            and not message.get("accounting_context_only")
+        ]
+        if predecessor_timestamps:
+            zone = ZoneInfo("Asia/Bangkok")
+            predecessor_start_date = min(
+                datetime.fromisoformat(value).astimezone(zone).date()
+                for value in predecessor_timestamps
+            )
+            predecessor_end_date = max(
+                datetime.fromisoformat(value).astimezone(zone).date()
+                for value in predecessor_timestamps
+            ) + timedelta(days=1)
+            periods.append(
+                {
+                    "start": datetime.combine(
+                        predecessor_start_date, datetime.min.time(), tzinfo=zone
+                    ).isoformat(),
+                    "end": datetime.combine(
+                        predecessor_end_date, datetime.min.time(), tzinfo=zone
+                    ).isoformat(),
+                    "reply_context_preserved": bool(
+                        predecessor.get("accounting_window", {}).get(
+                            "reply_context_preserved", False
+                        )
+                    )
+                    if isinstance(predecessor.get("accounting_window"), Mapping)
+                    else False,
+                    "inferred": True,
+                }
+            )
+    if isinstance(incoming.get("accounting_window"), Mapping):
+        periods.append(copy.deepcopy(dict(incoming["accounting_window"])))
+    starts = [core.clean_text(item.get("start")) for item in periods if item.get("start")]
+    ends = [core.clean_text(item.get("end")) for item in periods if item.get("end")]
+    if not starts or not ends:
+        timestamps = [
+            core.clean_text(message.get("timestamp"))
+            for document in (predecessor, incoming)
+            for group in document.get("groups", [])
+            for message in group.get("messages", [])
+            if isinstance(message, Mapping)
+        ]
+        core.require(bool(timestamps), "cumulative accounting window has no messages")
+        zone = ZoneInfo("Asia/Bangkok")
+        start_date = min(datetime.fromisoformat(value).astimezone(zone).date() for value in timestamps)
+        end_date = max(datetime.fromisoformat(value).astimezone(zone).date() for value in timestamps) + timedelta(days=1)
+        starts = [datetime.combine(start_date, datetime.min.time(), tzinfo=zone).isoformat()]
+        ends = [datetime.combine(end_date, datetime.min.time(), tzinfo=zone).isoformat()]
+    return (
+        {
+            "start": min(starts),
+            "end": max(ends),
+            "reply_context_preserved": True,
+        },
+        periods,
+    )
+
+
+def roll_forward_run(args: argparse.Namespace) -> dict[str, Any]:
+    previous_work = args.previous_work.resolve()
+    work = args.work.resolve()
+    previous_output = args.previous_output.resolve()
+    core.require(previous_work.is_dir(), f"predecessor work directory is missing: {previous_work}")
+    core.require(not work.exists(), f"work directory already exists; roll-forward requires a new path: {work}")
+    inputs = [path.resolve() for path in args.inputs]
+    for path in inputs:
+        core.require(path.exists(), f"input does not exist: {path}")
+
+    previous_run = _load_run(previous_work)
+    group_mode = core.clean_text(previous_run.get("group_mode")).casefold()
+    core.require(group_mode != finance_materials.GROUP_MODE, "finance mode does not support roll-forward")
+    core.require(
+        group_mode in {"small", "large", store_ledger.GROUP_MODE},
+        "predecessor mode does not support roll-forward",
+    )
+    previous_normalized = _load_snapshot(previous_work, previous_run)
+    predecessor_roster = Path(
+        str(
+            previous_run.get("roster_path")
+            or Path(__file__).resolve().parent.parent / "config" / "roster.yaml"
+        )
+    ).resolve()
+    core.require(
+        predecessor_roster.is_file(),
+        f"predecessor roster is missing: {predecessor_roster}",
+    )
+    predecessor_roster_sha256 = core.clean_text(
+        previous_run.get("roster_sha256")
+    )
+    if predecessor_roster_sha256:
+        core.require(
+            core.sha256_file(predecessor_roster)
+            == predecessor_roster_sha256,
+            "predecessor roster changed; restore the recorded parsing settings before roll-forward",
+        )
+    previous_decisions = _load_finished_decisions(
+        previous_work, previous_run, previous_normalized
+    )
+    period = _successor_period(previous_run, previous_normalized, args.date)
+    drifted, previous_output_sha256, previous_business = _predecessor_workbook_drift(
+        previous_work, previous_run, previous_output
+    )
+    amendments = _apply_confirmed_amendments(
+        args.confirmed_amendments,
+        previous_output_sha256=previous_output_sha256,
+        normalized=previous_normalized,
+        decisions=previous_decisions,
+    )
+    core.require(
+        not drifted or amendments["count"] > 0,
+        "predecessor workbook business cells changed; provide --confirmed-amendments bound to its current hash",
+    )
+    core.require(
+        drifted or amendments["count"] == 0,
+        "confirmed amendments were provided but the predecessor workbook has no business-cell changes",
+    )
+    previous_groups = _group_index(previous_normalized)
+    for group_key, decision in previous_decisions.items():
+        _validate_decision(
+            previous_normalized,
+            previous_groups[group_key],
+            decision,
+            require_complete=True,
+            capture_hashes=False,
+            rehash_labels=set(),
+        )
+    if drifted:
+        _require_amendments_rebuild_workbook(
+            previous_work,
+            previous_run,
+            previous_output,
+            previous_decisions,
+        )
+    legacy_migrations = 0
+    if group_mode == "large":
+        for group_key, decision in list(previous_decisions.items()):
+            if decision.get("contract_version") != large_daily.LEGACY_DECISION_CONTRACT:
+                continue
+            previous_decisions[group_key] = _migrate_legacy_large_decision(
+                previous_normalized,
+                previous_groups[group_key],
+                decision,
+            )
+            legacy_migrations += 1
+    _assign_stable_identities(previous_normalized)
+    previous_groups = _group_index(previous_normalized)
+
+    work.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="roll-forward-", dir=work.parent) as temporary_name:
+        temporary_root = Path(temporary_name)
+        staging = temporary_root / "work"
+        prior_ocr = _ocr_candidate_config_for_run(previous_run)
+        start_run(
+            SimpleNamespace(
+                work=staging,
+                inputs=inputs,
+                mode=group_mode,
+                contains=previous_run.get("group_name_contains", "小额"),
+                date=(
+                    period["date"]
+                    if group_mode == "large" or not period["accounting_from"]
+                    else None
+                ),
+                accounting_from=period["accounting_from"],
+                accounting_to=period["accounting_to"],
+                timezone=previous_run.get("accounting_timezone", "Asia/Bangkok"),
+                roster=predecessor_roster,
+                line_backup=[],
+                line_android_backup=[],
+                line_self_name=previous_run.get("line_self_name", "LINE_SELF"),
+                ocr_candidates=bool(prior_ocr["enabled"]),
+            )
+        )
+        incoming_run = _load_run(staging)
+        incoming = _load_snapshot(staging, incoming_run)
+        incoming_run_sha256 = core.sha256_file(_run_path(staging))
+        incoming_snapshot_sha256 = core.sha256_file(_snapshot_path(staging))
+        incoming_source_fingerprint = core.clean_text(
+            incoming.get("source_fingerprint")
+        )
+        _relocate_snapshot_paths(incoming, staging, work)
+        cumulative, merge_statistics = _merge_normalized_snapshots(
+            previous_normalized, incoming
+        )
+        cumulative_window, accounting_periods = _cumulative_accounting_window(
+            previous_normalized, incoming
+        )
+        cumulative["accounting_window"] = cumulative_window
+        cumulative["accounting_periods"] = accounting_periods
+
+        cumulative_groups = _group_index(cumulative)
+        group_reports: list[dict[str, Any]] = []
+        used_labels: set[str] = set()
+        for group in cumulative["groups"]:
+            group_key = core.clean_text(group.get("group_key"))
+            if group_key in previous_decisions:
+                decision, carry, new_count = _migrate_decision(
+                    cumulative,
+                    previous_groups[group_key],
+                    group,
+                    previous_decisions[group_key],
+                    group_mode=group_mode,
+                )
+            else:
+                decision = _decision_template(cumulative, group, group_mode=group_mode)
+                carry = []
+                new_count = len(group.get("messages", []))
+            filename = _decision_filename(group_key)
+            core.atomic_json(staging / "decisions" / filename, decision)
+            base_label = f"[{_platform_prefix(group.get('platform'))}] {group.get('group_name')}"
+            run_label = base_label
+            if run_label in used_labels:
+                run_label = f"{base_label} ({core.stable_token(group_key, length=6)})"
+            used_labels.add(run_label)
+            group_reports.append(
+                {
+                    "group_key": group_key,
+                    "group_name": group.get("group_name"),
+                    "platform": group.get("platform"),
+                    "run_label": run_label,
+                    "messages": len(group.get("messages", [])),
+                    "evidence_media": len(_media_inventory(group)),
+                    "decision_file": f"decisions/{filename}",
+                    "edit_mode": EDIT_CONTROL_MODE,
+                    "group_mode": group_mode,
+                    "sealed": bool(decision.get("sealed")),
+                    "roll_forward_carry": carry,
+                    "new_messages": new_count,
+                }
+            )
+
+        snapshot_path = _snapshot_path(staging)
+        core.atomic_json(snapshot_path, cumulative)
+        core.load_normalized(snapshot_path)
+        run = copy.deepcopy(incoming_run)
+        run.update(
+            {
+                "status": "reviewing",
+                "groups": group_reports,
+                "normalized_source_fingerprint": cumulative["source_fingerprint"],
+                "snapshot_sha256": core.sha256_file(snapshot_path),
+                "accounting_date": period["date"],
+                "input_roots": [str(path) for path in inputs],
+                "roll_forward": {
+                    "contract_version": ROLL_FORWARD_CONTRACT,
+                    "predecessor_work": str(previous_work),
+                    "predecessor_run_sha256": core.sha256_file(_run_path(previous_work)),
+                    "predecessor_snapshot_sha256": core.sha256_file(
+                        _snapshot_path(previous_work)
+                    ),
+                    "predecessor_output": str(previous_output),
+                    "predecessor_output_sha256": previous_output_sha256,
+                    "predecessor_output_business_fingerprint": previous_business,
+                    "incoming_run_sha256": incoming_run_sha256,
+                    "incoming_snapshot_sha256": incoming_snapshot_sha256,
+                    "incoming_source_fingerprint": incoming_source_fingerprint,
+                    "incoming_input_roots": [str(path) for path in inputs],
+                    "inherited_parsing_settings": {
+                        "group_mode": group_mode,
+                        "timezone": previous_run.get(
+                            "accounting_timezone", "Asia/Bangkok"
+                        ),
+                        "roster_path": str(predecessor_roster),
+                        "roster_sha256": core.sha256_file(predecessor_roster),
+                        "line_self_name": previous_run.get(
+                            "line_self_name", "LINE_SELF"
+                        ),
+                        "ocr_candidates": bool(prior_ocr["enabled"]),
+                    },
+                    "current_date": period["date"],
+                    "current_accounting_from": period["accounting_from"],
+                    "current_accounting_to": period["accounting_to"],
+                    "merge": merge_statistics,
+                    "confirmed_amendments": amendments,
+                    "legacy_contract_migrations": legacy_migrations,
+                },
+            }
+        )
+        run.pop("finished_at", None)
+        run.pop("output", None)
+        run.pop("output_sha256", None)
+        run.pop("output_business_fingerprint", None)
+        if period["accounting_from"]:
+            run["accounting_from"] = period["accounting_from"]
+            run["accounting_to"] = period["accounting_to"]
+        else:
+            run.pop("accounting_from", None)
+            run.pop("accounting_to", None)
+        core.atomic_json(_run_path(staging), run)
+        staging.replace(work)
+
+    return {
+        "work": str(work),
+        "mode": group_mode,
+        "date": period["date"],
+        "groups": len(group_reports),
+        "messages": cumulative["statistics"]["messages"],
+        "carry_objects": sum(len(item["roll_forward_carry"]) for item in group_reports),
+        "workbook_business_drift_confirmed": bool(drifted),
+        "confirmed_amendments": amendments["count"],
+        "legacy_contract_migrations": legacy_migrations,
+        **merge_statistics,
+    }
+
+
+def _business_cell_value(value: object) -> object:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def _workbook_uses_legacy_order_layout(path: Path) -> bool:
+    workbook = load_workbook(path, read_only=True, data_only=False)
+    try:
+        for worksheet in workbook.worksheets:
+            headers = {
+                core.clean_text(cell.value)
+                for cell in next(worksheet.iter_rows(min_row=1, max_row=1), ())
+                if core.clean_text(cell.value)
+            }
+            if {"记录类型", "订单编号"} <= headers:
+                return not {"订单状态", "完成时间"} <= headers
+        return False
+    finally:
+        workbook.close()
+
+
+def _workbook_business_material(path: Path, *, legacy: bool = False) -> dict[str, Any]:
+    """Read semantic workbook content while deliberately ignoring formatting."""
+
+    workbook = load_workbook(path, read_only=False, data_only=False)
+    try:
+        sheets: list[dict[str, Any]] = []
+        for worksheet in workbook.worksheets:
+            first_headers = [
+                core.clean_text(worksheet.cell(1, column).value)
+                for column in range(1, worksheet.max_column + 1)
+            ]
+            is_order_sheet = "记录类型" in first_headers and "订单编号" in first_headers
+            if is_order_sheet:
+                title_row = next(
+                    (
+                        row
+                        for row in range(2, worksheet.max_row + 1)
+                        if worksheet.cell(row, 1).value == "资金汇总"
+                    ),
+                    None,
+                )
+                detail_end = (title_row - 1) if title_row else worksheet.max_row
+                allowed_headers = [header for header in first_headers if header]
+                if legacy:
+                    allowed_headers = [
+                        header
+                        for header in allowed_headers
+                        if header not in {"订单状态", "完成时间"}
+                    ]
+                header_columns = {
+                    header: first_headers.index(header) + 1 for header in allowed_headers
+                }
+                detail_rows = []
+                for row in range(2, detail_end + 1):
+                    material = {
+                        header: _business_cell_value(
+                            worksheet.cell(row, column).value
+                        )
+                        for header, column in header_columns.items()
+                    }
+                    if any(value not in (None, "") for value in material.values()):
+                        detail_rows.append(material)
+                summary_rows: list[dict[str, Any]] = []
+                if title_row:
+                    summary_header_row = title_row + 1
+                    summary_headers = [
+                        core.clean_text(worksheet.cell(summary_header_row, column).value)
+                        for column in range(1, worksheet.max_column + 1)
+                    ]
+                    allowed_summary_headers = [
+                        header for header in summary_headers if header
+                    ]
+                    if legacy:
+                        allowed_summary_headers = [
+                            header
+                            for header in allowed_summary_headers
+                            if header != "统计日期"
+                        ]
+                    summary_columns = {
+                        header: summary_headers.index(header) + 1
+                        for header in allowed_summary_headers
+                    }
+                    for row in range(summary_header_row + 1, worksheet.max_row + 1):
+                        material = {}
+                        for header, column in summary_columns.items():
+                            cell_value = _business_cell_value(
+                                worksheet.cell(row, column).value
+                            )
+                            if legacy and header == "状态":
+                                cell_value = {
+                                    "已完成": "已确认",
+                                    "待次日继续": "待确认",
+                                    "已取消": "待确认",
+                                }.get(cell_value, cell_value)
+                            if legacy and header in {"换出合计", "换入合计"} and cell_value == "—":
+                                cell_value = "未确认"
+                            material[header] = cell_value
+                        if any(value not in (None, "") for value in material.values()):
+                            summary_rows.append(material)
+                sheet_material: dict[str, Any] = {
+                    "title": worksheet.title,
+                    "detail_headers": allowed_headers,
+                    "detail_rows": detail_rows,
+                    "summary_rows": summary_rows,
+                }
+            else:
+                last_row = max(
+                    (
+                        row
+                        for row in range(1, worksheet.max_row + 1)
+                        if any(
+                            worksheet.cell(row, column).value not in (None, "")
+                            for column in range(1, worksheet.max_column + 1)
+                        )
+                    ),
+                    default=0,
+                )
+                last_column = max(
+                    (
+                        column
+                        for column in range(1, worksheet.max_column + 1)
+                        if any(
+                            worksheet.cell(row, column).value not in (None, "")
+                            for row in range(1, last_row + 1)
+                        )
+                    ),
+                    default=0,
+                )
+                sheet_material = {
+                    "title": worksheet.title,
+                    "cells": [
+                        [
+                            _business_cell_value(worksheet.cell(row, column).value)
+                            for column in range(1, last_column + 1)
+                        ]
+                        for row in range(1, last_row + 1)
+                    ],
+                }
+            sheets.append(sheet_material)
+        return {"sheets": sheets}
+    finally:
+        workbook.close()
+
+
+def _workbook_business_fingerprint(path: Path, *, legacy: bool = False) -> str:
+    return core.fingerprint_json(_workbook_business_material(path, legacy=legacy))
+
+
+def _protected_replace_enabled(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "replace_predecessor", False))
+
+
+def _validate_finish_destination(
+    run: Mapping[str, Any], output: Path, *, replace_predecessor: bool
+) -> None:
+    if not replace_predecessor:
+        core.require(not output.exists(), f"output already exists; choose a new file: {output}")
+        return
+    lineage = run.get("roll_forward")
+    core.require(
+        isinstance(lineage, Mapping),
+        "--replace-predecessor is only available for a roll-forward work directory",
+    )
+    predecessor_output = Path(
+        str(lineage.get("predecessor_output") or "")
+    ).resolve()
+    core.require(
+        output == predecessor_output,
+        "--replace-predecessor may only target the predecessor workbook registered in run.json",
+    )
+    core.require(output.is_file(), f"registered predecessor workbook is missing: {output}")
+    expected_hash = core.clean_text(lineage.get("predecessor_output_sha256"))
+    core.require(
+        core.sha256_file(output) == expected_hash,
+        "predecessor workbook changed after roll-forward started; rebuild the successor run",
+    )
+
+
+def _publish_finished_workbook(
+    temporary_workbook: Path,
+    output: Path,
+    *,
+    run: Mapping[str, Any],
+    replace_predecessor: bool,
+) -> None:
+    _validate_finish_destination(
+        run, output, replace_predecessor=replace_predecessor
+    )
+    temporary_workbook.replace(output)
+
+
+def _record_finished_output(run: dict[str, Any], work: Path, output: Path) -> None:
+    run["status"] = "finished"
+    run["finished_at"] = datetime.now(timezone.utc).isoformat()
+    run["output"] = str(output)
+    run["output_sha256"] = core.sha256_file(output)
+    run["output_business_fingerprint"] = _workbook_business_fingerprint(output)
+    core.atomic_json(_run_path(work), run)
+
+
 def finish_run(args: argparse.Namespace) -> dict[str, Any]:
     work = args.work.resolve()
     output = args.output.resolve()
-    core.require(not output.exists(), f"output already exists; choose a new file: {output}")
     run = _load_run(work)
+    replace_predecessor = _protected_replace_enabled(args)
+    _validate_finish_destination(
+        run, output, replace_predecessor=replace_predecessor
+    )
     normalized = _load_snapshot(work, run)
     groups = _group_index(normalized)
     decisions: dict[str, Mapping[str, Any]] = {}
@@ -6094,11 +8171,13 @@ def finish_run(args: argparse.Namespace) -> dict[str, Any]:
                 not errors,
                 "store-ledger workbook verification failed: " + "; ".join(errors[:10]),
             )
-            workbook_path.replace(output)
-        run["status"] = "finished"
-        run["finished_at"] = datetime.now(timezone.utc).isoformat()
-        run["output"] = str(output)
-        core.atomic_json(_run_path(work), run)
+            _publish_finished_workbook(
+                workbook_path,
+                output,
+                run=run,
+                replace_predecessor=replace_predecessor,
+            )
+        _record_finished_output(run, work, output)
         return {
             "output": str(output),
             **ledger_statistics,
@@ -6128,11 +8207,13 @@ def finish_run(args: argparse.Namespace) -> dict[str, Any]:
                 not errors,
                 "finance-material workbook verification failed: " + "; ".join(errors[:10]),
             )
-            workbook_path.replace(output)
-        run["status"] = "finished"
-        run["finished_at"] = datetime.now(timezone.utc).isoformat()
-        run["output"] = str(output)
-        core.atomic_json(_run_path(work), run)
+            _publish_finished_workbook(
+                workbook_path,
+                output,
+                run=run,
+                replace_predecessor=replace_predecessor,
+            )
+        _record_finished_output(run, work, output)
         return {
             "output": str(output),
             **ledger_statistics,
@@ -6186,11 +8267,13 @@ def finish_run(args: argparse.Namespace) -> dict[str, Any]:
                 not errors,
                 "workbook verification failed: " + "; ".join(errors[:10]),
             )
-            workbook_path.replace(output)
-        run["status"] = "finished"
-        run["finished_at"] = datetime.now(timezone.utc).isoformat()
-        run["output"] = str(output)
-        core.atomic_json(_run_path(work), run)
+            _publish_finished_workbook(
+                workbook_path,
+                output,
+                run=run,
+                replace_predecessor=replace_predecessor,
+            )
+        _record_finished_output(run, work, output)
         return {
             "output": str(output),
             "groups": ledger_statistics["groups"],
@@ -6242,12 +8325,14 @@ def finish_run(args: argparse.Namespace) -> dict[str, Any]:
         workbook.close()
         errors = check_workbook.check(workbook_path, orders_path)
         core.require(not errors, "workbook verification failed: " + "; ".join(errors[:10]))
-        workbook_path.replace(output)
+        _publish_finished_workbook(
+            workbook_path,
+            output,
+            run=run,
+            replace_predecessor=replace_predecessor,
+        )
 
-    run["status"] = "finished"
-    run["finished_at"] = datetime.now(timezone.utc).isoformat()
-    run["output"] = str(output)
-    core.atomic_json(_run_path(work), run)
+    _record_finished_output(run, work, output)
     result = {
         "output": str(output),
         "groups": ledger_statistics["groups"],
@@ -6272,6 +8357,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "start":
             result = start_run(args)
+        elif args.command == "roll-forward":
+            result = roll_forward_run(args)
         elif args.command == "review":
             result = review_command(args)
         else:

@@ -174,9 +174,11 @@ class LineAndroidMiuiTests(unittest.TestCase):
             run = reconcile._load_run(work)
             normalized = reconcile._load_snapshot(work, run)
 
-            self.assertEqual(report["groups"], 1)
-            self.assertEqual(normalized["groups"][0]["group_name"], "普通群")
-            self.assertEqual(normalized["groups"][0]["group_key"], "line:c-other")
+            self.assertEqual(report["groups"], 2)
+            self.assertEqual(
+                {group["group_name"] for group in normalized["groups"]},
+                {"普通群", "曼谷门店开票群"},
+            )
 
     def test_start_finance_mode_selects_finance_miui_group(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

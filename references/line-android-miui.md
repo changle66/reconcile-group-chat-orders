@@ -36,7 +36,10 @@ python scripts/reconcile.py start <原始导出根目录> --line-android-backup 
 python scripts/reconcile.py start <原始导出根目录> --line-android-backup <目录或.bak> --work <全新工作目录> --mode store-ledger
 ```
 
-大额模式从备份读取全部群，再统一排除群名包含 `小额出`、`财务资料群` 或 `门店开票群` 的群。
+大额模式从备份读取全部群，再统一排除群名包含 `小额出` 或 `财务资料群` 的群；`门店开票群` 同时保留在大额模式。
+
+跨日续接仍由 `roll-forward` 自动发现读取器。前一日可来自 MIUI/Android、第二日可来自 iOS（反向也可）；稳定消息
+事实一致时自动去重，正文、发送者、时间或引用关系冲突时停止。媒体判定只有在内容 SHA-256 完全相同时才继承。
 
 需要诊断备份内容时，只读列群：
 

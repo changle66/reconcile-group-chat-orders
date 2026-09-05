@@ -136,6 +136,19 @@ def validate_orders(data: object) -> list[dict[str, Any]]:
             for summary_index, summary in enumerate(summaries):
                 field = f"groups[{group_index}].daily_summaries[{summary_index}]"
                 core.require(isinstance(summary, Mapping), f"{field} must be an object")
+                statistics_date = core.clean_text(summary.get("statistics_date"))
+                try:
+                    parsed_statistics_date = datetime.strptime(
+                        statistics_date, "%Y-%m-%d"
+                    ).date()
+                except ValueError as exc:
+                    raise ValueError(
+                        f"{field}.statistics_date must use YYYY-MM-DD"
+                    ) from exc
+                core.require(
+                    parsed_statistics_date.isoformat() == statistics_date,
+                    f"{field}.statistics_date must use YYYY-MM-DD",
+                )
                 fund_type = large_daily.normalize_fund_type(
                     summary.get("fund_type"), field=f"{field}.fund_type"
                 )
@@ -146,22 +159,16 @@ def validate_orders(data: object) -> list[dict[str, Any]]:
                 )
                 status_label = core.clean_text(summary.get("status_label"))
                 core.require(
-                    status_label in {"已确认", "待确认"},
+                    status_label
+                    in {"已确认", "待确认", "已完成", "待次日继续", "已取消"},
                     f"{field}.status_label is unsupported",
                 )
-                pending_summary = status_label == "待确认"
                 direction = core.clean_text(summary.get("direction"))
-                if direction == "待确认":
-                    core.require(
-                        pending_summary,
-                        f"{field}.direction can be pending only for a pending summary",
-                    )
-                else:
+                if direction != "待确认":
                     core.canonical_direction(direction, field=f"{field}.direction")
                 operator = core.clean_text(summary.get("operator")).casefold()
                 core.require(
-                    operator in large_daily.RATE_OPERATORS
-                    or (pending_summary and not operator),
+                    operator in large_daily.RATE_OPERATORS or not operator,
                     f"{field}.operator is unsupported",
                 )
                 rate = core.parse_decimal(
@@ -174,26 +181,28 @@ def validate_orders(data: object) -> list[dict[str, Any]]:
                     f"{field}.rate must be positive when known",
                 )
                 core.require(
-                    pending_summary or rate is not None,
-                    f"{field}.rate is required for a confirmed summary",
-                )
-                core.require(
                     isinstance(summary.get("count"), int) and summary.get("count") > 0,
                     f"{field}.count must be a positive integer",
                 )
                 for amount_field in ("source_total", "target_total"):
+                    state_field = f"{amount_field}_state"
+                    amount_state = core.clean_text(summary.get(state_field)).casefold()
+                    if not amount_state:
+                        amount_state = (
+                            "unknown" if summary.get(amount_field) is None else "known"
+                        )
+                    core.require(
+                        amount_state in {"known", "unknown", "absent"},
+                        f"{field}.{state_field} is unsupported",
+                    )
                     amount = core.parse_decimal(
                         summary.get(amount_field),
                         field=f"{field}.{amount_field}",
                         allow_none=True,
                     )
                     core.require(
-                        amount is None or amount >= 0,
-                        f"{field}.{amount_field} cannot be negative",
-                    )
-                    core.require(
-                        pending_summary or amount is not None,
-                        f"{field}.{amount_field} is required for a confirmed summary",
+                        (amount_state == "known") is (amount is not None),
+                        f"{field}.{amount_field} disagrees with {state_field}",
                     )
         for order_index, order in enumerate(orders):
             core.require(
@@ -414,6 +423,8 @@ def pricing_detail_rows(order: Mapping[str, Any]) -> list[list[Any]]:
                     None,
                     None,
                     None,
+                    None,
+                    None,
                 ]
             )
         if rounding:
@@ -433,12 +444,24 @@ def pricing_detail_rows(order: Mapping[str, Any]) -> list[list[Any]]:
                     None,
                     None,
                     None,
+                    None,
+                    None,
                 ]
             )
     return rows
 
 
 def order_rows(order: Mapping[str, Any]) -> list[list[Any]]:
+    lifecycle = (
+        order.get("lifecycle")
+        if isinstance(order.get("lifecycle"), Mapping)
+        else {}
+    )
+    lifecycle_labels = {
+        "completed": "已完成",
+        "pending_next_day": "待次日继续",
+        "cancelled": "已取消",
+    }
     rows: list[list[Any]] = [
         [
             "订单汇总",
@@ -458,6 +481,8 @@ def order_rows(order: Mapping[str, Any]) -> list[list[Any]]:
             )
             or None,
             order_row_note(order),
+            lifecycle_labels.get(core.clean_text(lifecycle.get("status")).casefold()),
+            excel_datetime(lifecycle.get("completion_at")),
             None,
             None,
         ]
@@ -480,6 +505,8 @@ def order_rows(order: Mapping[str, Any]) -> list[list[Any]]:
                 None,
                 None,
                 flow_row_note(flow),
+                None,
+                None,
                 flow.get("payee"),
                 excel_datetime(flow.get("message_time")),
             ]
@@ -513,12 +540,40 @@ def template_styles(
     workbook = load_workbook(template_path, read_only=False, data_only=False)
     try:
         sheet = workbook[workbook.sheetnames[0]]
-        header = [snapshot_cell_style(cell) for cell in sheet[1][: len(core.HEADERS)]]
-        body = [snapshot_cell_style(cell) for cell in sheet[2][: len(core.HEADERS)]]
-        widths = {
-            index: sheet.column_dimensions[get_column_letter(index)].width
-            for index in range(1, len(core.HEADERS) + 1)
+        source_columns = {
+            core.clean_text(sheet.cell(1, column).value): column
+            for column in range(1, sheet.max_column + 1)
+            if core.clean_text(sheet.cell(1, column).value)
         }
+        fallback_headers = {
+            "订单状态": "核对结果",
+            "完成时间": "聊天消息时间",
+        }
+
+        def source_column(header_name: str, destination: int) -> int:
+            source_name = (
+                header_name
+                if header_name in source_columns
+                else fallback_headers.get(header_name, header_name)
+            )
+            return source_columns.get(
+                source_name, min(destination, max(1, sheet.max_column))
+            )
+
+        header: list[Any] = []
+        body: list[Any] = []
+        widths: dict[int, float | None] = {}
+        for destination, header_name in enumerate(core.HEADERS, start=1):
+            source = source_column(header_name, destination)
+            header.append(snapshot_cell_style(sheet.cell(1, source)))
+            body.append(snapshot_cell_style(sheet.cell(2, source)))
+            widths[destination] = sheet.column_dimensions[
+                get_column_letter(source)
+            ].width
+        status_column = core.HEADERS.index("订单状态") + 1
+        completion_column = core.HEADERS.index("完成时间") + 1
+        widths[status_column] = max(widths.get(status_column) or 0, 14)
+        widths[completion_column] = max(widths.get(completion_column) or 0, 21)
         return header, body, widths, sheet.row_dimensions[1].height
     finally:
         workbook.close()
@@ -605,9 +660,11 @@ def build_workbook(
                 else:
                     for cell in worksheet[output_row]:
                         cell.fill = PatternFill()
-                worksheet.cell(output_row, len(core.HEADERS)).number_format = (
-                    "yyyy-mm-dd hh:mm:ss"
-                )
+                for datetime_header in ("聊天消息时间", "完成时间"):
+                    worksheet.cell(
+                        output_row,
+                        core.HEADERS.index(datetime_header) + 1,
+                    ).number_format = "yyyy-mm-dd hh:mm:ss"
                 output_row += 1
         review_range = f"{review_column_letter}2:{review_column_letter}{max(2, output_row - 1)}"
         worksheet.conditional_formatting.add(
@@ -633,23 +690,24 @@ def build_workbook(
 
 
 def large_summary_rows(group: Mapping[str, Any]) -> list[list[Any]]:
+    def amount_cell(summary: Mapping[str, Any], field: str) -> Any:
+        state = core.clean_text(summary.get(f"{field}_state")).casefold()
+        if state == "absent":
+            return "—"
+        if state == "unknown" or summary.get(field) is None:
+            return "未确认"
+        return excel_number(summary.get(field))
+
     return [
         [
+            summary.get("statistics_date"),
             summary.get("fund_type_label"),
             summary.get("direction"),
             summary.get("operator_label"),
             summary.get("rate_display"),
             int(summary.get("count") or 0),
-            (
-                excel_number(summary.get("source_total"))
-                if summary.get("source_total") is not None
-                else "未确认"
-            ),
-            (
-                excel_number(summary.get("target_total"))
-                if summary.get("target_total") is not None
-                else "未确认"
-            ),
+            amount_cell(summary, "source_total"),
+            amount_cell(summary, "target_total"),
             summary.get("status_label"),
         ]
         for summary in group.get("daily_summaries", [])
@@ -757,10 +815,10 @@ def build_large_order_workbook(
                     cell.font = Font(
                         name="Arial",
                         size=11,
-                        bold=column in {5, 6, 7},
+                        bold=column in {6, 7, 8},
                         color=(
                             LARGE_SUMMARY_TITLE_FILL_RGB
-                            if column in {5, 6, 7}
+                            if column in {6, 7, 8}
                             else "1F1F1F"
                         ),
                     )
@@ -778,20 +836,21 @@ def build_large_order_workbook(
                             else thin_grid
                         ),
                     )
-            worksheet.cell(row_index, 5).number_format = "0"
-            worksheet.cell(row_index, 6).number_format = "#,##0.00"
+            worksheet.cell(row_index, 6).number_format = "0"
             worksheet.cell(row_index, 7).number_format = "#,##0.00"
+            worksheet.cell(row_index, 8).number_format = "#,##0.00"
             worksheet.row_dimensions[row_index].height = 25
 
         minimum_widths = {
-            "A": 18,
-            "B": 23,
-            "C": 16,
-            "D": 13,
-            "E": 11,
-            "F": 18,
+            "A": 14,
+            "B": 18,
+            "C": 23,
+            "D": 16,
+            "E": 13,
+            "F": 11,
             "G": 18,
-            "H": 14,
+            "H": 18,
+            "I": 14,
         }
         for column_letter, minimum_width in minimum_widths.items():
             current_width = worksheet.column_dimensions[column_letter].width or 0

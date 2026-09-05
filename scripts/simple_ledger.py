@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import sys
 from collections import defaultdict
@@ -1759,6 +1760,51 @@ def _compile_order(
     else:
         order_status = "completed"
 
+    raw_lifecycle = raw_order.get("lifecycle")
+    if isinstance(raw_lifecycle, Mapping):
+        lifecycle = copy.deepcopy(dict(raw_lifecycle))
+    else:
+        lifecycle_status = (
+            "completed" if order_status == "completed" else "pending_next_day"
+        )
+        lifecycle_evidence = [
+            flow
+            for flow in flows
+            if flow.get("included")
+            and not flow.get("duplicate_of")
+            and flow.get("status") != "failed"
+        ]
+        lifecycle_at = max(
+            (str(flow.get("message_time") or "") for flow in lifecycle_evidence),
+            default=str(start_message.get("timestamp") or ""),
+        )
+        lifecycle_source_ids = list(
+            dict.fromkeys(
+                str(flow.get("source_message_id") or "")
+                for flow in lifecycle_evidence
+                if flow.get("source_message_id")
+            )
+        ) or [start_message_id]
+        lifecycle_reason = (
+            "付款与内部回款均已有完成依据"
+            if lifecycle_status == "completed"
+            else "截至本期末尚未形成完整付款与内部回款闭环"
+        )
+        lifecycle = {
+            "status": lifecycle_status,
+            "completion_at": lifecycle_at if lifecycle_status == "completed" else "",
+            "reason": lifecycle_reason,
+            "source_message_ids": lifecycle_source_ids,
+            "history": [
+                {
+                    "status": lifecycle_status,
+                    "at": lifecycle_at,
+                    "reason": lifecycle_reason,
+                    "source_message_ids": lifecycle_source_ids,
+                }
+            ],
+        }
+
     case_id = core.clean_text(raw_order.get("case_id")) or f"{group_key}:simple:{position:03d}"
     compiled_order = {
         "case_id": case_id,
@@ -1781,6 +1827,7 @@ def _compile_order(
         "anomaly_note": anomaly_note,
         "note": order_note,
         "order_status": order_status,
+        "lifecycle": lifecycle,
         "pricing_basis": pricing_basis,
         "pricing_source_message_ids": pricing_source_message_ids,
         "pricing_diagnostics": pricing_diagnostics,

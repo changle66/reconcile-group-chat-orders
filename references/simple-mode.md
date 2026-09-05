@@ -254,7 +254,8 @@ python scripts/reconcile.py review <work> apply-batch --group <群> --input <批
 - `page_commit.page_start/page_end/page_token` 必须原样来自当前 `review next`。页面必须与已确认进度连续，错误、过期或
   跳页令牌会使整个批次失败且不写文件。
 - 含 `page_commit` 的批次必须提交完整 `open_orders`；没有跨页订单时明确写 `[]`。它不是最终订单，不进入 Excel；
-  完成、取消或判明无效后，从列表移除，并把真正成交的订单写入 `orders`。
+  完成、取消、判明无效，或已经明确截止本期仍需次日继续后，从列表移除并写入 `orders`。`open_orders` 只表示本次
+  逐页阅读还没读完，不能用它表达跨日待续。
 - `open_orders` 至少保存 `id`、`start_message`、关键 `source_messages`、关联 `media_labels`、事实 `summary` 和
   `unresolved`；客户、方向、汇率和乘除方向已经知道时一并保存，未知时不要猜。
 - `media_decisions` 按 M 标签新增或替换，`orders` 按订单 ID 新增或替换；未出现的内容保持不变。
@@ -276,6 +277,11 @@ python scripts/reconcile.py review <work> apply-batch --group <群> --input <批
 用旧批次覆盖新判断。
 
 ## 封存和发布
+
+每个 `orders` 对象都有生命周期：`completed` 表示资金履约已完成，`pending_next_day` 表示截止本期仍未换完、未回款
+或聊天明确次日继续，`cancelled` 表示明确取消/失败且没有待履行资金。生命周期保存状态历史、原因和依据消息；完成时
+另存实际完成时间。即使付款与回款各出现一部分，只要聊天明确尚未全部完成，仍显式提交 `pending_next_day`，脚本不能
+仅凭“两侧都出现过”自动关闭。三种状态都属于完整订单并允许封存；跨日续接按 [roll-forward.md](roll-forward.md) 处理。
 
 群尾查看订单摘要和 `apply-batch` 返回的风险指标，只定向复核：
 
@@ -302,7 +308,8 @@ python scripts/reconcile.py finish <work> -o <新的群聊订单核对.xlsx>
 ```
 
 `finish` 要求所有群已封存，重新验证快照、原图哈希、判定指纹、金额关系和汇率字段，生成临时工作簿并逐格回读。
-输出已存在时拒绝覆盖。最终每群一张可见分表，包含汇率、每条资金记录的收款方及收款方实际到账金额。工作簿按
+输出已存在时拒绝覆盖。最终每群一张可见分表，包含汇率、每条资金记录的收款方及收款方实际到账金额，并增加
+“订单状态”和“完成时间”。工作簿按
 WPS 兼容门禁发布：业务单元格和汇总均为静态值，不含宏、外部链接或 Excel 专有公式；条件格式只使用基础公式。
 
 复杂关系仅在实际出现时读取 [advanced-relations.md](advanced-relations.md)。

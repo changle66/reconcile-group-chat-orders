@@ -30,6 +30,9 @@ python scripts/reconcile.py start <原始导出文件或备份根目录...> --wo
   一致的完成标记（例如粉色标记），可以判为 `final`；只有空白高亮、订单代号或无法与同票生命周期对应的名字时仍不得入账。
 - 明确作废记 `void`；尚未实际完成（例如“12号取现金”）记 `pending`。两者保留票面变动和具体
   `status_reason`，但没有 `posting_at`，实际入账金额留空并排除日汇总。
+- 每条记录保存 `status_history`、状态时间、原因和依据消息。跨日 `pending` 次日实际完成后沿用原记录 ID，追加
+  `posted` 历史；`voucher_date` 保留票面原日期，`posting_at` 使用实际完成/入账时间。只有 `posted` 金额进入其
+  实际发生日余额核对，不能补记回票面日期。
 - 作废票据之后发生的独立实际门店调拨是另一条记录，不能为了抵销作废票而把两者合并。
 - 同一群中非空 `voucher_number` 只能属于一个逻辑记录；发现同号多版本必须先合并生命周期再封存。
 
@@ -149,6 +152,9 @@ python scripts/reconcile.py start <原始导出文件或备份根目录...> --wo
 ```
 
 群读完时 `open_records` 必须为空。已经判明为 pending/void 的对象属于完整 `records`，不是开放对象。
+
+需要次日续接时使用 [roll-forward.md](roll-forward.md)。第二日对前一日票据的直接回复会连回累计快照中的原消息和
+原图；更正仍必须直接引用原票并给出完整算式，不能因跨日降低证据门槛。
 
 ## 门店调拨
 

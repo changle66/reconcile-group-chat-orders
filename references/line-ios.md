@@ -30,7 +30,10 @@ python scripts/reconcile.py start <原始导出根目录> --line-backup <LINE备
 python scripts/reconcile.py start <原始导出根目录> --line-backup <LINE备份目录> --work <全新工作目录> --mode store-ledger
 ```
 
-大额模式从备份读取全部群，再统一排除群名包含 `小额出`、`财务资料群` 或 `门店开票群` 的群。
+大额模式从备份读取全部群，再统一排除群名包含 `小额出` 或 `财务资料群` 的群；`门店开票群` 同时保留在大额模式。
+
+跨日续接仍由 `roll-forward` 自动发现读取器。前一日可来自 iOS、第二日可来自 MIUI/Android（反向也可）；只要群身份
+和稳定消息事实一致就自动去重并保留引用，正文、发送者、时间或引用关系冲突时停止。
 
 统一流程按 LINE 数据库中解析出的实际群名筛选，不把显示名相同的 Telegram、WhatsApp 或 LINE 群混在
 一起。新任务不要先运行旧提取脚本再拼接 normalized 文件，也不要使用 `--force` 覆盖历史输出。
